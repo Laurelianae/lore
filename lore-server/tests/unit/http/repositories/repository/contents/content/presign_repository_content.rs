@@ -191,7 +191,7 @@ async fn presign_permission_matrix() {
                 match case {
                     2 => claims.is_service_account = Some(true),
                     3 => claims.extra = json!({"roles": ["presign"]}).as_object().unwrap().clone(),
-                    4 | 5 | 6 => {
+                    4..=6 => {
                         let resource = if case == 5 {
                             "all".into()
                         } else if case == 6 {
@@ -214,7 +214,7 @@ async fn presign_permission_matrix() {
                         authorizer = Arc::new(Policy {
                             repository,
                             allowed,
-                        })
+                        });
                     }
                     9 => claims.extra = json!({"roles": ["admin"]}).as_object().unwrap().clone(),
                     _ => {}

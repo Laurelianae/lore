@@ -168,9 +168,9 @@ async fn repository_delete_permission_matrix() {
                         claims.extra = json!({"roles": [if case == 5 {"owner"} else {"admin"}]})
                             .as_object()
                             .unwrap()
-                            .clone()
+                            .clone();
                     }
-                    7 | 8 | 9 => {
+                    7..=9 => {
                         let resource = if case == 8 {
                             "all".into()
                         } else if case == 9 {
@@ -292,7 +292,7 @@ async fn legacy_repository_delete_denial_preserves_repository() {
                     },
                 ),
             );
-            let server = tokio::spawn(async move {
+            let server = lore_base::lore_spawn!(async move {
                 axum::serve(listener, app).await.unwrap();
             });
             let (immutable_store, mutable_store, execution) = test_store_create().await.unwrap();

@@ -456,9 +456,9 @@ async fn obliterate_permission_matrix() {
                 claims.extra = json!({"roles": ["obliterate"]})
                     .as_object()
                     .unwrap()
-                    .clone()
+                    .clone();
             }
-            4 | 5 | 6 => {
+            4..=6 => {
                 let resource = if case == 5 {
                     "all".into()
                 } else if case == 6 {

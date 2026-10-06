@@ -833,9 +833,9 @@ async fn protected_push_permission_matrix() {
                         claims.extra = json!({"roles": ["push-protected"]})
                             .as_object()
                             .unwrap()
-                            .clone()
+                            .clone();
                     }
-                    3 | 4 | 5 => {
+                    3..=5 => {
                         let resource = if case == 4 {
                             "all".into()
                         } else if case == 5 {
