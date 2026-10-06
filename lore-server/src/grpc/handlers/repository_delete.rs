@@ -27,41 +27,48 @@ use super::repository_query::repository_query_id;
 use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::rebac::RebacApiClient;
 use crate::authnz::rebac::grpc_get_rebac_client;
+use crate::authnz::repository_authorizer::PartitionGrants;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
-use crate::grpc::get_authorization;
 use crate::grpc::get_user_id;
+use crate::grpc::get_verified_token;
+use crate::grpc::no_repository_access_status;
 use crate::util::setup_execution;
 
 #[tracing::instrument(name = "RepositoryDelete::handle", skip_all)]
 pub async fn handler(
-    request: Request<RepositoryDeleteRequest>,
+    mut request: Request<RepositoryDeleteRequest>,
     auth_url: Option<String>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<RepositoryDeleteResponse>, Status> {
-    let user_info = get_authorization(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
-    let req = request.into_inner();
-
-    // TODO(mjansson): Once we have authz permission model with read/write/admin
-    // this should be upgraded to check for the correct permission rather than
-    // hardwired to service accounts. For now used to protect while allowing mirroring
-    let mut bypass_protection = false;
-    if let Ok(user_info) = user_info
-        && user_info.is_service_account.unwrap_or_default()
-    {
-        bypass_protection = true;
+    let id: RepositoryId = Context::from(request.get_ref().id.clone()).into();
+    let token = get_verified_token(request.extensions());
+    let grants = authorizer
+        .granted_access(token.as_ref(), id)
+        .await
+        .map_err(|_err| no_repository_access_status())?;
+    if let Some(grants) = grants.filter(|_| token.is_some()) {
+        request.extensions_mut().insert(PartitionGrants {
+            repository_id: id,
+            grants,
+        });
     }
-
+    let bypass_protection = if auth_url.is_none() {
+        authorizer.permits(request.extensions(), id, "owner").await
+            || authorizer.permits(request.extensions(), id, "admin").await
+    } else {
+        false
+    };
     let execution = setup_execution(module_path!(), correlation_id, user_id);
-
-    let id: RepositoryId = Context::from(req.id).into();
     let repository = Arc::new(RepositoryContext::new_server_context(
         immutable_store,
         mutable_store,

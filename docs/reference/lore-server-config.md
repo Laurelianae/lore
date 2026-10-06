@@ -389,6 +389,8 @@ When `[server.auth]` is present, `jwt_issuer` and `jwt_audience` are both mandat
 
 Protected-branch push bypass requires the explicit `push-protected` action, globally in Tier 1 or on the repository in Tier 2. The `is_service_account` claim no longer grants this bypass; issuers must grant `push-protected` to mirroring accounts before deploying this change. On servers without authentication, protected pushes remain denied.
 
+Without legacy `auth_url`, repository deletion retains the creator check; bypass now requires `owner` or `admin`, rather than `is_service_account`. Legacy deployments retain the external `DeleteResource` authorization. Unauthenticated servers retain creator-only deletion.
+
 `[server.auth.jwk]`:
 
 | Field | Default | Description |
