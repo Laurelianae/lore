@@ -330,10 +330,6 @@ pub fn is_owner_or_admin(extensions: &Extensions, repository: RepositoryId) -> b
         || user_permissions.contains(&"admin".to_string())
 }
 
-pub fn can_obliterate(extensions: &Extensions, repository: RepositoryId) -> bool {
-    user_permissions(extensions, repository).contains(&"obliterate".to_string())
-}
-
 pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool {
     user_permissions(extensions, repository).contains(&"migrate".to_string())
 }

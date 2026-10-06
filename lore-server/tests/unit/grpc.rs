@@ -541,10 +541,7 @@ fn user_permissions_merge_across_matching_entries() {
     );
 }
 
-/// Regression: a `urc-*` grant now satisfies `can_obliterate`
-/// and `is_owner_or_admin`, not just `can_admin_lock`. The old
-/// `user_permissions` reader never looked at the wildcard entry, so the
-/// three checks disagreed about one token.
+/// Regression: a `urc-*` grant satisfies both legacy action readers.
 #[test]
 fn wildcard_grant_satisfies_every_action_check() {
     let mut extensions = Extensions::new();
@@ -569,7 +566,6 @@ fn wildcard_grant_satisfies_every_action_check() {
             Context::from_str(repository_id.strip_prefix("urc-").unwrap())
                 .unwrap()
                 .into();
-        assert!(can_obliterate(&extensions, repository_context));
         assert!(is_owner_or_admin(&extensions, repository_context));
         assert!(can_admin_lock(&extensions, repository_context));
     }
@@ -589,7 +585,6 @@ fn no_grant_denies_every_action_check() {
             .into();
 
     assert!(!is_owner_or_admin(&extensions, test_repository_context));
-    assert!(!can_obliterate(&extensions, test_repository_context));
     assert!(!can_admin_lock(&extensions, test_repository_context));
 }
 

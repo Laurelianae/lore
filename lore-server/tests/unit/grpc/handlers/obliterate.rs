@@ -23,6 +23,7 @@ use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::DEFAULT_IDENTITY_CLAIM;
 use lore_server::auth::jwt::JwtVerifier;
 use lore_server::auth::jwt::ResourcePermission;
+use lore_server::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
 use lore_server::grpc::handlers::obliterate::*;
 use lore_server::hooks::HookDispatcher;
 use lore_storage::Fragment;
@@ -95,10 +96,14 @@ fn make_jwt(resources: Option<Vec<ResourcePermission>>) -> String {
         extra: Default::default(),
         identity: None,
     };
+    sign_claims(&claims)
+}
+
+fn sign_claims(claims: &AuthorizationToken) -> String {
     let key = EncodingKey::from_secret(SIGNING_SECRET.as_ref());
     let mut header = Header::new(ALGORITHM);
     header.kid = Some("test-kid".to_string());
-    encode(&header, &claims, &key).unwrap()
+    encode(&header, claims, &key).unwrap()
 }
 
 fn good_key_service() -> MockTestJWKService {
@@ -145,6 +150,13 @@ async fn proceeds_without_auth_when_no_verifier_configured() {
 
     let err = handler(
         make_request(repository, None),
+        Arc::new(ResourceGrantsAuthorizer::new(
+            "resources".into(),
+            "resource_id".into(),
+            None,
+            "urc-{id}".into(),
+            "urc-*".into(),
+        )),
         immutable_store,
         mutable_store,
         notification,
@@ -168,6 +180,13 @@ async fn returns_unauthenticated_when_authorization_header_absent() {
 
     let err = handler(
         make_request(repository, None),
+        Arc::new(ResourceGrantsAuthorizer::new(
+            "resources".into(),
+            "resource_id".into(),
+            None,
+            "urc-{id}".into(),
+            "urc-*".into(),
+        )),
         immutable_store,
         mutable_store,
         notification,
@@ -190,6 +209,13 @@ async fn returns_unauthenticated_for_unverifiable_token() {
 
     let err = handler(
         make_request(repository, Some(make_jwt(None))),
+        Arc::new(ResourceGrantsAuthorizer::new(
+            "resources".into(),
+            "resource_id".into(),
+            None,
+            "urc-{id}".into(),
+            "urc-*".into(),
+        )),
         immutable_store,
         mutable_store,
         notification,
@@ -217,6 +243,13 @@ async fn returns_permission_denied_when_user_lacks_obliterate_permission() {
 
     let err = handler(
         make_request(repository, Some(make_jwt(Some(resources)))),
+        Arc::new(ResourceGrantsAuthorizer::new(
+            "resources".into(),
+            "resource_id".into(),
+            None,
+            "urc-{id}".into(),
+            "urc-*".into(),
+        )),
         immutable_store,
         mutable_store,
         notification,
@@ -246,6 +279,13 @@ async fn returns_not_found_when_authorized_and_address_absent() {
 
     let err = handler(
         make_request(repository, Some(make_jwt(Some(resources)))),
+        Arc::new(ResourceGrantsAuthorizer::new(
+            "resources".into(),
+            "resource_id".into(),
+            None,
+            "urc-{id}".into(),
+            "urc-*".into(),
+        )),
         immutable_store,
         mutable_store,
         notification,
@@ -320,6 +360,13 @@ async fn succeeds_for_authorized_request_with_existing_address() {
 
     handler(
         request,
+        Arc::new(ResourceGrantsAuthorizer::new(
+            "resources".into(),
+            "resource_id".into(),
+            None,
+            "urc-{id}".into(),
+            "urc-*".into(),
+        )),
         immutable_store.clone(),
         mutable_store,
         notification,
@@ -336,4 +383,172 @@ async fn succeeds_for_authorized_request_with_existing_address() {
         get_err.is_address_not_found(),
         "payload should be obliterated; got: {get_err:?}"
     );
+}
+
+#[tokio::test]
+async fn obliterate_permission_matrix() {
+    use lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
+    use lore_server::authnz::repository_authorizer::{
+        AllowAllRepositoryAuthorizer, RepositoryAuthorizer, VerifiedToken,
+    };
+    use serde_json::json;
+
+    struct Policy(RepositoryId);
+    #[async_trait]
+    impl RepositoryAuthorizer for Policy {
+        async fn check_repository_access(
+            &self,
+            token: Option<&VerifiedToken<'_>>,
+            id: RepositoryId,
+            action: Option<&str>,
+        ) -> Result<(), tonic::Status> {
+            assert_eq!(id, self.0);
+            let token = token.unwrap();
+            let mut validation = jsonwebtoken::Validation::new(ALGORITHM);
+            validation.set_audience(&[TEST_AUDIENCE]);
+            let decoded = jsonwebtoken::decode::<AuthorizationToken>(
+                token.raw,
+                &DecodingKey::from_secret(SIGNING_SECRET.as_ref()),
+                &validation,
+            )
+            .unwrap();
+            assert_eq!(decoded.claims.user_id, token.claims.user_id);
+            assert!(action.is_none() || action == Some("obliterate"));
+            Ok(())
+        }
+    }
+
+    for case in 0..8 {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, _) = test_store_create().await.unwrap();
+        let (fragment, address, payload) = lore_revision::fragment::generate_random();
+        immutable_store
+            .clone()
+            .put(repository, address, fragment, Some(payload), false)
+            .await
+            .unwrap();
+        let allowed = matches!(case, 0 | 3 | 4 | 5 | 7);
+        let mut notification = MockNotificationSender::new();
+        notification
+            .expect_obliterate()
+            .times(usize::from(allowed))
+            .with(eq(repository), eq(address))
+            .returning(|_, _| Ok(()));
+        let notification = Arc::new(notification);
+        let mut claims = AuthorizationToken {
+            issuer: "test-issuer".into(),
+            user_id: "test-user".into(),
+            issued_at: 1,
+            audience: vec![TEST_AUDIENCE.into()],
+            expires: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 60,
+            ..Default::default()
+        };
+        let mut authorizer: Arc<dyn RepositoryAuthorizer> =
+            Arc::new(GlobalGrantsAuthorizer::new(Some("roles".into())));
+        match case {
+            0 => authorizer = Arc::new(AllowAllRepositoryAuthorizer),
+            2 => claims.extra = json!({"roles": ["admin"]}).as_object().unwrap().clone(),
+            3 => {
+                claims.extra = json!({"roles": ["obliterate"]})
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            }
+            4 | 5 | 6 => {
+                let resource = if case == 5 {
+                    "all".into()
+                } else if case == 6 {
+                    format!("repo-{}", random::<RepositoryId>())
+                } else {
+                    format!("repo-{repository}")
+                };
+                claims.extra = json!({"access": {"entries": [
+                    {"id": resource, "actions": []}, {"id": resource, "actions": ["obliterate"]}
+                ]}})
+                .as_object()
+                .unwrap()
+                .clone();
+                authorizer = Arc::new(ResourceGrantsAuthorizer::new(
+                    "access.entries".into(),
+                    "id".into(),
+                    Some("actions".into()),
+                    "repo-{id}".into(),
+                    "all".into(),
+                ));
+            }
+            7 => authorizer = Arc::new(Policy(repository)),
+            _ => {}
+        }
+        let mut request = make_request(
+            repository,
+            if case == 0 {
+                None
+            } else {
+                Some(sign_claims(&claims))
+            },
+        );
+        request.get_mut().address = Some(address.into());
+        let verifier = if case == 0 {
+            None
+        } else {
+            Some(make_verifier(good_key_service()))
+        };
+        let result = handler(
+            request,
+            authorizer,
+            immutable_store.clone(),
+            mutable_store,
+            notification,
+            &HookDispatcher::empty(),
+            &Arc::new(verifier),
+        )
+        .await;
+        assert_eq!(result.is_ok(), allowed, "case={case}: {result:?}");
+        if allowed {
+            assert!(
+                immutable_store
+                    .get(repository, address)
+                    .await
+                    .unwrap_err()
+                    .is_address_not_found()
+            );
+        } else {
+            assert_eq!(result.unwrap_err().code(), Code::PermissionDenied);
+            assert!(immutable_store.get(repository, address).await.is_ok());
+        }
+    }
+}
+
+#[tokio::test]
+async fn expired_token_cannot_obliterate() {
+    use lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, _) = test_store_create().await.unwrap();
+    let mut claims = AuthorizationToken {
+        issuer: "test-issuer".into(),
+        user_id: "test-user".into(),
+        issued_at: 1,
+        audience: vec![TEST_AUDIENCE.into()],
+        expires: 1,
+        ..Default::default()
+    };
+    claims.extra = serde_json::json!({"roles": ["obliterate"]})
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = handler(
+        make_request(repository, Some(sign_claims(&claims))),
+        Arc::new(GlobalGrantsAuthorizer::new(Some("roles".into()))),
+        immutable_store,
+        mutable_store,
+        Arc::new(MockNotificationSender::new()),
+        &HookDispatcher::empty(),
+        &Arc::new(Some(make_verifier(good_key_service()))),
+    )
+    .await;
+    assert_eq!(result.unwrap_err().code(), Code::Unauthenticated);
 }
