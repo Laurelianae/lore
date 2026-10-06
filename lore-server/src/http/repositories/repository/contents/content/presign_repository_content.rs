@@ -26,6 +26,9 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::repository_authorizer::PartitionGrants;
+use crate::authnz::repository_authorizer::RawToken;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::http::log_http_error;
 use crate::http::presign_token::CURRENT_TOKEN_VERSION;
 use crate::http::presign_token::PresignTokenPayload;
@@ -42,8 +45,8 @@ pub enum PresignError {
     ParseAddress(FromHexError),
     #[error("Presign feature is not configured")]
     NotConfigured,
-    #[error("Only service accounts may vend presigned URLs")]
-    NotServiceAccount,
+    #[error("Presign permission required")]
+    NotPermitted,
     #[error("content_type is not allowed: {0}")]
     DisallowedContentType(String),
     #[error("header value is not valid: {0}")]
@@ -67,9 +70,9 @@ impl IntoResponse for PresignError {
                 StatusCode::NOT_FOUND,
                 "presigned URL feature is not enabled".to_string(),
             ),
-            PresignError::NotServiceAccount => (
+            PresignError::NotPermitted => (
                 StatusCode::FORBIDDEN,
-                "only service accounts may vend presigned URLs".to_string(),
+                "presign permission required".to_string(),
             ),
             PresignError::StoreError | PresignError::SystemTime(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -100,23 +103,12 @@ pub struct PresignResponse {
     pub expires_at: u64,
 }
 
-/// Whether the caller is a service account.
-///
-/// Reads the `is_service_account` claim from the token. A `None` token means no
-/// JWT verifier is configured and auth is disabled server-wide, which counts as
-/// a service account.
-#[lore_macro::test_pub]
-fn call_is_service_account(user_info: &Option<AuthorizationToken>) -> bool {
-    match user_info {
-        Some(token) => token.is_service_account.unwrap_or(false),
-        None => true,
-    }
-}
-
 pub async fn handler(
     State(state): State<Arc<ServerState>>,
     Path((repository_id, address)): Path<(String, String)>,
     Extension(user_info): Extension<Option<AuthorizationToken>>,
+    raw_token: Option<Extension<RawToken>>,
+    partition_grants: Option<Extension<PartitionGrants>>,
     headers: HeaderMap,
     Json(body): Json<PresignRequest>,
 ) -> Result<impl IntoResponse, PresignError> {
@@ -126,13 +118,34 @@ pub async fn handler(
         .ok_or(PresignError::NotConfigured)?
         .clone();
 
-    if !call_is_service_account(&user_info) {
-        return Err(PresignError::NotServiceAccount);
-    }
-
     let repository = repository_id
         .parse::<RepositoryId>()
         .map_err(PresignError::ParseRepository)?;
+    if state.jwt_verifier.is_some() {
+        let permitted = if let Some(Extension(grants)) =
+            partition_grants.filter(|Extension(grants)| grants.repository_id == repository)
+        {
+            grants.grants.permits("presign")
+        } else if let (Some(claims), Some(Extension(raw))) = (&user_info, &raw_token) {
+            state
+                .repository_authorizer
+                .check_repository_access(
+                    Some(&VerifiedToken {
+                        raw: &raw.0,
+                        claims,
+                    }),
+                    repository,
+                    Some("presign"),
+                )
+                .await
+                .is_ok()
+        } else {
+            false
+        };
+        if !permitted {
+            return Err(PresignError::NotPermitted);
+        }
+    }
     let parsed_address = address
         .parse::<Address>()
         .map_err(PresignError::ParseAddress)?;

@@ -7,7 +7,6 @@ use axum_test::TestServer;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
-use lore_server::http::repositories::repository::contents::content::presign_repository_content::call_is_service_account;
 use lore_server::http::security_headers::ContentTypePolicy;
 use lore_server::http::server::LoreHttpServerSettings;
 use lore_server::http::server::ServerHealth;
@@ -19,39 +18,6 @@ use serde_json::json;
 use crate::http::test_utils::content_type_policy;
 use crate::http::test_utils::presign_config_with_policy;
 use crate::store::test_support::test_store_create;
-
-fn token_with_service_account(is_service_account: Option<bool>) -> AuthorizationToken {
-    AuthorizationToken {
-        is_service_account,
-        ..Default::default()
-    }
-}
-
-#[test]
-fn service_account_may_vend() {
-    assert!(call_is_service_account(&Some(token_with_service_account(
-        Some(true)
-    ))));
-}
-
-#[test]
-fn non_service_account_may_not_vend() {
-    assert!(!call_is_service_account(&Some(token_with_service_account(
-        Some(false)
-    ))));
-}
-
-#[test]
-fn missing_service_account_claim_may_not_vend() {
-    assert!(!call_is_service_account(&Some(token_with_service_account(
-        None
-    ))));
-}
-
-#[test]
-fn no_auth_configured_may_vend() {
-    assert!(call_is_service_account(&None));
-}
 
 async fn mint(body: serde_json::Value) -> axum_test::TestResponse {
     mint_with_policy(body, ContentTypePolicy::default()).await
@@ -144,4 +110,167 @@ async fn returns_400_for_unserializable_header_value() {
     // an invalid header value; mint must reject rather than let redeem 500.
     let response = mint(json!({"content_type": "image/png; x=\u{7}"})).await;
     assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn presign_permission_matrix() {
+    use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
+    use lore_revision::lore::RepositoryId;
+    use lore_server::auth::jwk::{JWKService, JWKServiceError};
+    use lore_server::auth::jwt::JwtVerifier;
+    use lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
+    use lore_server::authnz::repository_authorizer::{RepositoryAuthorizer, VerifiedToken};
+    use lore_server::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const SECRET: &[u8] = b"presign-permission-test-secret";
+    struct Keys;
+    #[async_trait::async_trait]
+    impl JWKService for Keys {
+        async fn get_key(&self, _kid: &str) -> Result<(DecodingKey, Algorithm), JWKServiceError> {
+            Ok((DecodingKey::from_secret(SECRET), Algorithm::HS256))
+        }
+        fn get_cached_key(&self, _kid: &str) -> Option<(DecodingKey, Algorithm)> {
+            Some((DecodingKey::from_secret(SECRET), Algorithm::HS256))
+        }
+        async fn refresh_key(
+            &self,
+            _kid: &str,
+        ) -> Result<Option<(DecodingKey, Algorithm)>, JWKServiceError> {
+            Ok(None)
+        }
+    }
+    struct Policy {
+        repository: RepositoryId,
+        allowed: bool,
+    }
+    #[async_trait::async_trait]
+    impl RepositoryAuthorizer for Policy {
+        async fn check_repository_access(
+            &self,
+            token: Option<&VerifiedToken<'_>>,
+            repository: RepositoryId,
+            action: Option<&str>,
+        ) -> Result<(), tonic::Status> {
+            assert_eq!(repository, self.repository);
+            assert!(!token.unwrap().raw.is_empty());
+            if action.is_none() || (action == Some("presign") && self.allowed) {
+                Ok(())
+            } else {
+                Err(tonic::Status::permission_denied("denied"))
+            }
+        }
+    }
+
+    for case in 0..10 {
+        let (immutable_store, mutable_store, execution) = test_store_create().await.unwrap();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = random::<RepositoryId>();
+                let (fragment, address, payload) = lore_revision::fragment::generate_random();
+                immutable_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload), false)
+                    .await
+                    .unwrap();
+                let allowed = matches!(case, 3 | 4 | 5 | 7);
+                let mut claims = AuthorizationToken {
+                    issuer: "issuer".into(),
+                    user_id: "user".into(),
+                    audience: vec!["lore-test".into()],
+                    expires: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        + 60,
+                    issued_at: 1,
+                    ..Default::default()
+                };
+                let mut authorizer: Arc<dyn RepositoryAuthorizer> =
+                    Arc::new(GlobalGrantsAuthorizer::new(Some("roles".into())));
+                match case {
+                    2 => claims.is_service_account = Some(true),
+                    3 => claims.extra = json!({"roles": ["presign"]}).as_object().unwrap().clone(),
+                    4 | 5 | 6 => {
+                        let resource = if case == 5 {
+                            "all".into()
+                        } else if case == 6 {
+                            format!("repo-{}", random::<RepositoryId>())
+                        } else {
+                            format!("repo-{repository}")
+                        };
+                        claims.extra = json!({"access": {"entries": [
+                        {"id": resource, "actions": []}, {"id": resource, "actions": ["presign"]}
+                    ]}}).as_object().unwrap().clone();
+                        authorizer = Arc::new(ResourceGrantsAuthorizer::new(
+                            "access.entries".into(),
+                            "id".into(),
+                            Some("actions".into()),
+                            "repo-{id}".into(),
+                            "all".into(),
+                        ));
+                    }
+                    7 | 8 => {
+                        authorizer = Arc::new(Policy {
+                            repository,
+                            allowed,
+                        })
+                    }
+                    9 => claims.extra = json!({"roles": ["admin"]}).as_object().unwrap().clone(),
+                    _ => {}
+                }
+                let state = ServerState {
+                    immutable_store: immutable_store.clone(),
+                    mutable_store,
+                    jwt_verifier: Some(JwtVerifier {
+                        jwk_service: Arc::new(Keys),
+                        jwt_issuer: Some(vec!["issuer".into()]),
+                        jwt_audience: Some(vec!["lore-test".into()]),
+                        jwt_typ: None,
+                        identity_claim: "sub".into(),
+                    }),
+                    repository_authorizer: authorizer,
+                    max_file_size: 100,
+                    presign_config: Some(presign_config_with_policy(Default::default())),
+                };
+                let health = ServerHealth::new_without_availability(immutable_store);
+                let server = TestServer::new(create_router(
+                    state,
+                    health,
+                    &LoreHttpServerSettings::test_default(),
+                ))
+                .unwrap();
+                let mut header = Header::new(Algorithm::HS256);
+                header.kid = Some("key".into());
+                let jwt = jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(SECRET))
+                    .unwrap();
+                let mut request = server
+                    .post(&format!(
+                        "/v1/repository/{repository}/content/{address}/presign"
+                    ))
+                    .json(&json!({}));
+                if case != 0 {
+                    request = request
+                        .add_header(axum::http::header::AUTHORIZATION, format!("Bearer {jwt}"));
+                }
+                let response = request.await;
+                let expected = if case == 0 {
+                    StatusCode::UNAUTHORIZED
+                } else if allowed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::FORBIDDEN
+                };
+                assert_eq!(response.status_code(), expected, "case={case}");
+                if allowed {
+                    assert!(
+                        response.json::<serde_json::Value>()["url_suffix"]
+                            .as_str()
+                            .unwrap()
+                            .contains("token=")
+                    );
+                }
+            })
+            .await;
+    }
 }

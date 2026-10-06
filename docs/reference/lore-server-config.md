@@ -391,6 +391,8 @@ Protected-branch push bypass requires the explicit `push-protected` action, glob
 
 Without legacy `auth_url`, repository deletion retains the creator check; bypass now requires `owner` or `admin`, rather than `is_service_account`. Legacy deployments retain the external `DeleteResource` authorization. Unauthenticated servers retain creator-only deletion.
 
+Issuing presigned content URLs requires the explicit `presign` action; `is_service_account` no longer grants it. Issuers must grant `presign` to accounts that vend URLs before deploying this change. Unauthenticated servers retain the existing presign behavior.
+
 `[server.auth.jwk]`:
 
 | Field | Default | Description |
