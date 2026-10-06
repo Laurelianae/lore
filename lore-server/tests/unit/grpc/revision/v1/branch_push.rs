@@ -11,6 +11,9 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+use lore_server::authnz::repository_authorizer::RawToken;
+use lore_server::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::revision::v1::branch_push::*;
 use lore_server::hooks::HookDispatcher;
@@ -110,7 +113,7 @@ fn make_request(
     request
 }
 
-fn make_service_account_request(
+fn make_permitted_request(
     repository: RepositoryId,
     branch: BranchId,
     revision: Hash,
@@ -120,9 +123,15 @@ fn make_service_account_request(
         .extensions_mut()
         .insert(lore_server::auth::jwt::AuthorizationToken {
             user_id: "service-bot".into(),
-            is_service_account: Some(true),
+            resources: Some(vec![lore_server::auth::jwt::ResourcePermission {
+                resource_id: format!("urc-{repository}"),
+                permission: vec!["push-protected".into()],
+            }]),
             ..lore_server::auth::jwt::AuthorizationToken::default()
         });
+    request
+        .extensions_mut()
+        .insert(RawToken("verified-token".into()));
     request
 }
 
@@ -151,6 +160,7 @@ async fn push_advances_branch_latest() {
         let hook_dispatcher = HookDispatcher::empty();
         let response = handler(
             make_request(repository, main, revision, false, false),
+            Arc::new(AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -190,6 +200,7 @@ async fn push_zero_revision_returns_invalid_argument() {
         let hook_dispatcher = HookDispatcher::empty();
         let err = handler(
             make_request(repository, main, Hash::default(), false, false),
+            Arc::new(AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -231,6 +242,7 @@ async fn push_with_stale_parent_returns_failed_precondition() {
         let hook_dispatcher = HookDispatcher::empty();
         handler(
             make_request(repository, main, first, false, false),
+            Arc::new(AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -247,6 +259,7 @@ async fn push_with_stale_parent_returns_failed_precondition() {
         let stale = build_revision(&repository_context, Hash::default(), 2).await;
         let err = handler(
             make_request(repository, main, stale, false, false),
+            Arc::new(AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -288,6 +301,7 @@ async fn force_push_overrides_stale_parent() {
         let hook_dispatcher = HookDispatcher::empty();
         handler(
             make_request(repository, main, first, false, false),
+            Arc::new(AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -302,6 +316,7 @@ async fn force_push_overrides_stale_parent() {
         let stale = build_revision(&repository_context, Hash::default(), 2).await;
         let response = handler(
             make_request(repository, main, stale, true, false),
+            Arc::new(AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -342,7 +357,7 @@ async fn push_to_protected_branch_returns_permission_denied() {
             repository,
         ));
         let main = create_root_branch(&repository_context, "main").await;
-        // Protect the branch — non-service-account pushes must be denied.
+        // Protect the branch — pushes without a permission must be denied.
         branch::protect(repository_context.clone(), main)
             .await
             .expect("should protect");
@@ -352,6 +367,7 @@ async fn push_to_protected_branch_returns_permission_denied() {
         let hook_dispatcher = HookDispatcher::empty();
         let err = handler(
             make_request(repository, main, revision, false, false),
+            Arc::new(AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -397,6 +413,7 @@ async fn push_idempotent_on_current_latest() {
         let hook_dispatcher = HookDispatcher::empty();
         handler(
             make_request(repository, main, revision, false, false),
+            Arc::new(AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -411,6 +428,7 @@ async fn push_idempotent_on_current_latest() {
         // Re-pushing the same revision returns success with the same latest.
         let response = handler(
             make_request(repository, main, revision, false, false),
+            Arc::new(AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -444,6 +462,7 @@ async fn unknown_branch_returns_not_found() {
         let hook_dispatcher = HookDispatcher::empty();
         let err = handler(
             make_request(repository, unknown, revision, false, false),
+            Arc::new(AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -460,7 +479,7 @@ async fn unknown_branch_returns_not_found() {
 }
 
 #[tokio::test]
-async fn service_account_bypasses_protection() {
+async fn explicit_permission_bypasses_protection() {
     let repository = random::<RepositoryId>();
     let (immutable_store, mutable_store, execution) =
         test_store_create().await.expect("Failed to create stores");
@@ -486,7 +505,14 @@ async fn service_account_bypasses_protection() {
 
         let hook_dispatcher = HookDispatcher::empty();
         let response = handler(
-            make_service_account_request(repository, main, revision),
+            make_permitted_request(repository, main, revision),
+            Arc::new(ResourceGrantsAuthorizer::new(
+                "resources".into(),
+                "resource_id".into(),
+                None,
+                "urc-{id}".into(),
+                "urc-*".into(),
+            )),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -496,7 +522,7 @@ async fn service_account_bypasses_protection() {
             &instrument_provider,
         )
         .await
-        .expect("service account should bypass protection");
+        .expect("explicit permission should bypass protection");
         assert_eq!(
             response.into_inner().revision_signature,
             bytes::Bytes::from(revision)
@@ -531,6 +557,7 @@ async fn push_to_deleted_branch_reinstates_name() {
         let hook_dispatcher = HookDispatcher::empty();
         handler(
             make_request(repository, main, main_latest, false, false),
+            Arc::new(AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -561,6 +588,7 @@ async fn push_to_deleted_branch_reinstates_name() {
         let child_revision = build_revision(&repository_context, main_latest, 2).await;
         let response = handler(
             make_request(repository, child, child_revision, false, false),
+            Arc::new(AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -607,6 +635,7 @@ async fn push_to_deleted_branch_fails_when_name_taken() {
         let hook_dispatcher = HookDispatcher::empty();
         handler(
             make_request(repository, main, main_latest, false, false),
+            Arc::new(AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -629,6 +658,7 @@ async fn push_to_deleted_branch_fails_when_name_taken() {
         let stale_revision = build_revision(&repository_context, main_latest, 2).await;
         let err = handler(
             make_request(repository, original, stale_revision, false, false),
+            Arc::new(AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -674,6 +704,7 @@ async fn fast_forward_merge_succeeds_for_clean_diff() {
         for rev in [r1, r2] {
             handler(
                 make_request(repository, main, rev, false, false),
+                Arc::new(AllowAllRepositoryAuthorizer),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -695,6 +726,7 @@ async fn fast_forward_merge_succeeds_for_clean_diff() {
 
         let response = handler(
             make_request(repository, main, divergent, false, true),
+            Arc::new(AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -742,4 +774,153 @@ async fn create_child_branch(
     )
     .await
     .expect("Could not create child branch")
+}
+
+#[tokio::test]
+async fn protected_push_permission_matrix() {
+    use lore_server::auth::jwt::AuthorizationToken;
+    use lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
+    use lore_server::authnz::repository_authorizer::{
+        Grants, PartitionGrants, RepositoryAuthorizer, VerifiedToken,
+    };
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    struct Policy;
+    #[async_trait::async_trait]
+    impl RepositoryAuthorizer for Policy {
+        async fn check_repository_access(
+            &self,
+            token: Option<&VerifiedToken<'_>>,
+            _repository: RepositoryId,
+            action: Option<&str>,
+        ) -> Result<(), tonic::Status> {
+            assert_eq!(action, Some("push-protected"));
+            assert_eq!(token.unwrap().raw, "verified-token");
+            Ok(())
+        }
+    }
+
+    for v1 in [false, true] {
+        for case in 0..8 {
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) = test_store_create().await.unwrap();
+            let allowed = matches!(case, 2 | 3 | 4 | 6 | 7);
+            let mut notification = MockNotificationSender::new();
+            notification
+                .expect_branch_pushed()
+                .times(usize::from(allowed))
+                .returning(|_, _, _, _, _| ());
+            let notification = Arc::new(notification);
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                let main = create_root_branch(&context, "main").await;
+                branch::protect(context.clone(), main).await.unwrap();
+                let before = branch::load_latest(context.clone(), main).await.unwrap();
+                let revision = build_revision(&context, Hash::default(), 1).await;
+                let mut request = make_request(repository, main, revision, false, false);
+                let mut claims = AuthorizationToken::default();
+                let mut authorizer: Arc<dyn RepositoryAuthorizer> =
+                    Arc::new(GlobalGrantsAuthorizer::new(Some("roles".into())));
+                match case {
+                    0 => authorizer = Arc::new(AllowAllRepositoryAuthorizer),
+                    1 => claims.is_service_account = Some(true),
+                    2 => {
+                        claims.extra = json!({"roles": ["push-protected"]})
+                            .as_object()
+                            .unwrap()
+                            .clone()
+                    }
+                    3 | 4 | 5 => {
+                        let resource = if case == 4 {
+                            "all".into()
+                        } else if case == 5 {
+                            format!("repo-{}", random::<RepositoryId>())
+                        } else {
+                            format!("repo-{repository}")
+                        };
+                        claims.extra = json!({"access": {"entries": [
+                            {"id": resource, "actions": []},
+                            {"id": resource, "actions": ["push-protected"]}
+                        ]}})
+                        .as_object()
+                        .unwrap()
+                        .clone();
+                        authorizer = Arc::new(ResourceGrantsAuthorizer::new(
+                            "access.entries".into(),
+                            "id".into(),
+                            Some("actions".into()),
+                            "repo-{id}".into(),
+                            "all".into(),
+                        ));
+                    }
+                    6 => {
+                        request.extensions_mut().insert(PartitionGrants {
+                            repository_id: repository,
+                            grants: Grants::Actions(HashSet::from(["push-protected".into()])),
+                        });
+                    }
+                    7 => authorizer = Arc::new(Policy),
+                    _ => unreachable!(),
+                }
+                if case != 0 {
+                    request.extensions_mut().insert(claims);
+                    request
+                        .extensions_mut()
+                        .insert(RawToken("verified-token".into()));
+                }
+                let hooks = HookDispatcher::empty();
+                let result = if v1 {
+                    handler(
+                        request,
+                        authorizer,
+                        immutable_store,
+                        mutable_store,
+                        notification,
+                        &hooks,
+                        DEFAULT_HISTORY_STEP_SIZE,
+                        Default::default(),
+                        &TestInstrumentProvider {},
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    let (metadata, extensions, req) = request.into_parts();
+                    let request = Request::from_parts(
+                        metadata,
+                        extensions,
+                        lore_proto::BranchPushRequest {
+                            branch: req.id,
+                            revision: req.revision_signature,
+                            force: req.force,
+                            fast_forward_merge: req.fast_forward_merge,
+                        },
+                    );
+                    lore_server::grpc::handlers::branch_push::handler(
+                        request,
+                        authorizer,
+                        immutable_store,
+                        mutable_store,
+                        notification,
+                        &hooks,
+                        DEFAULT_HISTORY_STEP_SIZE,
+                        Default::default(),
+                        &TestInstrumentProvider {},
+                    )
+                    .await
+                    .map(|_| ())
+                };
+                assert_eq!(result.is_ok(), allowed, "v1={v1}, case={case}: {result:?}");
+                if !allowed {
+                    assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied);
+                    assert_eq!(branch::load_latest(context, main).await.unwrap(), before);
+                }
+            }))
+            .await;
+        }
+    }
 }

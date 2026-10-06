@@ -387,6 +387,8 @@ When `[server.auth]` is present, `jwt_issuer` and `jwt_audience` are both mandat
 | `repository_catalog` | derived | Which catalog answers `lore repository list`: `auth_service` fetches the list from `UrcAuthApi` gRPC service's `LookupUserPermissions`. `baseline` fetches the list from the server's own store, based on `baseline_access` configuration rule. When unset, uses `auth_service` if `[environment.endpoint] auth_url` is set, and `baseline` otherwise. Set this to `auth_service` to keep an auth-service catalog on a deployment authorizing from token claims, or set it to `baseline` to list from the server store on a `UrcAuthApi` deployment. |
 | `repository_catalog_url` | `auth_url` | The `UrcAuthApi` endpoint the `auth_service` catalog asks. Defaults to `[environment.endpoint] auth_url`. This is required with `repository_catalog = "auth_service"` when `auth_url` is unset. The catalog forwards the caller's own token, so the endpoint must accept the tokens this server verifies. |
 
+Protected-branch push bypass requires the explicit `push-protected` action, globally in Tier 1 or on the repository in Tier 2. The `is_service_account` claim no longer grants this bypass; issuers must grant `push-protected` to mirroring accounts before deploying this change. On servers without authentication, protected pushes remain denied.
+
 `[server.auth.jwk]`:
 
 | Field | Default | Description |
