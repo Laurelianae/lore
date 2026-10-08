@@ -283,12 +283,15 @@ impl Storage for StorageClient {
         partition: Partition,
         correlation_id: &str,
     ) -> Result<u32, ProtocolError> {
-        // Fetch auth token via token exchange (cached if already exchanged).
         // The credentials are read here, not at construction: the server checks
         // storage authorization at each session start, so a session opened later
         // must present whatever the newest call supplied.
-        let token = if !self.auth_url.is_empty() {
-            let (identity_token, access_token) = self.credentials.tokens();
+        let (identity_token, access_token) = self.credentials.tokens();
+        let token = if !access_token.is_empty() {
+            access_token
+        } else if !self.auth_url.is_empty() {
+            // Fetch an authorization token via the legacy exchange when none
+            // was supplied (cached if already exchanged).
             let (_, authorization_token, _) = crate::auth::exchange::auth_exchange(
                 &self.auth_url,
                 &self.recipient_domain,

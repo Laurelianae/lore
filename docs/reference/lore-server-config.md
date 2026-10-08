@@ -435,10 +435,11 @@ This fork follows [upstream PR #49](https://github.com/EpicGames/lore/pull/49),
 adapted to its configured authorizers and cached grants. Keep the permission
 regressions as the acceptance contract when replacing this patch with upstream
 implementation. Direct CLI token issuance remains blocked until permission
-coverage passes across all exposed transports. The existing CLI QUIC session
-setup sends an empty token when `auth_url` is absent; claim-only CLI push coverage
-remains blocked by that client issue. Server-side QUIC permission coverage uses
-authenticated protocol requests directly.
+coverage passes across all exposed transports. CLI QUIC storage sessions use a
+supplied access token even when `auth_url` is absent. Authenticated CLI push
+coverage exercises both QUIC and gRPC across global, resource, and legacy grants,
+including access-token-only pushes. Server-side QUIC permission coverage also
+uses authenticated protocol requests directly.
 
 Without legacy `auth_url`, repository deletion retains the creator check; bypass now requires `owner` or `admin`, rather than `is_service_account`. Legacy deployments retain the external `DeleteResource` authorization. Unauthenticated servers retain creator-only deletion.
 

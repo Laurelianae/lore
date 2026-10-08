@@ -252,20 +252,29 @@ def test_read_write_matrix(permission_server, permissions, online):
 
 
 @pytest.mark.parametrize("transport", ["quic", "grpc"])
-def test_reader_cannot_push_and_writer_can(permission_server, new_lore_repo, transport):
+@pytest.mark.parametrize(
+    "with_identity_token", [False, True], ids=["access-only", "identity-and-access"]
+)
+def test_reader_cannot_push_and_writer_can(
+    permission_server, new_lore_repo, transport, with_identity_token
+):
     server = permission_server
-    if server.tier != "legacy":
-        pytest.skip(
-            "CLI storage sessions require auth_url; claim-only QUIC is covered by the Rust real-server matrix"
-        )
     repository = uuid.uuid4().hex
     writer = server.token(repository, ["write"])
     reader = server.token(repository, ["read"])
     remote = server.quic if transport == "quic" else f"grpc://{server.grpc}/"
     repo = new_lore_repo(remote_url=remote, create_repo=False)
-    server.mock.on("CreateResource", resource_id=f"urc-{repository}").respond(
-        empty_response()
-    )
+    if server.tier == "legacy":
+        server.mock.on("CreateResource", resource_id=f"urc-{repository}").respond(
+            empty_response()
+        )
+
+    def credentials(token):
+        return {
+            "access_token": token,
+            **({"identity_token": token} if with_identity_token else {}),
+        }
+
     repo.repository_create(
         repo_id=repository,
         identity_token=writer,
@@ -276,11 +285,11 @@ def test_reader_cannot_push_and_writer_can(permission_server, new_lore_repo, tra
     repo.file_stage("content.txt")
     repo.revision_commit("permission check")
     with pytest.raises(LoreException) as denied:
-        repo.push(identity_token=reader, access_token=reader)
+        repo.push(**credentials(reader))
     process_error = denied.value.__context__
     assert isinstance(process_error, CalledProcessError)
     assert process_error.returncode == 17, "Denied push must return NotAuthorized, not crash"
-    repo.push(identity_token=writer, access_token=writer)
+    repo.push(**credentials(writer))
 
 
 @pytest.mark.parametrize("permissions", [["read"], ["write"]])
