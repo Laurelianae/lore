@@ -426,6 +426,26 @@ hooks or storage writes. Existing repositories and existing auth resources requi
 write permission for retries and name-mapping repairs. If a hook rejects creation
 after a legacy auth resource was created, that resource remains available for retry.
 
+For CLI creation without a legacy `auth_url`, `--access-token` supplies the
+authorization for the proposed repository and takes precedence over
+`--identity-token`. If no access token is supplied, creation uses the supplied
+login credential. Claim-only servers currently cannot resolve a stored login
+credential without an auth endpoint. Tier 1 can use one
+token with global write permission. Tier 2 requires a token granting write for
+the proposed ID; its login token and repository token may be different. Automatic
+OAuth token exchange for creation is not implemented, so the required grant must
+already be present in the token supplied to the server. When legacy `auth_url`
+is configured, creation continues to send the login credential to `CreateResource`.
+
+Claim-based repository-management RPCs (create, delete, query, list, and metadata
+get/set) all prefer a supplied `--access-token`, then a supplied login credential
+when no access token is provided. Tokens are selected for each request, including
+retries and reconnects. The server enforces the token's grants: a repository-scoped
+token does not grant access to other repositories, and a read grant does not allow
+metadata changes or deletion. Legacy repository RPCs retain login-token selection,
+including auth-service calls for listing and deletion. Automatic OAuth token
+exchange remains separate work.
+
 An authorization-denied operation changes no repository or storage state and
 runs no mutation hook. Previously authorized items in a stream remain committed;
 streams do not promise batch rollback. Servers without authentication retain

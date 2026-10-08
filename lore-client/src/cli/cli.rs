@@ -77,13 +77,15 @@ pub struct LoreCli {
     #[clap(global = true, long, action)]
     pub identity: Option<String>,
 
-    /// Use given authentication token instead of one from the secure store. Acts
-    /// as the identity the token was issued to
+    /// Supply Lore's login credential instead of one from the secure store. In
+    /// the OAuth design this is an access token, not an OIDC ID token. Acts as
+    /// the identity the token was issued to
     #[clap(global = true, long, value_name = "token", conflicts_with = "identity")]
     pub identity_token: Option<String>,
 
-    /// Use given authorization token instead of exchanging one with the
-    /// authentication service
+    /// Supply authorization directly instead of exchanging a login credential.
+    /// Claim-based repository RPCs prefer this token; legacy repository RPCs
+    /// continue to use the login credential
     #[clap(global = true, long, value_name = "token", conflicts_with = "identity")]
     pub access_token: Option<String>,
 

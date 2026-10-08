@@ -912,6 +912,8 @@ pub async fn repository_client(
         connection
             .repository_authz(auth_url, identity, RepositoryId::default(), credentials)
             .await,
+        credentials,
+        !auth_url.is_empty(),
     );
 
     let repository = GRPCRepository {
@@ -1553,6 +1555,8 @@ impl GRPCRepository {
                     &self.credentials,
                 )
                 .await,
+            &self.credentials,
+            !self.auth_url.is_empty(),
         );
 
         Ok(())

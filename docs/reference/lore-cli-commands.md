@@ -219,8 +219,8 @@ printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-comma
 * `--remote` — Use remote data
 * `--local` — Use local data
 * `--identity <IDENTITY>` — Use given identity
-* `--identity-token <token>` — Use given authentication token instead of one from the secure store. Acts as the identity the token was issued to
-* `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service
+* `--identity-token <token>` — Supply Lore's login credential instead of one from the secure store. In the OAuth design this is an access token, not an OIDC ID token. Acts as the identity the token was issued to
+* `--access-token <token>` — Supply authorization directly instead of exchanging a login credential. Claim-based repository RPCs prefer this token; legacy repository RPCs continue to use the login credential
 * `--max-connections <MAX_CONNECTIONS>` — Set maximum number of parallel connections
 * `--file-count-limit <count>` — Set maximum number of parallel files opened
 * `--file-size-limit <size>` — Set maximum total size in bytes of parallel files opened
@@ -578,7 +578,7 @@ Instance management
 ###### **Subcommands:**
 
 * `list` — List all registered instances for this repository
-* `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not mounted
+* `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no revision, and paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not mounted
 
 
 
@@ -592,7 +592,7 @@ List all registered instances for this repository
 
 ## `lore repository instance prune`
 
-Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not mounted
+Remove stale instance entries: paths that no longer exist, paths that hold no revision, and paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not mounted
 
 **Usage:** `lore repository instance prune`
 

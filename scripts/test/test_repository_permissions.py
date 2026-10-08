@@ -14,6 +14,7 @@ import grpc
 import pytest
 from error_types import LoreException
 from grpc_probe import call, repository_metadata
+from lore_parsers import parse_jsonl
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
@@ -25,6 +26,7 @@ from mock_auth_server import (
     MockAuthServer,
     check_user_permission_response,
     empty_response,
+    lookup_user_permissions_response,
 )
 from protobuf_wire import encode_bytes_field, encode_string_field, parse_fields
 
@@ -62,6 +64,12 @@ def permission_server(request, tmp_path_factory, lore_server_executable_path):
         if request.param == "resource"
         else ""
     )
+    if request.param != "legacy":
+        # Exercise an explicit catalog without enabling the legacy auth_url.
+        policy += (
+            '\nrepository_catalog = "auth_service"'
+            f'\nrepository_catalog_url = "{mock.auth_url}"'
+        )
     with config.open("a") as output:
         output.write(
             f'{legacy}\n[server.auth]\njwt_issuer = "{mock.issuer}"\njwt_audience = ["{mock.audience[0]}"]\n{policy}\n[server.auth.jwk]\nendpoint = "{mock.jwks_url}"\n'
@@ -288,7 +296,9 @@ def test_reader_cannot_push_and_writer_can(
         repo.push(**credentials(reader))
     process_error = denied.value.__context__
     assert isinstance(process_error, CalledProcessError)
-    assert process_error.returncode == 17, "Denied push must return NotAuthorized, not crash"
+    assert process_error.returncode == 17, (
+        "Denied push must return NotAuthorized, not crash"
+    )
     repo.push(**credentials(writer))
 
 
@@ -315,6 +325,208 @@ def test_creation_requires_write_on_proposed_id(permission_server, permissions):
                 f"{REPOSITORY}/RepositoryGet",
                 encode_bytes_field(1, bytes.fromhex(other)),
                 metadata(other, writer),
+            )[0]
+            == grpc.StatusCode.NOT_FOUND
+        )
+
+
+@pytest.mark.parametrize("transport", ["quic", "grpc"])
+@pytest.mark.parametrize(
+    "credential_case",
+    ["access-only", "login-only", "distinct", "reader", "other-repository", "expired"],
+)
+def test_cli_creation_selects_claim_authorization(
+    permission_server, new_lore_repo, transport, credential_case
+):
+    server = permission_server
+    if server.tier == "legacy":
+        pytest.skip("Legacy creation uses the login credential and CreateResource")
+    if credential_case == "other-repository" and server.tier == "global":
+        pytest.skip("Global write grants apply to every repository")
+
+    repository = uuid.uuid4().hex
+    writer = server.token(repository, ["write"])
+    login = server.token(repository, None)
+    credentials = {"access_token": writer}
+    allowed = credential_case in ["access-only", "login-only", "distinct"]
+    if credential_case == "login-only":
+        credentials = {"identity_token": writer}
+    elif credential_case == "distinct":
+        assert login != writer
+        credentials["identity_token"] = login
+    elif credential_case == "reader":
+        credentials = {
+            "identity_token": writer,
+            "access_token": server.token(repository, ["read"]),
+        }
+    elif credential_case == "other-repository":
+        credentials = {
+            "identity_token": writer,
+            "access_token": server.token(uuid.uuid4().hex, ["write"]),
+        }
+    elif credential_case == "expired":
+        credentials = {
+            "identity_token": writer,
+            "access_token": server.mock.mint_token(
+                USER1,
+                resources=[
+                    {"resource_id": f"urc-{repository}", "permission": ["write"]}
+                ],
+                extra_claims={"permissions": ["write"]},
+                lifetime_seconds=-120,
+            ),
+        }
+
+    remote = server.quic if transport == "quic" else f"grpc://{server.grpc}/"
+    repo = new_lore_repo(remote_url=remote, create_repo=False)
+    if allowed:
+        repo.repository_create(repo_id=repository, **credentials)
+    else:
+        with pytest.raises(LoreException):
+            repo.repository_create(repo_id=repository, **credentials)
+
+    code, _, _ = call(
+        server.grpc,
+        f"{REPOSITORY}/RepositoryGet",
+        encode_bytes_field(1, bytes.fromhex(repository)),
+        metadata(repository, writer),
+    )
+    assert code == (grpc.StatusCode.OK if allowed else grpc.StatusCode.NOT_FOUND)
+
+
+@pytest.mark.parametrize("transport", ["quic", "grpc"])
+def test_cli_legacy_creation_sends_login_credential(
+    permission_server, new_lore_repo, transport
+):
+    server = permission_server
+    if server.tier != "legacy":
+        pytest.skip("CreateResource belongs to the legacy auth service")
+    repository = uuid.uuid4().hex
+    login = server.mock.mint_token(USER1)
+    authorization = server.token(repository, ["write"])
+    assert login != authorization
+    server.mock.on(
+        "CreateResource", resource_id=f"urc-{repository}", bearer=login
+    ).respond(empty_response())
+    remote = server.quic if transport == "quic" else f"grpc://{server.grpc}/"
+    repo = new_lore_repo(remote_url=remote, create_repo=False)
+    repo.repository_create(
+        repo_id=repository, identity_token=login, access_token=authorization
+    )
+    requests = [
+        request
+        for request in server.mock.requests_for("CreateResource")
+        if request["resource_id"] == f"urc-{repository}"
+    ]
+    assert len(requests) == 1
+    assert requests[0]["bearer"] == login
+
+
+@pytest.mark.parametrize("transport", ["quic", "grpc"])
+@pytest.mark.parametrize(
+    "credential_case", ["access-only", "distinct", "reader", "other-repository"]
+)
+def test_cli_repository_management_uses_correct_credential(
+    permission_server, new_lore_repo, transport, credential_case
+):
+    server = permission_server
+    if server.tier == "legacy" and credential_case != "distinct":
+        pytest.skip("Legacy repository management retains login-token selection")
+    if server.tier == "global" and credential_case == "other-repository":
+        pytest.skip("Global write grants apply to every repository")
+    repository = uuid.uuid4().hex
+    writer = server.token(repository, ["write"])
+    reader = server.token(repository, ["read"])
+    login = server.mock.mint_token(USER1)
+    remote = server.quic if transport == "quic" else f"grpc://{server.grpc}/"
+    repo = new_lore_repo(remote_url=remote, create_repo=False)
+    if server.tier == "legacy":
+        server.mock.on("CreateResource", resource_id=f"urc-{repository}").respond(
+            empty_response()
+        )
+        server.mock.on(
+            "DeleteResource", resource_id=f"urc-{repository}", bearer=writer
+        ).respond(empty_response())
+    repo.repository_create(
+        repo_id=repository, identity_token=writer, access_token=writer
+    )
+    for token in [writer, reader]:
+        server.mock.on("LookupUserPermissions", bearer=token).respond(
+            lookup_user_permissions_response(f"urc-{repository}")
+        )
+    if server.tier == "legacy":
+        authorization = server.mock.mint_token(
+            USER1,
+            resources=[{"resource_id": f"urc-{repository}", "permission": ["write"]}],
+            extra_claims={"permissions": ["write"], "credential": "scoped"},
+        )
+        assert writer != authorization
+        # Uploads use the scoped token; repository RPCs must retain the login.
+        credentials = {"identity_token": writer, "access_token": authorization}
+    elif credential_case == "distinct":
+        credentials = {"identity_token": login, "access_token": writer}
+    elif credential_case == "reader":
+        credentials = {"identity_token": writer, "access_token": reader}
+    elif credential_case == "other-repository":
+        credentials = {
+            "identity_token": writer,
+            "access_token": server.token(uuid.uuid4().hex, ["write"]),
+        }
+        server.mock.on(
+            "LookupUserPermissions", bearer=credentials["access_token"]
+        ).respond(empty_response())
+    else:
+        credentials = {"access_token": writer}
+
+    if credential_case == "other-repository":
+        with pytest.raises(LoreException):
+            repo.repository_info(repo.remote_path, **credentials)
+        listing = repo.run(["repository", "list", remote], **credentials)
+        assert repo.name not in listing
+        with pytest.raises(LoreException):
+            repo.repository_metadata_set(["credential-test", "changed"], **credentials)
+        with pytest.raises(LoreException):
+            repo.repository_delete(**credentials)
+        assert (
+            call(
+                server.grpc,
+                f"{REPOSITORY}/RepositoryGet",
+                encode_bytes_field(1, bytes.fromhex(repository)),
+                metadata(repository, writer),
+            )[0]
+            == grpc.StatusCode.OK
+        )
+        return
+
+    repo.repository_info(repo.remote_path, **credentials)
+    listing = repo.run(["repository", "list", remote], **credentials)
+    assert repo.name in listing
+    repo.repository_metadata_get(**credentials)
+    if credential_case == "reader":
+        with pytest.raises(LoreException):
+            repo.repository_metadata_set(["credential-test", "changed"], **credentials)
+        with pytest.raises(LoreException):
+            repo.repository_delete(**credentials)
+        output = repo.repository_metadata_get(json=True, access_token=writer)
+        assert all(
+            event["key"] != "credential-test"
+            for event in parse_jsonl(output, "metadata")
+        )
+    else:
+        repo.repository_metadata_set(["credential-test", "changed"], **credentials)
+        output = repo.repository_metadata_get(
+            "credential-test", json=True, **credentials
+        )
+        events = parse_jsonl(output, "metadata")
+        assert len(events) == 1
+        assert events[0]["value"]["data"] == "changed"
+        repo.repository_delete(**credentials)
+        assert (
+            call(
+                server.grpc,
+                f"{REPOSITORY}/RepositoryGet",
+                encode_bytes_field(1, bytes.fromhex(repository)),
+                metadata(repository, writer),
             )[0]
             == grpc.StatusCode.NOT_FOUND
         )
