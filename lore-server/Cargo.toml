@@ -81,6 +81,7 @@ tonic-prost-build = { workspace = true }
 vergen = { workspace = true }
 
 [dev-dependencies]
+lore-transport = { workspace = true, features = ["test-util"] }
 # The unit-test binary's store policies, set before the harness starts; see tests/unit/main.rs.
 ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }

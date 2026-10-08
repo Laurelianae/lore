@@ -124,6 +124,14 @@ async fn serve_and_connect(
     factory: Box<dyn StreamHandlerFactory>,
     protocol: &'static str,
 ) -> Harness {
+    serve_and_connect_with_stream_limit(factory, protocol, STREAM_COUNT as u64).await
+}
+
+async fn serve_and_connect_with_stream_limit(
+    factory: Box<dyn StreamHandlerFactory>,
+    protocol: &'static str,
+    stream_limit: u64,
+) -> Harness {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let server_addr = socket.local_addr().expect("Failed socket setup");
     drop(socket);
@@ -135,6 +143,7 @@ async fn serve_and_connect(
             .cert_file(cert_path)
             .pkey_file(key_path)
             .stream_handler_factory(factory)
+            .max_bidi_streams(stream_limit)
             .build()
             .unwrap(),
     )
@@ -1838,5 +1847,447 @@ async fn authenticated_storage_permission_matrix_on_both_protocols() {
                 .await;
             }
         }
+    }
+}
+
+mod authorization_expiry {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    use lore_base::types::RepositoryId;
+    use lore_server::auth::jwk::JWKService;
+    use lore_server::auth::jwk::JWKServiceError;
+    use lore_server::auth::jwt::AuthorizationToken;
+    use lore_server::auth::jwt::JwtVerifier;
+    use lore_server::auth::jwt::ResourcePermission;
+    use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
+    use lore_transport::connection::SuppliedCredentials;
+    use lore_transport::error::ProtocolError;
+    use lore_transport::quic::client::ServiceClient;
+    use lore_transport::quic::storage_service::auth::StorageClientAuth;
+    use lore_transport::quic::storage_service::client::StorageClient;
+    use lore_transport::session::SessionAuthorization;
+    use lore_transport::traits::Storage;
+
+    use super::*;
+
+    struct Keys;
+    #[async_trait]
+    impl JWKService for Keys {
+        fn get_cached_key(
+            &self,
+            _: &str,
+        ) -> Option<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm)> {
+            Some((
+                jsonwebtoken::DecodingKey::from_secret(b"expiry-test"),
+                jsonwebtoken::Algorithm::HS256,
+            ))
+        }
+        async fn get_key(
+            &self,
+            kid: &str,
+        ) -> Result<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm), JWKServiceError> {
+            Ok(self.get_cached_key(kid).unwrap())
+        }
+        async fn refresh_key(
+            &self,
+            kid: &str,
+        ) -> Result<Option<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError>
+        {
+            Ok(self.get_cached_key(kid))
+        }
+    }
+    fn verifier() -> Arc<Option<JwtVerifier>> {
+        Arc::new(Some(JwtVerifier {
+            jwk_service: Arc::new(Keys),
+            jwt_issuer: None,
+            jwt_audience: Some(vec!["expiry".into()]),
+            jwt_typ: None,
+            identity_claim: "sub".into(),
+        }))
+    }
+    fn token(expires: u64, repositories: &[RepositoryId], action: &str) -> String {
+        let claims = AuthorizationToken {
+            user_id: "expiry-user".into(),
+            audience: vec!["expiry".into()],
+            expires,
+            resources: Some(
+                repositories
+                    .iter()
+                    .map(|repository| ResourcePermission {
+                        resource_id: format!("urc-{repository}"),
+                        permission: vec![action.into()],
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        header.kid = Some("expiry-key".into());
+        jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b"expiry-test"),
+        )
+        .unwrap()
+    }
+    async fn command(
+        harness: &mut Harness,
+        v4: bool,
+        command: Command,
+        session: u32,
+        payload: &[u8],
+    ) -> (CommandHeader, Vec<u8>) {
+        let header =
+            CommandHeader::new_with_session(command as u8, random(), payload.len(), session);
+        let bytes = if v4 {
+            header.to_bytes_v4().to_vec()
+        } else {
+            header.to_bytes().to_vec()
+        };
+        harness.send.write_all(&bytes).await.unwrap();
+        harness.send.write_all(payload).await.unwrap();
+        harness.send.flush().await.unwrap();
+        let mut response = vec![0; if v4 { 12 } else { 8 }];
+        harness.recv.read_exact(&mut response).await.unwrap();
+        let header = if v4 {
+            CommandHeader::from_bytes_v4(&response)
+        } else {
+            CommandHeader::from_bytes(&response)
+        };
+        let mut data = vec![
+            0;
+            if header.error {
+                0
+            } else {
+                header.size_or_status as usize
+            }
+        ];
+        harness.recv.read_exact(&mut data).await.unwrap();
+        (header, data)
+    }
+    async fn authorize(
+        harness: &mut Harness,
+        v4: bool,
+        repository: RepositoryId,
+        token: &str,
+    ) -> u32 {
+        let mut payload = if v4 { vec![0] } else { vec![] };
+        payload.extend_from_slice(repository.data());
+        if v4 {
+            payload.push(0);
+            payload.extend_from_slice(&(token.len() as u16).to_le_bytes());
+        }
+        payload.extend_from_slice(token.as_bytes());
+        let (header, data) = command(harness, v4, Command::Authorize, 0, &payload).await;
+        assert!(!header.error, "{header:?}");
+        if v4 {
+            u32::from_le_bytes(data.try_into().unwrap())
+        } else {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn open_connections_reject_expired_reads_writes_and_cached_copies() {
+        for v4 in [false, true] {
+            let (immutable, mutable, execution) = test_store_create().await.unwrap();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let repository = random();
+                    let source = random();
+                    let expires = jsonwebtoken::get_current_timestamp() + 30;
+                    let now = Arc::new(AtomicU64::new(expires));
+                    let factory = TestHandlerFactory::with_authorization_clock(
+                        immutable.clone(),
+                        mutable,
+                        verifier(),
+                        Arc::new(AuthClientAuthorizer::new("https://auth.invalid".into())),
+                        {
+                            let now = now.clone();
+                            Arc::new(move || now.load(Ordering::SeqCst))
+                        },
+                    );
+                    let mut harness = serve_and_connect(
+                        Box::new(factory),
+                        if v4 { TEST_PROTOCOL_V4 } else { TEST_PROTOCOL },
+                    )
+                    .await;
+                    let session = authorize(
+                        &mut harness,
+                        v4,
+                        repository,
+                        &token(expires, &[repository, source], "write"),
+                    )
+                    .await;
+                    let valid_session = if v4 {
+                        authorize(
+                            &mut harness,
+                            true,
+                            repository,
+                            &token(expires + 3600, &[repository], "read"),
+                        )
+                        .await
+                    } else {
+                        0
+                    };
+                    let (fragment, address, payload) = generate_random();
+                    immutable
+                        .clone()
+                        .put(source, address, fragment, Some(payload), false)
+                        .await
+                        .unwrap();
+                    let mut copy = source.data().to_vec();
+                    copy.extend_from_slice(address.as_bytes());
+                    if v4 {
+                        copy.extend_from_slice(address.context.as_bytes());
+                    }
+                    assert!(
+                        !command(&mut harness, v4, Command::Copy, session, &copy)
+                            .await
+                            .0
+                            .error
+                    );
+                    assert!(
+                        !command(&mut harness, v4, Command::Get, session, address.as_bytes())
+                            .await
+                            .0
+                            .error
+                    );
+                    now.store(expires + 60, Ordering::SeqCst);
+                    assert!(
+                        !command(&mut harness, v4, Command::Get, session, address.as_bytes())
+                            .await
+                            .0
+                            .error
+                    );
+                    let (new_fragment, new_address, new_payload) = generate_random();
+                    let mut put = new_address.as_bytes().to_vec();
+                    put.extend_from_slice(new_fragment.as_bytes());
+                    put.extend_from_slice(&new_payload);
+                    now.store(expires + 61, Ordering::SeqCst);
+                    if !v4 {
+                        // Reject reauthorization even before a storage command has observed
+                        // expiry and installed the sticky retirement marker.
+                        let mut reconnect = repository.data().to_vec();
+                        reconnect.extend_from_slice(
+                            token(expires + 3600, &[repository], "read").as_bytes(),
+                        );
+                        let (header, _) =
+                            command(&mut harness, false, Command::Authorize, 0, &reconnect).await;
+                        assert!(header.error);
+                        assert_eq!(
+                            header.size_or_status,
+                            QuicServiceError::AuthorizationExpired as u32
+                        );
+                    }
+                    for (operation, bytes) in [
+                        (Command::Get, address.as_bytes()),
+                        (Command::Put, put.as_slice()),
+                        (Command::Copy, copy.as_slice()),
+                    ] {
+                        let (header, _) =
+                            command(&mut harness, v4, operation, session, bytes).await;
+                        assert!(header.error);
+                        assert_eq!(
+                            header.size_or_status,
+                            QuicServiceError::AuthorizationExpired as u32
+                        );
+                    }
+                    assert!(
+                        immutable
+                            .clone()
+                            .get(repository, new_address)
+                            .await
+                            .is_err()
+                    );
+                    if v4 {
+                        assert!(
+                            !command(
+                                &mut harness,
+                                true,
+                                Command::Get,
+                                valid_session,
+                                address.as_bytes()
+                            )
+                            .await
+                            .0
+                            .error
+                        );
+                        let reader = authorize(
+                            &mut harness,
+                            true,
+                            repository,
+                            &token(expires + 3600, &[repository], "read"),
+                        )
+                        .await;
+                        assert!(
+                            !command(&mut harness, true, Command::Get, reader, address.as_bytes())
+                                .await
+                                .0
+                                .error
+                        );
+                        let (header, _) =
+                            command(&mut harness, true, Command::Put, reader, &put).await;
+                        assert_eq!(
+                            header.size_or_status,
+                            QuicServiceError::NotAuthorized as u32
+                        );
+                    }
+                    if !v4 {
+                        // A retired legacy connection must reject Connect before installing
+                        // a fresh token; otherwise authorization would misleadingly succeed.
+                        let mut reconnect = repository.data().to_vec();
+                        reconnect.extend_from_slice(
+                            token(expires + 3600, &[repository], "read").as_bytes(),
+                        );
+                        let (header, _) =
+                            command(&mut harness, false, Command::Authorize, 0, &reconnect).await;
+                        assert!(header.error);
+                        assert_eq!(
+                            header.size_or_status,
+                            QuicServiceError::AuthorizationExpired as u32
+                        );
+                    }
+                    now.store(expires - 1, Ordering::SeqCst);
+                    assert_eq!(
+                        command(&mut harness, v4, Command::Get, session, address.as_bytes())
+                            .await
+                            .0
+                            .size_or_status,
+                        QuicServiceError::AuthorizationExpired as u32
+                    );
+                })
+                .await;
+        }
+    }
+
+    async fn bounded<T>(label: &str, future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(30), future)
+            .await
+            .unwrap_or_else(|_| panic!("timed out: {label}"))
+    }
+
+    #[tokio::test]
+    async fn actual_client_recovers_once_with_latest_token_and_enforces_new_grants() {
+        let (immutable, mutable, execution) = test_store_create().await.unwrap();
+        bounded(
+            "client recovery scenario",
+            LORE_CONTEXT.scope(execution, async move {
+                let repository = random::<RepositoryId>();
+                let expires = jsonwebtoken::get_current_timestamp() + 30;
+                let now = Arc::new(AtomicU64::new(expires));
+                let factory = TestHandlerFactory::with_authorization_clock(
+                    immutable.clone(),
+                    mutable,
+                    verifier(),
+                    Arc::new(AuthClientAuthorizer::new("https://auth.invalid".into())),
+                    {
+                        let now = now.clone();
+                        Arc::new(move || now.load(Ordering::SeqCst))
+                    },
+                );
+                let mut harness = serve_and_connect_with_stream_limit(
+                    Box::new(factory),
+                    TEST_PROTOCOL_V4,
+                    (STREAM_COUNT + 1) as u64,
+                )
+                .await;
+                // The raw harness opens a stream of its own. Release that slot before
+                // the real client fills the server's eight-stream connection limit.
+                harness.send.finish().unwrap();
+                harness.recv.stop(quinn::VarInt::from_u32(0)).unwrap();
+
+                let credentials = Arc::new(SuppliedCredentials::new(
+                    "",
+                    &token(expires, &[repository], "write"),
+                ));
+                let adapter = Arc::new(StorageClientAuth {
+                    recipient_domain: "localhost".into(),
+                    auth_url: String::new(),
+                    identity: "expiry-user".into(),
+                    partition: repository,
+                    user_agent: "expiry-test".into(),
+                });
+                let storage = Arc::new(StorageClient::new(
+                    std::sync::Weak::new(),
+                    "lores://localhost",
+                    TransportConfig {
+                        max_bytes_bandwidth_per_second: 1_000_000,
+                        expected_rtt_ms: DEFAULT_EXPECTED_RTT_MS,
+                        congestion_algorithm: CongestionAlgorithm::Bbr,
+                        initial_cwnd: None,
+                    },
+                    adapter,
+                    "",
+                    "localhost",
+                    "expiry-user",
+                    repository,
+                    harness.connection.clone(),
+                    &credentials,
+                ));
+                bounded("create stream", storage.quic().create_initial_stream())
+                    .await
+                    .unwrap();
+
+                storage.quic().stream_count.store(1, Ordering::Relaxed);
+                let id = bounded("session start", storage.session_start(repository, "expiry"))
+                    .await
+                    .unwrap();
+
+                let session = SessionAuthorization::new(
+                    storage.clone(),
+                    id,
+                    repository,
+                    "expiry".into(),
+                    credentials.clone(),
+                );
+                let (fragment, address, payload) = generate_random();
+                immutable
+                    .clone()
+                    .put(repository, address, fragment, Some(payload), false)
+                    .await
+                    .unwrap();
+                assert!(
+                    session
+                        .execute(|storage, id| async move { storage.get(id, &address).await })
+                        .await
+                        .is_ok()
+                );
+
+                now.store(expires + 61, Ordering::SeqCst);
+                assert!(matches!(
+                    session
+                        .execute(|storage, id| async move { storage.get(id, &address).await })
+                        .await,
+                    Err(ProtocolError::NotAuthenticated(_))
+                ));
+
+                credentials.update("", &token(expires + 3600, &[repository], "read"));
+                assert!(
+                    session
+                        .execute(|storage, id| async move { storage.get(id, &address).await })
+                        .await
+                        .is_ok()
+                );
+
+                let (new_fragment, new_address, new_payload) = generate_random();
+                assert!(matches!(
+                    session
+                        .execute(|storage, id| {
+                            let payload = new_payload.clone();
+                            async move {
+                                storage
+                                    .put(id, new_address, new_fragment, Some(payload))
+                                    .await
+                            }
+                        })
+                        .await,
+                    Err(ProtocolError::NotAuthorized(_))
+                ));
+                assert!(immutable.get(repository, new_address).await.is_err());
+            }),
+        )
+        .await;
     }
 }

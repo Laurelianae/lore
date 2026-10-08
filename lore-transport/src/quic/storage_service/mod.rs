@@ -7,7 +7,10 @@ use super::QuicOpCode;
 use super::UnknownCommand;
 use super::command_header::CommandHeader;
 
+#[cfg(not(feature = "test-util"))]
 mod auth;
+#[cfg(feature = "test-util")]
+pub mod auth;
 pub mod client;
 
 pub const MAX_CHUNK_SIZE: usize = lore_base::types::FRAGMENT_SIZE_THRESHOLD

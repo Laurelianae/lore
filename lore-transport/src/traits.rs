@@ -82,7 +82,11 @@ pub trait Protocol: Send + Sync {
     ) -> Result<Arc<dyn Environment>, ProtocolError>;
 }
 
-/// Storage protocol
+/// Storage protocol.
+///
+/// Storage operations may return `NotAuthenticated` only for a rejection before
+/// dispatch: `StorageSession` can reauthorize and replay such a request once.
+/// Permission denials must return `NotAuthorized` and are never replayed.
 #[async_trait]
 pub trait Storage: Send + Sync {
     /// Start a session for the given partition and correlation ID.

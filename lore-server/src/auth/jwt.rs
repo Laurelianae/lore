@@ -18,6 +18,23 @@ use tracing::warn;
 use super::jwk::JWKServiceError;
 use crate::auth::jwk::JWKService;
 
+/// JWT clock skew allowance, shared by fresh verification and cached QUIC grants.
+pub const AUTHORIZATION_LEEWAY_SECONDS: u64 = 60;
+
+/// Matches jsonwebtoken's whole-second expiry boundary, without overflowing `exp`.
+/// Equality at the end of the skew allowance remains valid.
+pub fn authorization_expired(expires: u64, now: u64) -> bool {
+    now.saturating_sub(AUTHORIZATION_LEEWAY_SECONDS) > expires
+}
+
+/// Clock used when admitting work against cached authorization. JWT verification itself
+/// uses the same epoch-second source through jsonwebtoken.
+pub type AuthorizationClock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+pub fn authorization_clock() -> AuthorizationClock {
+    Arc::new(jsonwebtoken::get_current_timestamp)
+}
+
 /// From Lore protos, but cannot derive deserialize on external type
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
 pub struct ResourcePermission {
@@ -327,6 +344,7 @@ impl JwtVerifier {
         }
 
         validation.validate_exp = true;
+        validation.leeway = AUTHORIZATION_LEEWAY_SECONDS;
 
         debug!("Decoding JWT token");
 

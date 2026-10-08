@@ -245,6 +245,9 @@ impl ServiceClient for StorageClient {
             }
             SendWithReconnectError::ClientError(client_error) => match client_error {
                 QuicClientError::SlowDown => ProtocolError::from(SlowDown),
+                QuicClientError::AuthorizationExpired => {
+                    ProtocolError::from(lore_base::error::NotAuthenticated)
+                }
                 QuicClientError::NotAuthorized => ProtocolError::from(NotAuthorized),
                 QuicClientError::NotFound => ProtocolError::from(NotFound),
                 QuicClientError::Oversized => ProtocolError::from(Oversized {

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 use std::sync::Weak;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -16,6 +18,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
 
 use crate::connection::Connection;
+use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
 use crate::traits::Storage;
 
@@ -34,17 +37,108 @@ pub struct StorageSession {
 }
 
 struct ResolvedFields {
-    storage: Arc<dyn Storage>,
-    /// Keeps the connection alive while this session exists, and is what a source partition is
-    /// authorized on — authorization is per connection, not per session.
     connection: Arc<Connection>,
-    session_id: u32,
-    /// The partition this session was started for, so a copy naming it as its source needs no
-    /// authorization beyond the session itself.
+    authorization: Arc<SessionAuthorization>,
+}
+
+/// Refresh state is shared by pooled and lazy handles. Only an explicit pre-dispatch
+/// authentication rejection permits replay; permission denials never enter this path.
+#[lore_macro::test_pub]
+pub(crate) struct SessionAuthorization {
+    storage: Arc<dyn Storage>,
+    session_id: AtomicU32,
+    generation: AtomicU64,
     partition: Partition,
-    /// The correlation id the session was started under, so authorizing a further partition on this
-    /// connection is attributed to the same command.
     correlation_id: Arc<str>,
+    credentials: Arc<SuppliedCredentials>,
+    /// Serializes replacement and shares failed authorization within a credential generation.
+    refresh: TokioMutex<Option<(u64, ProtocolError)>>,
+}
+
+impl SessionAuthorization {
+    #[lore_macro::test_pub]
+    pub(crate) fn new(
+        storage: Arc<dyn Storage>,
+        session_id: u32,
+        partition: Partition,
+        correlation_id: Arc<str>,
+        credentials: Arc<SuppliedCredentials>,
+    ) -> Self {
+        Self {
+            storage,
+            session_id: AtomicU32::new(session_id),
+            partition,
+            correlation_id,
+            generation: AtomicU64::new(credentials.credential_generation()),
+            credentials,
+            refresh: TokioMutex::new(None),
+        }
+    }
+
+    #[lore_macro::test_pub]
+    pub(crate) async fn execute<T, F, Fut>(&self, operation: F) -> Result<T, ProtocolError>
+    where
+        F: Fn(Arc<dyn Storage>, u32) -> Fut,
+        Fut: std::future::Future<Output = Result<T, ProtocolError>>,
+    {
+        let failed_id = self.session_id.load(Ordering::Acquire);
+        match operation(self.storage.clone(), failed_id).await {
+            Err(ProtocolError::NotAuthenticated(_)) => {}
+            result => return result,
+        }
+
+        // Keep the gate through replay, so expiry of a replacement is shared before
+        // another caller can authorize yet another session with the same credential.
+        let mut failure = self.refresh.lock().await;
+        let generation = self.credentials.credential_generation();
+        if let Some((failed_generation, error)) = failure.as_ref()
+            && *failed_generation == generation
+        {
+            return Err(error.clone());
+        }
+        let mut replacement = self.session_id.load(Ordering::Acquire);
+        // A concurrent replacement is reusable only while its credential generation
+        // is still current. Otherwise one replay would knowingly use an obsolete grant.
+        if replacement == failed_id || self.generation.load(Ordering::Acquire) != generation {
+            let retired_id = replacement;
+            match self
+                .storage
+                .session_start(self.partition, &self.correlation_id)
+                .await
+            {
+                Ok(session_id) => {
+                    self.generation.store(generation, Ordering::Release);
+                    self.session_id.store(session_id, Ordering::Release);
+                    replacement = session_id;
+                    *failure = None;
+                    // Cleanup is independent of cancellation of the operation's replay.
+                    let storage = self.storage.clone();
+                    lore_spawn_net!(async move {
+                        let _ = storage.session_stop(retired_id).await;
+                    });
+                }
+                Err(error) => {
+                    // Backpressure and transport failures keep their normal retry behavior.
+                    // Only credential failures settle authorization for this generation.
+                    if matches!(
+                        error,
+                        ProtocolError::NotAuthenticated(_) | ProtocolError::NotAuthorized(_)
+                    ) {
+                        *failure = Some((generation, error.clone()));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let result = operation(self.storage.clone(), replacement).await;
+        if matches!(result, Err(ProtocolError::NotAuthenticated(_))) {
+            *failure = Some((
+                self.generation.load(Ordering::Acquire),
+                ProtocolError::from(lore_base::error::NotAuthenticated),
+            ));
+        }
+        result
+    }
 }
 
 /// Closure signature for a pending session's resolver. Returns an eager
@@ -89,11 +183,14 @@ impl StorageSession {
     ) -> Self {
         Self {
             inner: SessionInner::Resolved(ResolvedFields {
-                storage,
+                authorization: Arc::new(SessionAuthorization::new(
+                    storage,
+                    session_id,
+                    partition,
+                    correlation_id,
+                    connection.credentials().clone(),
+                )),
                 connection,
-                session_id,
-                partition,
-                correlation_id,
             }),
         }
     }
@@ -130,6 +227,7 @@ impl StorageSession {
     /// operation on it re-runs the resolver and obtains a `session_id` the server
     /// knows about. An eager one keeps the id it was built with, so a caller that
     /// invalidates and retries the same session has to hold a lazy one.
+    /// Authorization expiry instead refreshes the stored ID for either kind of session.
     pub fn is_lazy(&self) -> bool {
         matches!(self.inner, SessionInner::Pending { .. })
     }
@@ -202,16 +300,18 @@ impl StorageSession {
         }
     }
 
-    /// Get the resolved `(storage, session_id)` pair, driving the pending
-    /// resolver on first call. All operation methods go through here.
-    async fn ensure(&self) -> Result<(Arc<dyn Storage>, u32), ProtocolError> {
-        self.with_resolved(|r| (r.storage.clone(), r.session_id))
-            .await
+    async fn execute<T, F, Fut>(&self, operation: F) -> Result<T, ProtocolError>
+    where
+        F: Fn(Arc<dyn Storage>, u32) -> Fut,
+        Fut: std::future::Future<Output = Result<T, ProtocolError>>,
+    {
+        let authorization = self.with_resolved(|r| r.authorization.clone()).await?;
+        authorization.execute(operation).await
     }
 
     /// The partition this session is scoped to, driving the pending resolver on first call.
     pub async fn partition(&self) -> Result<Partition, ProtocolError> {
-        self.with_resolved(|r| r.partition).await
+        self.with_resolved(|r| r.authorization.partition).await
     }
 
     /// Whether a [`StorageSession::copy`] on this session may name `partition` as its source.
@@ -223,7 +323,13 @@ impl StorageSession {
     /// refuse for a cached lookup.
     pub async fn can_copy_from(&self, partition: Partition) -> bool {
         let Ok((connection, own, correlation_id)) = self
-            .with_resolved(|r| (r.connection.clone(), r.partition, r.correlation_id.clone()))
+            .with_resolved(|r| {
+                (
+                    r.connection.clone(),
+                    r.authorization.partition,
+                    r.authorization.correlation_id.clone(),
+                )
+            })
             .await
         else {
             return false;
@@ -238,16 +344,18 @@ impl StorageSession {
     }
 
     pub async fn get(&self, address: &Address) -> Result<(Fragment, Bytes), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage.get(session_id, address).await
+        self.execute(|storage, session_id| async move { storage.get(session_id, address).await })
+            .await
     }
 
     pub async fn get_priority(
         &self,
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage.get_priority(session_id, address).await
+        self.execute(|storage, session_id| async move {
+            storage.get_priority(session_id, address).await
+        })
+        .await
     }
 
     pub async fn put(
@@ -256,13 +364,16 @@ impl StorageSession {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<(), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage.put(session_id, address, fragment, payload).await
+        self.execute(|storage, session_id| {
+            let payload = payload.clone();
+            async move { storage.put(session_id, address, fragment, payload).await }
+        })
+        .await
     }
 
     pub async fn query(&self, address: &[Address]) -> Result<Bytes, ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage.query(session_id, address).await
+        self.execute(|storage, session_id| async move { storage.query(session_id, address).await })
+            .await
     }
 
     pub async fn verify(
@@ -270,8 +381,10 @@ impl StorageSession {
         address: &Address,
         heal: bool,
     ) -> Result<VerifyResult, ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage.verify(session_id, address, heal).await
+        self.execute(|storage, session_id| async move {
+            storage.verify(session_id, address, heal).await
+        })
+        .await
     }
 
     pub async fn copy(
@@ -280,10 +393,12 @@ impl StorageSession {
         source_address: Address,
         target_context: Context,
     ) -> Result<(), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage
-            .copy(session_id, source_partition, source_address, target_context)
-            .await
+        self.execute(|storage, session_id| async move {
+            storage
+                .copy(session_id, source_partition, source_address, target_context)
+                .await
+        })
+        .await
     }
 
     /// Fetch only fragment metadata (`flags`, `size_payload`, `size_content`) for `address`.
@@ -291,13 +406,17 @@ impl StorageSession {
     /// Use this when the caller needs metadata without paying the payload transfer cost — e.g.
     /// the storage API's `query` op for remote-hit metadata lookups.
     pub async fn get_metadata(&self, address: &Address) -> Result<Fragment, ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage.get_metadata(session_id, address).await
+        self.execute(|storage, session_id| async move {
+            storage.get_metadata(session_id, address).await
+        })
+        .await
     }
 
     pub async fn mutable_load(&self, key: &Hash, key_type: KeyType) -> Result<Hash, ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage.mutable_load(session_id, key, key_type).await
+        self.execute(|storage, session_id| async move {
+            storage.mutable_load(session_id, key, key_type).await
+        })
+        .await
     }
 
     /// `mutable_load` + `get` in one round trip, always reading the key as
@@ -309,8 +428,10 @@ impl StorageSession {
         context: &Context,
         flags: u32,
     ) -> Result<(Hash, Fragment, Bytes), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage.get_resolved(session_id, key, context, flags).await
+        self.execute(|storage, session_id| async move {
+            storage.get_resolved(session_id, key, context, flags).await
+        })
+        .await
     }
 
     /// `put` + `mutable_store` in one round trip: store the fragment, then map `key` to
@@ -322,10 +443,15 @@ impl StorageSession {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<(), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage
-            .put_resolved(session_id, key, address, fragment, payload)
-            .await
+        self.execute(|storage, session_id| {
+            let payload = payload.clone();
+            async move {
+                storage
+                    .put_resolved(session_id, key, address, fragment, payload)
+                    .await
+            }
+        })
+        .await
     }
 
     pub async fn mutable_store(
@@ -334,10 +460,12 @@ impl StorageSession {
         value: Hash,
         key_type: KeyType,
     ) -> Result<(), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage
-            .mutable_store(session_id, key, value, key_type)
-            .await
+        self.execute(|storage, session_id| async move {
+            storage
+                .mutable_store(session_id, key, value, key_type)
+                .await
+        })
+        .await
     }
 
     pub async fn mutable_compare_and_swap(
@@ -347,27 +475,24 @@ impl StorageSession {
         value: Hash,
         key_type: KeyType,
     ) -> Result<Hash, ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
-        storage
-            .mutable_compare_and_swap(session_id, key, expected, value, key_type)
-            .await
+        self.execute(|storage, session_id| async move {
+            storage
+                .mutable_compare_and_swap(session_id, key, expected, value, key_type)
+                .await
+        })
+        .await
     }
 }
 
-impl Drop for StorageSession {
+impl Drop for SessionAuthorization {
     fn drop(&mut self) {
-        // Only the Resolved variant owns a server-side session directly. A
-        // Pending variant that never resolved has nothing to stop. A Pending
-        // variant that did resolve delegates: the inner Arc<StorageSession>
-        // in the OnceCell has its own Drop that fires session_stop when its
-        // refcount reaches zero.
-        if let SessionInner::Resolved(r) = &self.inner {
-            let storage = r.storage.clone();
-            let session_id = r.session_id;
-            lore_base::lore_spawn_net!(async move {
-                let _ = storage.session_stop(session_id).await;
-            });
-        }
+        // Operations retain this Arc independently of the pooled/lazy handle. Final
+        // ownership therefore ends only after every refresh can no longer change the ID.
+        let storage = self.storage.clone();
+        let session_id = self.session_id.load(Ordering::Acquire);
+        lore_spawn_net!(async move {
+            let _ = storage.session_stop(session_id).await;
+        });
     }
 }
 

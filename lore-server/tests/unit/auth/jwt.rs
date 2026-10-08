@@ -1270,3 +1270,22 @@ mod jwt_verifier {
         }
     }
 }
+
+#[test]
+fn cached_expiry_matches_verifier_skew_and_boundary() {
+    assert!(!authorization_expired(100, 99));
+    assert!(!authorization_expired(100, 100));
+    assert!(!authorization_expired(100, 159));
+    assert!(!authorization_expired(100, 160));
+    assert!(authorization_expired(100, 161));
+    assert!(!authorization_expired(0, 0));
+    assert!(!authorization_expired(0, 60));
+    assert!(authorization_expired(0, 61));
+    assert!(!authorization_expired(u64::MAX, u64::MAX));
+    assert!(!authorization_expired(u64::MAX - 60, u64::MAX));
+    assert!(authorization_expired(u64::MAX - 61, u64::MAX));
+    assert_eq!(
+        jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256).leeway,
+        AUTHORIZATION_LEEWAY_SECONDS
+    );
+}

@@ -76,6 +76,7 @@ pub enum ParsedStorageRequestV4 {
 
 fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
     match error {
+        MessageHandleError::AuthorizationExpired => QuicServiceError::AuthorizationExpired,
         MessageHandleError::AuthorizationFailure(_) | MessageHandleError::MissingToken => {
             QuicServiceError::NotAuthorized
         }
@@ -98,6 +99,7 @@ pub struct StorageServiceV4 {
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     session_map: Arc<SessionMap>,
+    clock: crate::auth::jwt::AuthorizationClock,
     user_agent_filter: Arc<UserAgentFilter>,
 }
 
@@ -117,6 +119,7 @@ impl StorageServiceV4 {
             local_store,
             mutable_store,
             session_map: Arc::new(SessionMap::default()),
+            clock: crate::auth::jwt::authorization_clock(),
             user_agent_filter,
         }
     }
@@ -209,7 +212,7 @@ impl QuicService for StorageServiceV4 {
                     let authorization = jwt_verifier
                         .verify_token(&token_str)
                         .await
-                        .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
+                        .map_err(MessageHandleError::from)?;
 
                     let verified = VerifiedToken {
                         raw: &token_str,
@@ -227,6 +230,11 @@ impl QuicService for StorageServiceV4 {
                     user_id = crate::util::get_user_id_from_token(Some(authorization));
                 }
 
+                if token.as_ref().is_some_and(|token| {
+                    crate::auth::jwt::authorization_expired(token.claims.expires, (self.clock)())
+                }) {
+                    return Err(MessageHandleError::AuthorizationExpired);
+                }
                 let session_map = self.session_map.clone();
                 match session_map.start(repository, correlation_id, user_id, grants, token) {
                     Ok((session_id, correlation_id)) => {
@@ -240,9 +248,11 @@ impl QuicService for StorageServiceV4 {
                         Ok(response_data)
                     }
                     Err(SessionError::LimitReached) => Err(MessageHandleError::SessionLimitReached),
-                    Err(SessionError::CounterExhausted | SessionError::NotFound) => {
-                        Err(MessageHandleError::InternalError)
-                    }
+                    Err(
+                        SessionError::CounterExhausted
+                        | SessionError::NotFound
+                        | SessionError::AuthorizationExpired,
+                    ) => Err(MessageHandleError::InternalError),
                 }
             }
             ParsedStorageRequestV4::AuthorizeStop { session_id } => {
@@ -263,8 +273,17 @@ impl QuicService for StorageServiceV4 {
             } => {
                 let session_map = self.session_map.clone();
                 let session = session_map
-                    .get(session_id)
-                    .ok_or(MessageHandleError::NotConnected)?;
+                    .get_authorized(session_id, (self.clock)())
+                    .map_err(|err| match err {
+                        SessionError::AuthorizationExpired => {
+                            MessageHandleError::AuthorizationExpired
+                        }
+                        SessionError::NotFound => MessageHandleError::NotConnected,
+                        _ => MessageHandleError::InternalError,
+                    })?;
+                if self.jwt_verifier.is_some() && session.token.is_none() {
+                    return Err(MessageHandleError::MissingToken);
+                }
 
                 let repository = session.repository;
                 let correlation_id = session.correlation_id.clone();

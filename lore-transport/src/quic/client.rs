@@ -491,6 +491,7 @@ where
                 if matches!(
                     err,
                     QuicClientError::SlowDown
+                        | QuicClientError::AuthorizationExpired
                         | QuicClientError::NotAuthorized
                         | QuicClientError::NotFound
                         | QuicClientError::ClientMessageTooBig

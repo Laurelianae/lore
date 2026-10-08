@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 
@@ -17,6 +18,8 @@ use crate::authnz::repository_authorizer::VerifiedTokenOwned;
 pub(crate) const MAX_CONCURRENT_SESSIONS: u32 = 10_000;
 
 pub struct SessionEntry {
+    /// Sticky retirement: a backwards clock adjustment cannot revive this grant.
+    pub retired: AtomicBool,
     pub repository: RepositoryId,
     pub correlation_id: String,
     pub user_id: String,
@@ -72,6 +75,7 @@ pub enum SessionError {
     LimitReached,
     CounterExhausted,
     NotFound,
+    AuthorizationExpired,
 }
 
 impl Default for SessionMap {
@@ -112,6 +116,7 @@ impl SessionMap {
         self.entries.insert(
             session_id,
             SessionEntry {
+                retired: AtomicBool::new(false),
                 repository,
                 correlation_id: correlation_id.clone(),
                 user_id,
@@ -130,6 +135,31 @@ impl SessionMap {
             Some(_) => Ok(()),
             None => Err(SessionError::NotFound),
         }
+    }
+
+    /// Admit a command before it reads cached grants or copy permissions. The retained
+    /// retired entry keeps repeated requests classified as expiry until stopped.
+    pub fn get_authorized(
+        &self,
+        session_id: u32,
+        now: u64,
+    ) -> Result<dashmap::mapref::one::Ref<'_, u32, SessionEntry>, SessionError> {
+        let entry = self
+            .entries
+            .get(&session_id)
+            .ok_or(SessionError::NotFound)?;
+        if entry.retired.load(Ordering::Acquire) {
+            return Err(SessionError::AuthorizationExpired);
+        }
+        if entry
+            .token
+            .as_ref()
+            .is_some_and(|token| crate::auth::jwt::authorization_expired(token.claims.expires, now))
+        {
+            entry.retired.store(true, Ordering::Release);
+            return Err(SessionError::AuthorizationExpired);
+        }
+        Ok(entry)
     }
 
     pub fn get(&self, session_id: u32) -> Option<dashmap::mapref::one::Ref<'_, u32, SessionEntry>> {

@@ -47,6 +47,14 @@ pub enum QuicServiceError {
     Failed = 3,
     NotFound = 4,
     Oversized = 5,
+    /// The storage command was rejected before dispatch because cached authorization
+    /// expired. Both v4 and legacy storage emit this status without ALPN negotiation.
+    /// Upgraded clients classify it as `NotAuthenticated`; older clients fail closed
+    /// through their unknown-status path and may report a generic/Internal error.
+    /// Legacy connections must reconnect with a fresh credential; v4 sessions can
+    /// reauthorize on the same connection. Upgraded clients cannot enforce expiry
+    /// when talking to an older server that still accepts expired cached grants.
+    AuthorizationExpired = 6,
     SlowDown = 100,
     // service specific implementations can use 200-299
     ImplementationReserved = RESERVED_ERROR_CODE_START,
@@ -81,6 +89,8 @@ pub enum QuicClientError {
     Permit,
     #[error("Slow down")]
     SlowDown,
+    #[error("Authorization expired")]
+    AuthorizationExpired,
     #[error("Not authorized")]
     NotAuthorized,
     #[error("Not found")]

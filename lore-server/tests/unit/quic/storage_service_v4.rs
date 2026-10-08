@@ -223,16 +223,21 @@ mod authorized_session {
     }
 
     fn signed_token(resource_ids: &[&str], permissions: &[&str]) -> String {
+        let expires = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .add(Duration::from_secs(60))
+            .as_secs();
+        signed_token_at(resource_ids, permissions, expires)
+    }
+
+    fn signed_token_at(resource_ids: &[&str], permissions: &[&str], expires: u64) -> String {
         let claims = AuthorizationToken {
             user_id: "test-user".to_string(),
             issuer: "test-issuer".to_string(),
             issued_at: 1,
             audience: vec![TEST_AUDIENCE.to_string()],
-            expires: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .add(Duration::from_secs(60))
-                .as_secs(),
+            expires,
             resources: Some(
                 resource_ids
                     .iter()
@@ -285,6 +290,172 @@ mod authorized_session {
             )
             .await?;
         Ok(u32::from_le_bytes(response[0][..4].try_into().unwrap()))
+    }
+
+    #[tokio::test]
+    async fn open_session_rejects_commands_after_token_expiry() {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+        let mut service = authenticated_service().await;
+        let repository = random();
+        let token = signed_token(&[&format!("urc-{repository}")], &["write"]);
+        let session_id = start_session(&service, repository, &token).await.unwrap();
+        let expires = service
+            .session_map
+            .get(session_id)
+            .unwrap()
+            .token
+            .as_ref()
+            .unwrap()
+            .claims
+            .expires;
+        let now = Arc::new(AtomicU64::new(expires));
+        service.clock = {
+            let now = now.clone();
+            Arc::new(move || now.load(Ordering::SeqCst))
+        };
+        // An empty Query is valid and reaches the store before expiry.
+        let query = || ParsedStorageRequestV4::StorageCommand {
+            session_id,
+            opcode: lore_transport::quic::storage_service::Command::Query as u8,
+            payload: Bytes::new(),
+        };
+        assert!(
+            service
+                .run_request_handler(AttributeMap::default().into(), query())
+                .await
+                .is_ok()
+        );
+        now.store(expires + 60, Ordering::SeqCst);
+        assert!(
+            service
+                .run_request_handler(AttributeMap::default().into(), query())
+                .await
+                .is_ok()
+        );
+        now.store(expires + 61, Ordering::SeqCst);
+        let source = random();
+        service
+            .session_map
+            .get(session_id)
+            .unwrap()
+            .authorized_sources
+            .insert(source);
+        for command in [
+            Command::Get,
+            Command::GetMetadata,
+            Command::Put,
+            Command::Query,
+            Command::Verify,
+            Command::Copy,
+            Command::MutableLoad,
+            Command::MutableStore,
+            Command::MutableCas,
+            Command::GetResolved,
+            Command::PutResolved,
+        ] {
+            // Malformed payloads still receive expiry: parsing and storage dispatch never run.
+            let result = service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::StorageCommand {
+                        session_id,
+                        opcode: command as u8,
+                        payload: Bytes::new(),
+                    },
+                )
+                .await;
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, MessageHandleError::AuthorizationExpired),
+                "{command:?}: {error:?}"
+            );
+            let mapped = service.transform_protocol_error(&error);
+            assert_eq!(
+                mapped.response_error_code,
+                QuicServiceError::AuthorizationExpired as u32
+            );
+            assert!(!mapped.is_internal_error);
+        }
+        now.store(expires, Ordering::SeqCst);
+        assert!(matches!(
+            service
+                .run_request_handler(AttributeMap::default().into(), query())
+                .await,
+            Err(MessageHandleError::AuthorizationExpired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn near_expiry_start_does_not_extend_the_grant() {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+        let mut service = authenticated_service().await;
+        let repository = random();
+        let expires = jsonwebtoken::get_current_timestamp() + 10;
+        let token = signed_token_at(&[&format!("urc-{repository}")], &["read"], expires);
+        let now = Arc::new(AtomicU64::new(expires + 59));
+        service.clock = {
+            let now = now.clone();
+            Arc::new(move || now.load(Ordering::SeqCst))
+        };
+        let id = start_session(&service, repository, &token).await.unwrap();
+        now.store(expires + 61, Ordering::SeqCst);
+        assert!(matches!(
+            service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::StorageCommand {
+                        session_id: id,
+                        opcode: Command::Query as u8,
+                        payload: Bytes::new()
+                    }
+                )
+                .await,
+            Err(MessageHandleError::AuthorizationExpired)
+        ));
+        assert!(
+            service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::AuthorizeStop { session_id: id }
+                )
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            start_session(&service, repository, &token).await,
+            Err(MessageHandleError::AuthorizationExpired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_and_malformed_credentials_never_open_an_authenticated_session() {
+        let service = authenticated_service().await;
+        for (token, missing) in [
+            (vec![], true),
+            (vec![255], false),
+            (b"invalid.jwt".to_vec(), false),
+        ] {
+            let result = service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::AuthorizeStart {
+                        repository: random(),
+                        correlation_id: String::new(),
+                        auth_token: token,
+                    },
+                )
+                .await;
+            if missing {
+                assert!(matches!(result, Err(MessageHandleError::MissingToken)));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(MessageHandleError::AuthorizationFailure(_))
+                ));
+            }
+        }
     }
 
     /// A granted session stores the enumerated grants and the verified
@@ -457,5 +628,20 @@ mod authorized_session {
             .await
             .expect_err("a token granting another partition must be refused");
         assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
+    }
+    #[tokio::test]
+    async fn expired_token_is_classified_during_initial_authorization() {
+        let repository = random::<lore_revision::lore::RepositoryId>();
+        let token = signed_token_at(
+            &[&format!("urc-{repository}")],
+            &["write"],
+            jsonwebtoken::get_current_timestamp() - 61,
+        );
+        let service = authenticated_service().await;
+        let result = start_session(&service, repository, &token).await;
+        assert!(matches!(
+            result,
+            Err(MessageHandleError::AuthorizationExpired)
+        ));
     }
 }

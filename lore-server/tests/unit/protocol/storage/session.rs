@@ -42,6 +42,7 @@ mod entry_permits {
 
     fn entry(grants: Option<Grants>, token: Option<Arc<VerifiedTokenOwned>>) -> SessionEntry {
         SessionEntry {
+            retired: std::sync::atomic::AtomicBool::new(false),
             repository: random(),
             correlation_id: "corr".to_string(),
             user_id: String::new(),
@@ -54,7 +55,10 @@ mod entry_permits {
     fn owned_token() -> Arc<VerifiedTokenOwned> {
         Arc::new(VerifiedTokenOwned {
             raw: "raw.jwt".to_string(),
-            claims: AuthorizationToken::default(),
+            claims: AuthorizationToken {
+                expires: jsonwebtoken::get_current_timestamp() + 3600,
+                ..Default::default()
+            },
         })
     }
 
@@ -240,4 +244,49 @@ fn limit_freed_by_stop() {
     map.stop(ids[0]).unwrap();
     map.start(repo, "freed".into(), String::new(), None, None)
         .unwrap();
+}
+
+#[test]
+fn retirement_is_sticky_and_scoped_to_one_session() {
+    use lore_server::auth::jwt::AuthorizationToken;
+    let map = SessionMap::default();
+    let token = |expires| {
+        Some(Arc::new(VerifiedTokenOwned {
+            raw: "verified".into(),
+            claims: AuthorizationToken {
+                expires,
+                ..Default::default()
+            },
+        }))
+    };
+    let (expired, _) = map
+        .start(random(), "expired".into(), String::new(), None, token(100))
+        .unwrap();
+    let (valid, _) = map
+        .start(random(), "valid".into(), String::new(), None, token(1000))
+        .unwrap();
+    let (anonymous, _) = map
+        .start(random(), "anonymous".into(), String::new(), None, None)
+        .unwrap();
+    let source = random();
+    map.get(expired).unwrap().authorized_sources.insert(source);
+    assert!(map.get_authorized(expired, 100).is_ok());
+    assert!(map.get_authorized(expired, 160).is_ok());
+    assert!(matches!(
+        map.get_authorized(expired, 161),
+        Err(SessionError::AuthorizationExpired)
+    ));
+    assert!(matches!(
+        map.get_authorized(expired, 99),
+        Err(SessionError::AuthorizationExpired)
+    ));
+    assert!(map.get_authorized(valid, 161).is_ok());
+    assert!(map.get_authorized(anonymous, u64::MAX).is_ok());
+    // Retirement preserves the ID for repeated classified failures, including copies.
+    assert!(map.get(expired).is_some());
+    map.stop(expired).unwrap();
+    assert!(matches!(
+        map.get_authorized(expired, 161),
+        Err(SessionError::NotFound)
+    ));
 }

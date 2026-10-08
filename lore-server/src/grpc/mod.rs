@@ -96,6 +96,10 @@ pub fn map_message_handle_error_to_status(
     details: Option<Bytes>,
 ) -> Status {
     let (code, message) = match error {
+        MessageHandleError::AuthorizationExpired => (
+            Code::Unauthenticated,
+            message.unwrap_or_else(|| "Authorization expired".into()),
+        ),
         MessageHandleError::AuthorizationFailure(err) => (
             Code::PermissionDenied,
             message.unwrap_or_else(|| format!("Authorization failed {err}")),

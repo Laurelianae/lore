@@ -308,6 +308,22 @@ pub mod tests {
             jwt_verifier: Arc<Option<crate::auth::jwt::JwtVerifier>>,
             authorizer: Arc<dyn crate::authnz::repository_authorizer::RepositoryAuthorizer>,
         ) -> Self {
+            Self::with_authorization_clock(
+                immutable_store,
+                mutable_store,
+                jwt_verifier,
+                authorizer,
+                crate::auth::jwt::authorization_clock(),
+            )
+        }
+
+        pub fn with_authorization_clock(
+            immutable_store: Arc<dyn ImmutableStore>,
+            mutable_store: Arc<dyn MutableStore>,
+            jwt_verifier: Arc<Option<crate::auth::jwt::JwtVerifier>>,
+            authorizer: Arc<dyn crate::authnz::repository_authorizer::RepositoryAuthorizer>,
+            clock: crate::auth::jwt::AuthorizationClock,
+        ) -> Self {
             let contexts: ObservedContexts = Arc::default();
             let mut service_store = ServiceStore::default();
             {
@@ -316,17 +332,19 @@ pub mod tests {
                 let contexts = contexts.clone();
                 let jwt_verifier = jwt_verifier.clone();
                 let authorizer = authorizer.clone();
+                let clock = clock.clone();
                 service_store.add_service(
                     TEST_PROTOCOL,
                     Box::new(move |context: Arc<AttributeMap>| {
                         contexts.lock().push(context.clone());
-                        let storage_protocol = StorageService::new(
+                        let mut storage_protocol = StorageService::new(
                             jwt_verifier.clone(),
                             authorizer.clone(),
                             immutable_store.clone(),
                             immutable_store.clone(),
                             mutable_store.clone(),
                         );
+                        storage_protocol.clock = clock.clone();
                         Box::new(StreamHandler::new(
                             Arc::new(storage_protocol),
                             context,
@@ -346,11 +364,12 @@ pub mod tests {
                 let contexts = contexts.clone();
                 let jwt_verifier = jwt_verifier.clone();
                 let authorizer = authorizer.clone();
+                let clock = clock.clone();
                 service_store.add_service(
                     TEST_PROTOCOL_V4,
                     Box::new(move |context: Arc<AttributeMap>| {
                         contexts.lock().push(context.clone());
-                        let v4_service = StorageServiceV4::new(
+                        let mut v4_service = StorageServiceV4::new(
                             jwt_verifier.clone(),
                             authorizer.clone(),
                             immutable_store.clone(),
@@ -358,6 +377,7 @@ pub mod tests {
                             mutable_store.clone(),
                             Arc::new(lore_telemetry::user_agent_filter::UserAgentFilter::default()),
                         );
+                        v4_service.clock = clock.clone();
                         Box::new(StreamHandler::new(
                             Arc::new(v4_service),
                             context,

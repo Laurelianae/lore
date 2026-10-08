@@ -87,7 +87,7 @@ impl Message for Connect {
                     let authorization = jwt_verifier
                         .verify_token(auth_token)
                         .await
-                        .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
+                        .map_err(MessageHandleError::from)?;
                     let token = VerifiedToken {
                         raw: auth_token,
                         claims: &authorization,

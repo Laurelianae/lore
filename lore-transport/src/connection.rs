@@ -758,6 +758,13 @@ impl SuppliedCredentials {
         !tokens.0.is_empty() || !tokens.1.is_empty()
     }
 
+    /// Invalidation signal for failed session refreshes, not an atomic token snapshot.
+    /// `update` publishes tokens before advancing this signal. A raced refresh may
+    /// record an older generation and conservatively reauthorize again later.
+    pub(crate) fn credential_generation(&self) -> u64 {
+        *self.generation.borrow()
+    }
+
     /// The credentials to use now, as `(identity_token, access_token)`.
     pub fn tokens(&self) -> (String, String) {
         self.tokens.read().clone()

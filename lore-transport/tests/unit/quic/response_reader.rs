@@ -7,6 +7,10 @@ use lore_transport::quic::response_reader::*;
 #[test]
 fn maps_known_service_errors_to_typed_variants() {
     assert!(matches!(
+        handle_error(QuicServiceError::AuthorizationExpired as u32),
+        QuicClientError::AuthorizationExpired
+    ));
+    assert!(matches!(
         handle_error(QuicServiceError::NotAuthorized as u32),
         QuicClientError::NotAuthorized
     ));

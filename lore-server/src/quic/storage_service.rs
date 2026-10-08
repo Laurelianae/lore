@@ -319,6 +319,7 @@ impl ParsedStorageRequest {
 
 fn quic_error(message_error: &MessageHandleError) -> QuicServiceError {
     match message_error {
+        MessageHandleError::AuthorizationExpired => QuicServiceError::AuthorizationExpired,
         MessageHandleError::AuthorizationFailure(_) | MessageHandleError::MissingToken => {
             QuicServiceError::NotAuthorized
         }
@@ -417,6 +418,7 @@ pub fn message_handle_error_to_label(value: &MessageHandleError) -> &'static str
         MessageHandleError::QueryResultSizeMismatch => "QueryResultSizeMismatch",
         MessageHandleError::StoreFailure => "StoreFailure",
         MessageHandleError::AuthorizationFailure(_) => "AuthorizationFailure",
+        MessageHandleError::AuthorizationExpired => "AuthorizationExpired",
         MessageHandleError::MissingToken => "MissingToken",
         MessageHandleError::BranchProtected => "BranchProtected",
         MessageHandleError::Metadata => "Metadata",
@@ -432,7 +434,8 @@ pub fn message_handle_error_to_label(value: &MessageHandleError) -> &'static str
 
 pub fn is_internal_error(error: &MessageHandleError) -> bool {
     match error {
-        MessageHandleError::AuthorizationFailure(_)
+        MessageHandleError::AuthorizationExpired
+        | MessageHandleError::AuthorizationFailure(_)
         | MessageHandleError::AlreadyConnected
         | MessageHandleError::BranchExists
         | MessageHandleError::BranchMismatch
@@ -458,8 +461,13 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
     }
 }
 
+/// A legacy connection must reconnect after expiry; refreshing attributes cannot revive it.
+struct AuthorizationRetired;
+
+#[lore_macro::test_pub]
 pub struct StorageService {
     jwt_verifier: Arc<Option<JwtVerifier>>,
+    clock: crate::auth::jwt::AuthorizationClock,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -476,6 +484,7 @@ impl StorageService {
     ) -> Self {
         Self {
             jwt_verifier,
+            clock: crate::auth::jwt::authorization_clock(),
             repository_authorizer,
             immutable_store,
             local_store,
@@ -507,6 +516,23 @@ impl QuicService for StorageService {
         context: Arc<AttributeMap>,
         request: Self::ParsedRequestType,
     ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
+        if self.jwt_verifier.is_some() && !matches!(request, ParsedStorageRequest::Correlate(_)) {
+            let claims = context.get::<AuthorizationToken>();
+            // Connect must not report success on a retired connection or replace its
+            // claims after the prior authorization has expired. Legacy recovery is a
+            // fresh connection; Correlate remains available for connection diagnostics.
+            if context.get::<AuthorizationRetired>().is_some()
+                || claims.as_ref().is_some_and(|claims| {
+                    crate::auth::jwt::authorization_expired(claims.expires, (self.clock)())
+                })
+            {
+                context.insert(AuthorizationRetired);
+                return Err(MessageHandleError::AuthorizationExpired);
+            }
+            if !matches!(request, ParsedStorageRequest::Connect(_)) && claims.is_none() {
+                return Err(MessageHandleError::MissingToken);
+            }
+        }
         if request.requires_write() {
             let repository = *context
                 .get_or::<RepositoryId, MessageHandleError>(MessageHandleError::NotConnected)?;

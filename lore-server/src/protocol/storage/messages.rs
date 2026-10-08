@@ -44,6 +44,8 @@ pub enum MessageParseError {
 
 #[derive(Debug, Error)]
 pub enum MessageHandleError {
+    #[error("Authorization expired")]
+    AuthorizationExpired,
     #[error("Authorization failed ({0})")]
     AuthorizationFailure(String),
     #[error("Already connected to a repository")]
@@ -154,4 +156,16 @@ pub enum LoreResponse {
     MutableLoad(responses::MutableLoadResponse),
     MutableStore(responses::MutableStoreResponse),
     MutableCas(responses::MutableCasResponse),
+}
+
+impl From<crate::auth::jwt::JwtVerifierError> for MessageHandleError {
+    fn from(error: crate::auth::jwt::JwtVerifierError) -> Self {
+        if matches!(&error, crate::auth::jwt::JwtVerifierError::ValidationFailed(inner)
+            if matches!(inner.kind(), jsonwebtoken::errors::ErrorKind::ExpiredSignature))
+        {
+            Self::AuthorizationExpired
+        } else {
+            Self::AuthorizationFailure(error.to_string())
+        }
+    }
 }

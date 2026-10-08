@@ -178,16 +178,21 @@ mod authorized_connect {
     }
 
     fn signed_token(resource_id: &str, permissions: &[&str]) -> String {
+        let expires = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .add(Duration::from_secs(60))
+            .as_secs();
+        signed_token_at(resource_id, permissions, expires)
+    }
+
+    fn signed_token_at(resource_id: &str, permissions: &[&str], expires: u64) -> String {
         let claims = AuthorizationToken {
             user_id: "test-user".to_string(),
             issuer: "test-issuer".to_string(),
             issued_at: 1,
             audience: vec![TEST_AUDIENCE.to_string()],
-            expires: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .add(Duration::from_secs(60))
-                .as_secs(),
+            expires,
             resources: Some(vec![ResourcePermission {
                 resource_id: resource_id.to_string(),
                 permission: permissions.iter().map(ToString::to_string).collect(),
@@ -253,5 +258,28 @@ mod authorized_connect {
         assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
         assert!(context.get::<RepositoryId>().is_none());
         assert!(context.get::<PartitionGrants>().is_none());
+    }
+    #[tokio::test]
+    async fn expired_token_is_classified_during_initial_authorization() {
+        let repository = random::<RepositoryId>();
+        let token = signed_token_at(
+            &format!("urc-{repository}"),
+            &["write"],
+            jsonwebtoken::get_current_timestamp() - 61,
+        );
+        let result = Connect {
+            repository,
+            auth_token: Some(token),
+        }
+        .handle_auth(
+            Arc::new(AttributeMap::default()),
+            verifier(),
+            legacy_authorizer(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(MessageHandleError::AuthorizationExpired)
+        ));
     }
 }
