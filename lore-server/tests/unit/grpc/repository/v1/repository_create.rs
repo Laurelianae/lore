@@ -1,62 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-mod input_length_validation {
-    use lore_revision::repository;
-    use lore_server::grpc::repository::v1::repository_create::*;
-
-    #[test]
-    fn accepts_valid_input() {
-        validate_create_input("my-repo", "a description", "main", "alice")
-            .expect("valid input should pass");
-    }
-
-    #[test]
-    fn accepts_name_at_max_length() {
-        let name = "a".repeat(repository::MAX_NAME_LEN);
-        validate_create_input(&name, "desc", "main", "alice")
-            .expect("name at exactly MAX_NAME_LEN should pass");
-    }
-
-    #[test]
-    fn rejects_oversized_repository_name() {
-        let long_name = "a".repeat(repository::MAX_NAME_LEN + 1);
-        let err = validate_create_input(&long_name, "desc", "main", "alice")
-            .expect_err("should reject oversized name");
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(
-            err.message()
-                .contains("Repository name exceeds maximum length")
-        );
-    }
-
-    #[test]
-    fn rejects_oversized_description() {
-        let long_desc = "a".repeat(repository::MAX_DESCRIPTION_LEN + 1);
-        let err = validate_create_input("my-repo", &long_desc, "main", "alice")
-            .expect_err("should reject oversized description");
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("description exceeds maximum length"));
-    }
-
-    #[test]
-    fn rejects_oversized_branch_name() {
-        let long_branch = "a".repeat(repository::MAX_NAME_LEN + 1);
-        let err = validate_create_input("my-repo", "desc", &long_branch, "alice")
-            .expect_err("should reject oversized branch name");
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("Branch name exceeds maximum length"));
-    }
-
-    #[test]
-    fn rejects_oversized_creator() {
-        let long_creator = "a".repeat(repository::MAX_NAME_LEN + 1);
-        let err = validate_create_input("my-repo", "desc", "main", &long_creator)
-            .expect_err("should reject oversized creator");
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("Creator exceeds maximum length"));
-    }
-}
-
 mod forwarded_request {
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -202,6 +145,9 @@ mod forwarded_request {
             let response = handler(
                 make_request(repository_id, "test-repo"),
                 None, /* no auth */
+                std::sync::Arc::new(
+                    lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer,
+                ),
                 immutable_store,
                 mutable_store,
                 &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -237,6 +183,9 @@ mod forwarded_request {
             let err = handler(
                 make_request(repository_id, "test-repo"),
                 None,
+                std::sync::Arc::new(
+                    lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer,
+                ),
                 immutable_store,
                 mutable_store,
                 &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -268,6 +217,9 @@ mod forwarded_request {
             let err = handler(
                 make_request(repository_id, "test-repo"),
                 None,
+                std::sync::Arc::new(
+                    lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer,
+                ),
                 immutable_store,
                 mutable_store,
                 &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -301,6 +253,9 @@ mod forwarded_request {
             let response = handler(
                 make_request(repository_id, "my-repo"),
                 None, /* no auth */
+                std::sync::Arc::new(
+                    lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer,
+                ),
                 immutable_store,
                 mutable_store,
                 &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -318,4 +273,171 @@ mod forwarded_request {
         }))
         .await;
     }
+}
+
+/// A denied create or retry must not dispatch hooks or repair repository mappings.
+#[tokio::test]
+async fn claim_creation_and_retries_require_write_before_hooks() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_base::types::Context;
+    use lore_base::types::RepositoryId;
+    use lore_revision::repository::RepositoryContext;
+    use lore_revision::repository::{self};
+    use lore_server::auth::jwt::AuthorizationToken;
+    use lore_server::auth::jwt::ResourcePermission;
+    use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
+    use lore_server::authnz::repository_authorizer::RawToken;
+    use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
+    use lore_server::grpc::repository::v1::repository_create::handler;
+    use lore_server::hooks::Hook;
+    use lore_server::hooks::HookContext;
+    use lore_server::hooks::HookDispatcher;
+    use lore_server::hooks::HookError;
+    use lore_server::hooks::HookPoint;
+    use tonic::Request;
+
+    use crate::store::test_support::test_store_create;
+
+    struct Counter(Arc<AtomicUsize>);
+    impl Hook for Counter {
+        fn name(&self) -> &'static str {
+            "creation-counter"
+        }
+        fn hook_points(&self) -> &'static [HookPoint] {
+            &[HookPoint::RepositoryCreate]
+        }
+        fn pre_handler(&self, _context: &HookContext) -> Result<(), HookError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    struct Metrics;
+    impl lore_telemetry::InstrumentProvider for Metrics {
+        fn namespace(&self) -> &'static str {
+            "creation-permissions"
+        }
+    }
+    let (immutable, mutable, execution) = test_store_create().await.unwrap();
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let id = rand::random::<RepositoryId>();
+        let context = Arc::new(RepositoryContext::new_server_context(
+            immutable.clone(),
+            mutable.clone(),
+            id,
+        ));
+        let count = Arc::new(AtomicUsize::new(0));
+        let hooks = HookDispatcher::from_hooks_default(vec![(
+            "counter".into(),
+            Box::new(Counter(count.clone())),
+        )]);
+        let authorizer: Arc<dyn RepositoryAuthorizer> =
+            Arc::new(AuthClientAuthorizer::new("https://auth.invalid".into()));
+        let branch = rand::random::<Context>();
+        let request = |permission: &str| {
+            let mut request =
+                Request::new(lore_proto::lore::repository::v1::RepositoryCreateRequest {
+                    id: id.data().to_vec().into(),
+                    name: "creation-permissions".into(),
+                    description: String::new(),
+                    default_branch_id: branch.into(),
+                    default_branch_name: "main".into(),
+                    creator: None,
+                });
+            request.extensions_mut().insert(AuthorizationToken {
+                user_id: "creator".into(),
+                resources: Some(vec![ResourcePermission {
+                    resource_id: format!("urc-{id}"),
+                    permission: vec![permission.into()],
+                }]),
+                ..Default::default()
+            });
+            request.extensions_mut().insert(RawToken("verified".into()));
+            request
+        };
+        assert_eq!(
+            handler(
+                request("read"),
+                None,
+                authorizer.clone(),
+                immutable.clone(),
+                mutable.clone(),
+                &None,
+                &hooks,
+                &Metrics
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(repository::metadata_hash(context.clone()).await.is_err());
+        handler(
+            request("write"),
+            None,
+            authorizer.clone(),
+            immutable.clone(),
+            mutable.clone(),
+            &None,
+            &hooks,
+            &Metrics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let hash = repository::metadata_hash(context.clone()).await.unwrap();
+        repository::store_name_to_id(
+            context.clone(),
+            "creation-permissions",
+            RepositoryId::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            handler(
+                request("read"),
+                None,
+                authorizer.clone(),
+                immutable.clone(),
+                mutable.clone(),
+                &None,
+                &hooks,
+                &Metrics
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            repository::metadata_hash(context.clone()).await.unwrap(),
+            hash
+        );
+        let mapping = repository::id_from_name(context.clone(), "creation-permissions").await;
+        assert!(mapping.is_err() || mapping.unwrap().is_zero());
+        handler(
+            request("write"),
+            None,
+            authorizer,
+            immutable,
+            mutable,
+            &None,
+            &hooks,
+            &Metrics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repository::id_from_name(context, "creation-permissions")
+                .await
+                .unwrap(),
+            id
+        );
+    }))
+    .await;
 }

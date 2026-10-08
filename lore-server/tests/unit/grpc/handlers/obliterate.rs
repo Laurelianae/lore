@@ -274,7 +274,7 @@ async fn returns_not_found_when_authorized_and_address_absent() {
     let verifier = make_verifier(good_key_service());
     let resources = vec![ResourcePermission {
         resource_id: format!("urc-{repository}"),
-        permission: vec!["obliterate".to_string()],
+        permission: vec!["read".to_string(), "obliterate".to_string()],
     }];
 
     let err = handler(
@@ -342,7 +342,7 @@ async fn succeeds_for_authorized_request_with_existing_address() {
     let verifier = make_verifier(good_key_service());
     let resources = vec![ResourcePermission {
         resource_id: format!("urc-{repository}"),
-        permission: vec!["obliterate".to_string()],
+        permission: vec!["read".to_string(), "obliterate".to_string()],
     }];
 
     let mut request = Request::new(ObliterateRequest {
@@ -388,9 +388,9 @@ async fn succeeds_for_authorized_request_with_existing_address() {
 #[tokio::test]
 async fn obliterate_permission_matrix() {
     use lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
-    use lore_server::authnz::repository_authorizer::{
-        AllowAllRepositoryAuthorizer, RepositoryAuthorizer, VerifiedToken,
-    };
+    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
+    use lore_server::authnz::repository_authorizer::VerifiedToken;
     use serde_json::json;
 
     struct Policy(RepositoryId);
@@ -453,7 +453,7 @@ async fn obliterate_permission_matrix() {
             0 => authorizer = Arc::new(AllowAllRepositoryAuthorizer),
             2 => claims.extra = json!({"roles": ["admin"]}).as_object().unwrap().clone(),
             3 => {
-                claims.extra = json!({"roles": ["obliterate"]})
+                claims.extra = json!({"roles": ["read", "obliterate"]})
                     .as_object()
                     .unwrap()
                     .clone();
@@ -467,7 +467,7 @@ async fn obliterate_permission_matrix() {
                     format!("repo-{repository}")
                 };
                 claims.extra = json!({"access": {"entries": [
-                    {"id": resource, "actions": []}, {"id": resource, "actions": ["obliterate"]}
+                    {"id": resource, "actions": []}, {"id": resource, "actions": ["read", "obliterate"]}
                 ]}})
                 .as_object()
                 .unwrap()
@@ -536,7 +536,7 @@ async fn expired_token_cannot_obliterate() {
         expires: 1,
         ..Default::default()
     };
-    claims.extra = serde_json::json!({"roles": ["obliterate"]})
+    claims.extra = serde_json::json!({"roles": ["read", "obliterate"]})
         .as_object()
         .unwrap()
         .clone();

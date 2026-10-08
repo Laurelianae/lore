@@ -184,3 +184,42 @@ async fn a_read_handed_the_last_context_reference_reaches_the_pool() {
             .expect_err("the pooled session never resolves");
     assert!(!err.is_address_not_found(), "reported {err:?}");
 }
+
+/// Authorization failures are ordinary remote outcomes, not retryable faults or panics.
+#[tokio::test]
+async fn denied_remote_upload_preserves_authorization_error_without_retrying() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use lore_base::error::NotAuthenticated;
+    use lore_base::error::NotAuthorized;
+    use lore_base::types::Fragment;
+
+    for authenticated in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = calls.clone();
+        let session = Arc::new(StorageSession::pending(move || {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if authenticated {
+                    Err(ProtocolError::from(NotAuthorized))
+                } else {
+                    Err(ProtocolError::from(NotAuthenticated))
+                }
+            }
+        }));
+        under_execution_context(|| async {
+            let error =
+                store_raw_remote_retry(session, absent_address(), Fragment::default(), None)
+                    .await
+                    .unwrap_err();
+            if authenticated {
+                assert!(error.is_not_authorized());
+            } else {
+                assert!(error.is_not_authenticated());
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        })
+        .await;
+    }
+}

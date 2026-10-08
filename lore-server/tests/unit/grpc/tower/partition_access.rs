@@ -309,7 +309,7 @@ impl Service<Request<()>> for GrantsInner {
 /// an action check needs no second authorizer call.
 #[tokio::test]
 async fn an_enumeration_is_exposed_to_the_handler_and_answers_reachability() {
-    let grants = Grants::Actions(["migrate".to_string()].into());
+    let grants = Grants::Actions(["read".to_string(), "migrate".to_string()].into());
     let authorizer = EnumeratingAuthorizer::new(grants.clone());
     let inner = GrantsInner::default();
     let mut service =

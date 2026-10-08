@@ -293,19 +293,36 @@ pub mod tests {
             immutable_store: Arc<dyn ImmutableStore>,
             mutable_store: Arc<dyn MutableStore>,
         ) -> Self {
+            Self::with_authorization(
+                immutable_store,
+                mutable_store,
+                Arc::new(None),
+                Arc::new(AllowAllRepositoryAuthorizer),
+            )
+        }
+
+        /// Serve both storage protocols with a configured verifier and authorizer.
+        pub fn with_authorization(
+            immutable_store: Arc<dyn ImmutableStore>,
+            mutable_store: Arc<dyn MutableStore>,
+            jwt_verifier: Arc<Option<crate::auth::jwt::JwtVerifier>>,
+            authorizer: Arc<dyn crate::authnz::repository_authorizer::RepositoryAuthorizer>,
+        ) -> Self {
             let contexts: ObservedContexts = Arc::default();
             let mut service_store = ServiceStore::default();
             {
                 let immutable_store = immutable_store.clone();
                 let mutable_store = mutable_store.clone();
                 let contexts = contexts.clone();
+                let jwt_verifier = jwt_verifier.clone();
+                let authorizer = authorizer.clone();
                 service_store.add_service(
                     TEST_PROTOCOL,
                     Box::new(move |context: Arc<AttributeMap>| {
                         contexts.lock().push(context.clone());
                         let storage_protocol = StorageService::new(
-                            Arc::new(None),
-                            Arc::new(AllowAllRepositoryAuthorizer),
+                            jwt_verifier.clone(),
+                            authorizer.clone(),
                             immutable_store.clone(),
                             immutable_store.clone(),
                             mutable_store.clone(),
@@ -327,13 +344,15 @@ pub mod tests {
                 let immutable_store = immutable_store.clone();
                 let mutable_store = mutable_store.clone();
                 let contexts = contexts.clone();
+                let jwt_verifier = jwt_verifier.clone();
+                let authorizer = authorizer.clone();
                 service_store.add_service(
                     TEST_PROTOCOL_V4,
                     Box::new(move |context: Arc<AttributeMap>| {
                         contexts.lock().push(context.clone());
                         let v4_service = StorageServiceV4::new(
-                            Arc::new(None),
-                            Arc::new(AllowAllRepositoryAuthorizer),
+                            jwt_verifier.clone(),
+                            authorizer.clone(),
                             immutable_store.clone(),
                             immutable_store.clone(),
                             mutable_store.clone(),

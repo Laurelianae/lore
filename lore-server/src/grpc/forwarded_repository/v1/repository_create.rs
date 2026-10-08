@@ -17,20 +17,28 @@ use crate::hooks::HookDispatcher;
 /// and executes it, returning the result to the other server for forwarding on to its
 /// client
 #[tracing::instrument(name = "ForwardedRepository::v1::RepositoryCreate::Handler", skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub async fn handler(
     request: Request<RepositoryCreateRequest>,
     auth_url: Option<String>,
+    jwt_verifier: Option<crate::auth::jwt::JwtVerifier>,
+    authorizer: Arc<dyn crate::authnz::repository_authorizer::RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<RepositoryCreateResponse>, Status> {
     let caller_context = CallerContext::from_forwarded_request(&request)?;
+    let extensions = caller_context
+        .verified_extensions(jwt_verifier.as_ref())
+        .await?;
 
     repository_create_implementation(
         request.into_inner(),
         caller_context,
         auth_url,
+        authorizer,
+        extensions,
         immutable_store,
         mutable_store,
         hook_dispatcher,

@@ -61,6 +61,10 @@ async fn missing_user_id_returns_internal_error() {
         let err = handler(
             request,
             None,
+            None,
+            std::sync::Arc::new(
+                lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer,
+            ),
             immutable_store,
             mutable_store,
             &hook_dispatcher,
@@ -92,6 +96,10 @@ mod base_repository_create_handler {
             let response = handler(
                 make_forwarded_request(repository_id, "my-repo"),
                 None, /* no auth */
+                None,
+                std::sync::Arc::new(
+                    lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer,
+                ),
                 immutable_store,
                 mutable_store,
                 &hook_dispatcher,
@@ -124,6 +132,10 @@ mod base_repository_create_handler {
             handler(
                 make_forwarded_request(repository_id, "my-repo"),
                 None,
+                None,
+                std::sync::Arc::new(
+                    lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer,
+                ),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 &hook_dispatcher,
@@ -136,6 +148,10 @@ mod base_repository_create_handler {
             let err = handler(
                 make_forwarded_request(repository_id, "other-name"),
                 None,
+                None,
+                std::sync::Arc::new(
+                    lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer,
+                ),
                 immutable_store,
                 mutable_store,
                 &hook_dispatcher,

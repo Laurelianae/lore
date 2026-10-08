@@ -1098,7 +1098,7 @@ fn token_authorized_for(repos: &[RepositoryId]) -> lore_server::auth::jwt::Autho
             repos
                 .iter()
                 .map(|id| ResourcePermission {
-                    permission: vec![],
+                    permission: vec!["read".to_string()],
                     resource_id: format!("urc-{id}"),
                 })
                 .collect(),

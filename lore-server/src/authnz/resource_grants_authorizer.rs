@@ -5,6 +5,7 @@ use lore_base::types::RepositoryId;
 use tonic::Status;
 
 use super::repository_authorizer::Grants;
+use super::repository_authorizer::READ_PERMISSIONS;
 use super::repository_authorizer::RepositoryAuthorizer;
 use super::repository_authorizer::VerifiedToken;
 use crate::auth::jwt::ResourceMatcher;
@@ -123,7 +124,15 @@ impl ResourceGrantsAuthorizer {
             return Err(Status::permission_denied("No grant for repository"));
         }
         match action {
-            None => Ok(()),
+            None if READ_PERMISSIONS
+                .iter()
+                .any(|action| self.matcher.permits(&entries, repository_id, action)) =>
+            {
+                Ok(())
+            }
+            None => Err(Status::permission_denied(
+                "Repository read permission required",
+            )),
             Some(action) if self.matcher.permits(&entries, repository_id, action) => Ok(()),
             Some(_) => Err(Status::permission_denied("Action not permitted")),
         }

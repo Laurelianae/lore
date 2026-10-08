@@ -66,6 +66,12 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<Streaming<storage_v1::PutResolvedRequest>>,
     ) -> Result<Response<Self::PutResolvedStream>, Status> {
+        self.repository_authorizer()
+            .require_write(
+                request.extensions(),
+                crate::grpc::get_repository(request.metadata())?,
+            )
+            .await?;
         put_resolved::handler(
             request,
             self.mutable_store().clone(),
@@ -81,6 +87,12 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<Streaming<storage_v1::PutRequest>>,
     ) -> Result<Response<Self::PutStream>, Status> {
+        self.repository_authorizer()
+            .require_write(
+                request.extensions(),
+                crate::grpc::get_repository(request.metadata())?,
+            )
+            .await?;
         put::handler(request, self.immutable_store().clone(), self).await
     }
 
@@ -97,6 +109,12 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<Streaming<storage_v1::CopyRequest>>,
     ) -> Result<Response<Self::CopyStream>, Status> {
+        self.repository_authorizer()
+            .require_write(
+                request.extensions(),
+                crate::grpc::get_repository(request.metadata())?,
+            )
+            .await?;
         copy::handler(
             request,
             self.immutable_store().clone(),
@@ -124,6 +142,12 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<storage_v1::MutableStoreRequest>,
     ) -> Result<Response<storage_v1::MutableStoreResponse>, Status> {
+        self.repository_authorizer()
+            .require_write(
+                request.extensions(),
+                crate::grpc::get_repository(request.metadata())?,
+            )
+            .await?;
         mutable_store::handler(request, self.mutable_store().clone()).await
     }
 
@@ -131,6 +155,12 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<storage_v1::MutableCompareAndSwapRequest>,
     ) -> Result<Response<storage_v1::MutableCompareAndSwapResponse>, Status> {
+        self.repository_authorizer()
+            .require_write(
+                request.extensions(),
+                crate::grpc::get_repository(request.metadata())?,
+            )
+            .await?;
         mutable_compare_and_swap::handler(request, self.mutable_store().clone()).await
     }
 }

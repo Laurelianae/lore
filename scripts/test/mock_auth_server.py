@@ -308,6 +308,11 @@ class _JwksHttpHandler(BaseHTTPRequestHandler):
             mock.calls["jwks_fetch"] += 1
             body = json.dumps(mock.jwks()).encode("utf-8")
             self._respond(200, body, "application/json")
+        elif self.path.endswith("/.well-known/openid-configuration"):
+            body = json.dumps(
+                {"issuer": mock.issuer, "jwks_uri": mock.jwks_url}
+            ).encode("utf-8")
+            self._respond(200, body, "application/json")
         elif self.path.startswith("/login/"):
             # The page exists so the login URL a test registers is real.
             self._respond(200, b"<html><body>Mock login complete.</body></html>")
@@ -502,6 +507,7 @@ class MockAuthServer:
         user: MockUser,
         resources: list[dict] | None = None,
         lifetime_seconds: int = DEFAULT_TOKEN_LIFETIME_SECONDS,
+        extra_claims: dict | None = None,
     ) -> str:
         """A signed JWT for `user`. With `resources`, an authorization token
         (the multiresource-exchange shape); without, an authentication token.
@@ -524,6 +530,8 @@ class MockAuthServer:
         }
         if resources is not None:
             claims["resources"] = resources
+        if extra_claims:
+            claims.update(extra_claims)
         header = {"alg": "RS256", "typ": "JWT", "kid": self.kid}
         signing_input = (
             _b64url(json.dumps(header, separators=(",", ":")).encode())

@@ -72,14 +72,18 @@ async fn flat_claim_grants_the_action_on_any_partition() {
 }
 
 #[tokio::test]
-async fn no_permission_claim_permits_plain_access_and_denies_every_action() {
+async fn no_permission_claim_denies_plain_access_and_every_action() {
     let authorizer = GlobalGrantsAuthorizer::new(None);
     let claims = token_with_extra(json!({
         "realm_access": { "roles": ["obliterate"] }
     }));
-    check(&authorizer, &claims, RepositoryId::default(), None)
-        .await
-        .unwrap();
+    assert_eq!(
+        check(&authorizer, &claims, RepositoryId::default(), None)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
     for action in ["obliterate", "admin", "presign"] {
         let err = check(&authorizer, &claims, RepositoryId::default(), Some(action))
             .await
@@ -89,12 +93,16 @@ async fn no_permission_claim_permits_plain_access_and_denies_every_action() {
 }
 
 #[tokio::test]
-async fn named_action_permits_plain_access_too() {
+async fn privileged_only_grant_denies_plain_access() {
     let authorizer = GlobalGrantsAuthorizer::new(Some("groups".to_string()));
     let claims = token_with_extra(json!({ "groups": ["obliterate"] }));
-    check(&authorizer, &claims, RepositoryId::default(), None)
-        .await
-        .unwrap();
+    assert_eq!(
+        check(&authorizer, &claims, RepositoryId::default(), None)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
 }
 
 #[tokio::test]

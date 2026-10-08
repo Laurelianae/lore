@@ -38,6 +38,8 @@ impl InstrumentProvider for ForwardedRevisionServiceInstrumentProvider {
 /// Mirrors particular RPCs of `LoreRevisionV1Service`
 #[derive(Clone)]
 pub struct LoreForwardedRevisionV1Service {
+    jwt_verifier: Option<crate::auth::jwt::JwtVerifier>,
+    authorizer: Arc<dyn crate::authnz::repository_authorizer::RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification: Arc<dyn NotificationSender>,
@@ -48,6 +50,8 @@ pub struct LoreForwardedRevisionV1Service {
 
 impl LoreForwardedRevisionV1Service {
     pub fn new(
+        jwt_verifier: Option<crate::auth::jwt::JwtVerifier>,
+        authorizer: Arc<dyn crate::authnz::repository_authorizer::RepositoryAuthorizer>,
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         notification: Arc<dyn NotificationSender>,
@@ -56,6 +60,8 @@ impl LoreForwardedRevisionV1Service {
     ) -> Self {
         let instrument_provider = ForwardedRevisionServiceInstrumentProvider;
         Self {
+            jwt_verifier,
+            authorizer,
             immutable_store,
             mutable_store,
             notification,
@@ -72,8 +78,15 @@ impl ForwardedRevisionService for LoreForwardedRevisionV1Service {
         &self,
         request: Request<BranchCreateRequest>,
     ) -> Result<Response<BranchCreateResponse>, Status> {
-        timeout_grpc(
-            self.rpc_timeout,
+        timeout_grpc(self.rpc_timeout, async {
+            let context =
+                crate::grpc::forwarded_requests::CallerContext::from_forwarded_request(&request)?;
+            let extensions = context
+                .verified_extensions(self.jwt_verifier.as_ref())
+                .await?;
+            self.authorizer
+                .require_write(&extensions, context.repository_id)
+                .await?;
             branch_create::handler(
                 request,
                 self.immutable_store.clone(),
@@ -81,8 +94,9 @@ impl ForwardedRevisionService for LoreForwardedRevisionV1Service {
                 self.notification.clone(),
                 &self.hook_dispatcher,
                 &self.instrument_provider,
-            ),
-        )
+            )
+            .await
+        })
         .await
     }
 
@@ -90,8 +104,15 @@ impl ForwardedRevisionService for LoreForwardedRevisionV1Service {
         &self,
         request: Request<BranchDeleteRequest>,
     ) -> Result<Response<BranchDeleteResponse>, Status> {
-        timeout_grpc(
-            self.rpc_timeout,
+        timeout_grpc(self.rpc_timeout, async {
+            let context =
+                crate::grpc::forwarded_requests::CallerContext::from_forwarded_request(&request)?;
+            let extensions = context
+                .verified_extensions(self.jwt_verifier.as_ref())
+                .await?;
+            self.authorizer
+                .require_write(&extensions, context.repository_id)
+                .await?;
             branch_delete::handler(
                 request,
                 self.immutable_store.clone(),
@@ -99,8 +120,9 @@ impl ForwardedRevisionService for LoreForwardedRevisionV1Service {
                 self.notification.clone(),
                 &self.hook_dispatcher,
                 &self.instrument_provider,
-            ),
-        )
+            )
+            .await
+        })
         .await
     }
 
@@ -108,14 +130,25 @@ impl ForwardedRevisionService for LoreForwardedRevisionV1Service {
         &self,
         request: Request<BranchGetRequest>,
     ) -> Result<Response<BranchGetResponse>, Status> {
-        timeout_grpc(
-            self.rpc_timeout,
+        timeout_grpc(self.rpc_timeout, async {
+            let context =
+                crate::grpc::forwarded_requests::CallerContext::from_forwarded_request(&request)?;
+            let extensions = context
+                .verified_extensions(self.jwt_verifier.as_ref())
+                .await?;
+            self.authorizer
+                .granted_access(
+                    crate::grpc::get_verified_token(&extensions).as_ref(),
+                    context.repository_id,
+                )
+                .await?;
             branch_get::handler(
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
-            ),
-        )
+            )
+            .await
+        })
         .await
     }
 
@@ -125,11 +158,25 @@ impl ForwardedRevisionService for LoreForwardedRevisionV1Service {
         &self,
         request: Request<BranchListRequest>,
     ) -> Result<Response<Self::BranchListStream>, Status> {
-        branch_list::handler(
-            request,
-            self.immutable_store.clone(),
-            self.mutable_store.clone(),
-        )
+        timeout_grpc(self.rpc_timeout, async {
+            let context =
+                crate::grpc::forwarded_requests::CallerContext::from_forwarded_request(&request)?;
+            let extensions = context
+                .verified_extensions(self.jwt_verifier.as_ref())
+                .await?;
+            self.authorizer
+                .granted_access(
+                    crate::grpc::get_verified_token(&extensions).as_ref(),
+                    context.repository_id,
+                )
+                .await?;
+            branch_list::handler(
+                request,
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
+            )
+            .await
+        })
         .await
     }
 }

@@ -161,7 +161,7 @@ mod link_read {
         let claims = AuthorizationToken {
             resources: Some(vec![ResourcePermission {
                 resource_id: format!("urc-{}", repository(GRANTED)),
-                permission: vec![],
+                permission: vec!["read".to_string()],
             }]),
             ..Default::default()
         };

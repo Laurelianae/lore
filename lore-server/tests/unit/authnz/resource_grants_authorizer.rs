@@ -62,7 +62,7 @@ async fn default_template_reproduces_the_legacy_matching() {
     let claims = AuthorizationToken {
         resources: Some(vec![ResourcePermission {
             resource_id: format!("urc-{REPOSITORY_HEX}"),
-            permission: vec!["obliterate".to_string()],
+            permission: vec!["read".to_string(), "obliterate".to_string()],
         }]),
         ..Default::default()
     };
@@ -105,7 +105,7 @@ fn entry(resource_id: &str, permissions: &[&str]) -> ResourcePermission {
 #[tokio::test]
 async fn wildcard_entry_matches_every_repository() {
     let authorizer = default_authorizer();
-    let claims = claims_with_resources(vec![entry("urc-*", &["migrate"])]);
+    let claims = claims_with_resources(vec![entry("urc-*", &["read", "migrate"])]);
 
     for repository in [repository(REPOSITORY_HEX), repository(UNRELATED_HEX)] {
         check(&authorizer, &claims, repository, None).await.unwrap();
@@ -124,7 +124,7 @@ async fn permissions_merge_across_matching_entries() {
     let authorizer = default_authorizer();
     let claims = claims_with_resources(vec![
         entry(&format!("urc-{REPOSITORY_HEX}"), &["push"]),
-        entry("urc-*", &["migrate"]),
+        entry("urc-*", &["read", "migrate"]),
         entry(&format!("urc-{REPOSITORY_HEX}"), &["obliterate"]),
     ]);
 
@@ -262,11 +262,10 @@ async fn malformed_entries_are_skipped_rather_than_fatal() {
         ]
     }));
 
-    // The malformed-actions entries still name the resource, so
-    // reachability holds while their unreadable actions grant nothing.
+    // Matching entries without read-like actions cannot reach the repository.
     check(&authorizer, &claims, repository(REPOSITORY_HEX), None)
         .await
-        .unwrap();
+        .unwrap_err();
     check(
         &authorizer,
         &claims,

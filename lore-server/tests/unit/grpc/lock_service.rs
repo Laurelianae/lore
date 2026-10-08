@@ -377,7 +377,7 @@ mod actions {
                 },
                 repository,
                 // A perfectly good token that grants something else.
-                Some(token_granting(repository, &["push"])),
+                Some(token_granting(repository, &["write"])),
             );
             lock_service.unlock(request).await.unwrap();
         }
@@ -400,7 +400,7 @@ mod actions {
                         owner: "someone".to_string(),
                     },
                     repository,
-                    Some(token_granting(repository, &["push"])),
+                    Some(token_granting(repository, &["write"])),
                 ))
                 .await
                 .expect_err("admin lock without `migrate` is denied");
@@ -426,7 +426,10 @@ mod actions {
     #[tokio::test]
     async fn no_token_means_no_elevation_and_no_admin_lock() {
         let repository = random::<RepositoryId>();
-        let lock_service = lock_service_with(store_expecting_validate_user(true), tier1());
+        let lock_service = lock_service_with(
+            store_expecting_validate_user(true),
+            Arc::new(lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+        );
         lock_service
             .unlock(request_with_token(
                 UnlockRequest {

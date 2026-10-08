@@ -140,7 +140,7 @@ async fn the_shared_authorizer_decides_the_repository_path() {
 
             let granted = vec![ResourcePermission {
                 resource_id: format!("urc-{repository}"),
-                permission: vec![],
+                permission: vec!["read".to_string()],
             }];
             let response = server
                 .get(&url)
@@ -150,7 +150,7 @@ async fn the_shared_authorizer_decides_the_repository_path() {
 
             let elsewhere = vec![ResourcePermission {
                 resource_id: "urc-00000000000000000000000000000000".to_string(),
-                permission: vec![],
+                permission: vec!["read".to_string()],
             }];
             let response = server
                 .get(&url)

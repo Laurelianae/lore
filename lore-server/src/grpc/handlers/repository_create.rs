@@ -29,6 +29,7 @@ use super::repository_query::repository_query_name;
 use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::rebac::RebacApiClient;
 use crate::authnz::rebac::grpc_get_rebac_client;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
@@ -47,6 +48,7 @@ use crate::util::setup_execution;
 pub async fn handler(
     request: Request<RepositoryCreateRequest>,
     auth_url: Option<String>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: &HookDispatcher,
@@ -55,7 +57,7 @@ pub async fn handler(
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
-    let req = request.into_inner();
+    let (_, extensions, req) = request.into_parts();
 
     let id: RepositoryId = Context::from(req.id).into();
 
@@ -66,6 +68,22 @@ pub async fn handler(
         mutable_store,
         id,
     ));
+    validate_create(
+        &req.name,
+        &req.description,
+        &req.default_branch_name,
+        &req.creator,
+        id,
+    )?;
+    authorize_repository_create(
+        repository.clone(),
+        req.name.as_str(),
+        auth_url.as_deref(),
+        authorization,
+        &extensions,
+        authorizer.as_ref(),
+    )
+    .await?;
     Span::current().record("requested_repo_id", id.to_string());
 
     LORE_CONTEXT
@@ -90,8 +108,6 @@ pub async fn handler(
                 req.default_branch_name.as_str(),
                 req.creator.as_str(),
                 req.created,
-                auth_url,
-                authorization,
             )
             .await
             .inspect_err(|err| warn!(error = ?err, "Repository create failed"))?;
@@ -112,13 +128,14 @@ pub async fn handler(
         .await
 }
 
-// Reject oversized string fields early to prevent resource exhaustion.
+/// Validate all create fields before authorization side effects and storage writes.
 #[lore_macro::test_pub]
-fn validate_create_input(
+pub(crate) fn validate_create(
     name: &str,
     description: &str,
     default_branch_name: &str,
     creator: &str,
+    id: RepositoryId,
 ) -> Result<(), Status> {
     if name.len() > repository::MAX_NAME_LEN {
         return Err(Status::invalid_argument(format!(
@@ -144,6 +161,19 @@ fn validate_create_input(
             repository::MAX_NAME_LEN,
         )));
     }
+    if !repository::is_valid_name(name) {
+        return Err(Status::invalid_argument("Invalid repository name"));
+    }
+
+    // If the name is an ID, make sure it matches the actual ID as we do not want
+    // to alias IDs with mismatching names
+    if let Ok(name_id) = Context::from_str(name)
+        && !name_id.is_zero()
+        && RepositoryId::from(name_id) != id
+    {
+        return Err(Status::invalid_argument("Invalid repository name"));
+    }
+
     Ok(())
 }
 
@@ -156,23 +186,14 @@ async fn repository_create(
     default_branch_name: &str,
     creator: &str,
     created: u64,
-    auth_url: Option<String>,
-    authorization: Option<String>,
 ) -> Result<RepositoryData, Status> {
-    validate_create_input(name, description, default_branch_name, creator)?;
-
-    if !repository::is_valid_name(name) {
-        return Err(Status::invalid_argument("Invalid repository name"));
-    }
-
-    // If the name is an ID, make sure it matches the actual ID as we do not want
-    // to alias IDs with mismatching names
-    if let Ok(name_id) = Context::from_str(name)
-        && !name_id.is_zero()
-        && RepositoryId::from(name_id) != repository.id
-    {
-        return Err(Status::invalid_argument("Invalid repository name"));
-    }
+    validate_create(
+        name,
+        description,
+        default_branch_name,
+        creator,
+        repository.id,
+    )?;
 
     // Check if a repository already exist. Skip authz check to also check repositories registered by others
     if let Ok(data) = repository_query_id(
@@ -244,11 +265,6 @@ async fn repository_create(
                 name, data.id, repository.id
             )))
         };
-    }
-
-    if let Some(auth_url) = auth_url {
-        let client = Box::new(grpc_get_rebac_client(auth_url).await?);
-        repository_create_auth_resource(client, authorization, repository.id, name).await?;
     }
 
     // Set up the repository metadata
@@ -336,7 +352,7 @@ pub(crate) async fn repository_create_auth_resource(
     authorization: Option<String>,
     repository_id: RepositoryId,
     name: &str,
-) -> Result<(), Status> {
+) -> Result<bool, Status> {
     info!(
         "Repository create auth resource for {} with name {}",
         repository_id, name
@@ -351,10 +367,10 @@ pub(crate) async fn repository_create_auth_resource(
     )?;
 
     match client.create_resource(request).await {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(true),
         Err(err) if err.code() == Code::AlreadyExists => {
             info!(auth_error = ?err, requested_repo_id = %repository_id, "Auth resource for already exists, continuing");
-            Ok(())
+            Ok(false)
         }
         Err(err) if err.code() == Code::PermissionDenied => {
             info!(?err, "Create resource in auth failed - permission denied");
@@ -394,4 +410,32 @@ pub(crate) async fn repository_create_auth_resource(
             Status::internal(format!("Failed to call auth create_resource: {err}"))
         })),
     }
+}
+
+/// Authorize creation before hooks, idempotent mapping repairs, or storage writes.
+/// Callers must run `validate_create` before this can create an auth resource.
+/// Legacy new resources use `CreateResource`; existing resources require write access.
+pub(crate) async fn authorize_repository_create(
+    repository: Arc<RepositoryContext>,
+    name: &str,
+    auth_url: Option<&str>,
+    authorization: Option<String>,
+    extensions: &tonic::Extensions,
+    authorizer: &dyn RepositoryAuthorizer,
+) -> Result<(), Status> {
+    let Some(auth_url) = auth_url else {
+        return authorizer.require_write(extensions, repository.id).await;
+    };
+    let existing = none_or_status(
+        repository_query_id(repository.clone(), repository.id, None, None).await,
+        |err| err.is_address_not_found() || err.is_repository_not_found(),
+    )?;
+    if existing.is_some() {
+        return authorizer.require_write(extensions, repository.id).await;
+    }
+    let client = Box::new(grpc_get_rebac_client(auth_url.to_string()).await?);
+    if !repository_create_auth_resource(client, authorization, repository.id, name).await? {
+        authorizer.require_write(extensions, repository.id).await?;
+    }
+    Ok(())
 }

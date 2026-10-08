@@ -64,6 +64,7 @@ pub async fn handler(
             grants,
         });
     }
+    authorizer.require_write(request.extensions(), id).await?;
     let bypass_protection = if auth_url.is_none() {
         authorizer.permits(request.extensions(), id, "owner").await
             || authorizer.permits(request.extensions(), id, "admin").await

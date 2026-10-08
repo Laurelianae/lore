@@ -67,7 +67,7 @@ impl VerifiedTokenOwned {
 pub enum Grants {
     /// The partition is not reachable: every action denied.
     Denied,
-    /// Reachable, permitted exactly these actions.
+    /// Exact actions; reachable only when a read-like action is present.
     Actions(HashSet<String>),
     /// Reachable, permitted every action.
     All,
@@ -75,7 +75,25 @@ pub enum Grants {
 
 impl Grants {
     pub fn reachable(&self) -> bool {
-        !matches!(self, Grants::Denied)
+        READ_PERMISSIONS.iter().any(|action| self.permits(action))
+    }
+
+    /// Whether these grants allow an ordinary repository mutation.
+    pub fn writable(&self) -> bool {
+        WRITE_PERMISSIONS.iter().any(|action| self.permits(action))
+    }
+
+    /// Deny before any ordinary mutation, preserving repository hiding.
+    pub fn require_write(&self) -> Result<(), Status> {
+        if !self.reachable() {
+            Err(crate::grpc::no_repository_access_status())
+        } else if self.writable() {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(
+                "Repository write permission required",
+            ))
+        }
     }
 
     pub fn permits(&self, action: &str) -> bool {
@@ -86,6 +104,11 @@ impl Grants {
         }
     }
 }
+
+/// Permissions that grant baseline repository access.
+pub const READ_PERMISSIONS: &[&str] = &["read", "write", "admin", "owner"];
+/// Permissions that grant ordinary repository mutations.
+pub const WRITE_PERMISSIONS: &[&str] = &["write", "admin", "owner"];
 
 /// The partition-access layer's enumerated answer for the partition the
 /// request named in its metadata, inserted as a request extension so a
@@ -100,6 +123,35 @@ pub struct PartitionGrants {
 
 #[async_trait]
 pub trait RepositoryAuthorizer: Send + Sync {
+    /// Check ordinary write access, enumerating permissions once when possible.
+    async fn check_repository_write(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+    ) -> Result<(), Status> {
+        if let Some(grants) = self
+            .granted_actions(token, repository_id)
+            .await
+            .map_err(|_denied| crate::grpc::no_repository_access_status())?
+        {
+            return grants.require_write();
+        }
+        self.check_repository_access(token, repository_id, None)
+            .await
+            .map_err(|_denied| crate::grpc::no_repository_access_status())?;
+        for action in WRITE_PERMISSIONS {
+            if self
+                .check_repository_access(token, repository_id, Some(action))
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        Err(Status::permission_denied(
+            "Repository write permission required",
+        ))
+    }
     /// Whether `token` may reach `repository_id` at all (`action: None`), or
     /// may perform the named privileged action on it (`action: Some`).
     async fn check_repository_access(
@@ -144,7 +196,35 @@ pub trait RepositoryAuthorizer: Send + Sync {
     }
 }
 
-impl dyn RepositoryAuthorizer {
+impl dyn RepositoryAuthorizer + '_ {
+    /// Require ordinary write access using grants for this repository only.
+    /// Unlike privileged checks, this preserves allow-all servers without tokens.
+    pub async fn require_write(
+        &self,
+        extensions: &tonic::Extensions,
+        repository_id: RepositoryId,
+    ) -> Result<(), Status> {
+        let token = crate::grpc::get_verified_token(extensions);
+        self.require_write_with_grants(
+            token.as_ref(),
+            repository_id,
+            extensions.get::<PartitionGrants>(),
+        )
+        .await
+    }
+
+    /// Require write access with a transport's repository-scoped cached grants.
+    pub async fn require_write_with_grants(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+        grants: Option<&PartitionGrants>,
+    ) -> Result<(), Status> {
+        if let Some(grants) = grants.filter(|grants| grants.repository_id == repository_id) {
+            return grants.grants.require_write();
+        }
+        self.check_repository_write(token, repository_id).await
+    }
     /// Reachability of `repository_id`, with the caller's enumerated grants
     /// when this authorizer can enumerate them: `Ok(Some(grants))` also
     /// answers later action checks in memory, `Ok(None)` means reachable but
@@ -343,7 +423,7 @@ fn grants_from_response(response: &CheckUserPermissionResponse, resource_id: &st
 }
 
 /// Answer an access question from the `resources` claim of an exchanged
-/// access token. `action: None` asks whether any entry names the partition.
+/// access token. `action: None` requires a read-like permission on the partition.
 /// `action: Some` asks whether a matching entry grants the action. Answered
 /// in place rather than through [`grants_from_resources_claim`]: the
 /// link-read closure asks this per link, and the merged permission set is
@@ -355,7 +435,9 @@ fn evaluate_resources_claim(
 ) -> Result<(), Status> {
     let matcher = ResourceMatcher::default();
     let permitted = match action {
-        None => matcher.any_match(resources, repository_id),
+        None => READ_PERMISSIONS
+            .iter()
+            .any(|action| matcher.permits(resources, repository_id, action)),
         Some(action) => matcher.permits(resources, repository_id, action),
     };
     if permitted {
@@ -367,7 +449,7 @@ fn evaluate_resources_claim(
 
 /// Answer an access question from a `CheckUserPermission` response.
 ///
-/// `action: None` checks whether an allowed entry contains the resource at all.
+/// `action: None` requires a read-like permission on the resource.
 /// `action: Some` also checks whether the entry grants the named action.
 #[lore_macro::test_pub]
 fn evaluate_check_user_permission(
@@ -379,8 +461,12 @@ fn evaluate_check_user_permission(
         .allowed_resource_permission
         .iter()
         .filter(|entry| entry.resource_id == resource_id)
-        .any(|entry| {
-            action.is_none_or(|action| entry.permission.iter().any(|granted| granted == action))
+        .any(|entry| match action {
+            Some(action) => entry.permission.iter().any(|granted| granted == action),
+            None => entry
+                .permission
+                .iter()
+                .any(|granted| READ_PERMISSIONS.contains(&granted.as_str())),
         });
     if permitted {
         Ok(())

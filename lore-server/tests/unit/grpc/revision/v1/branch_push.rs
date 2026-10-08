@@ -778,13 +778,15 @@ async fn create_child_branch(
 
 #[tokio::test]
 async fn protected_push_permission_matrix() {
+    use std::collections::HashSet;
+
     use lore_server::auth::jwt::AuthorizationToken;
     use lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
-    use lore_server::authnz::repository_authorizer::{
-        Grants, PartitionGrants, RepositoryAuthorizer, VerifiedToken,
-    };
+    use lore_server::authnz::repository_authorizer::Grants;
+    use lore_server::authnz::repository_authorizer::PartitionGrants;
+    use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
+    use lore_server::authnz::repository_authorizer::VerifiedToken;
     use serde_json::json;
-    use std::collections::HashSet;
 
     struct Policy;
     #[async_trait::async_trait]

@@ -23,9 +23,8 @@ impl GlobalGrantsAuthorizer {
         Self { permission_claim }
     }
 
-    /// Any authenticated principal reaches every partition on this tier. The
-    /// action set is the permission claim's string values, empty when the
-    /// claim is unconfigured or absent.
+    /// Global actions from the permission claim, empty when unconfigured or absent.
+    /// Only read-like actions make repositories reachable.
     fn grants_for(&self, token: &VerifiedToken<'_>) -> Grants {
         let Some(claim) = &self.permission_claim else {
             return Grants::Actions(HashSet::new());
@@ -54,8 +53,10 @@ impl GlobalGrantsAuthorizer {
             return Err(Status::unauthenticated("No token"));
         };
         match action {
-            // action == None -> just check that the user has a valid token
-            None => Ok(()),
+            None if self.grants_for(token).reachable() => Ok(()),
+            None => Err(Status::permission_denied(
+                "Repository read permission required",
+            )),
             Some(action) if self.grants_for(token).permits(action) => Ok(()),
             Some(_) => Err(Status::permission_denied("Action not permitted")),
         }

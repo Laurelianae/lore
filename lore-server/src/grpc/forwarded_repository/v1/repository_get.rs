@@ -10,7 +10,6 @@ use tonic::Status;
 use tracing::debug;
 
 use crate::auth::jwt::JwtVerifier;
-use crate::authnz::repository_authorizer::RawToken;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::repository::v1::repository_get::repository_get_implementation;
@@ -36,21 +35,11 @@ pub async fn handler(
     let caller_context = CallerContext::from_forwarded_request(&request)?;
     let (_, mut extensions, req) = request.into_parts();
 
-    if let Some(verifier) = &jwt_verifier
-        && let Some(raw) = caller_context
-            .authorization
-            .as_deref()
-            .and_then(|header| header.strip_prefix("Bearer "))
+    if let Err(err) = caller_context
+        .verify_and_insert_token(jwt_verifier.as_ref(), &mut extensions)
+        .await
     {
-        match verifier.verify_token(raw).await {
-            Ok(claims) => {
-                extensions.insert(RawToken(raw.to_string()));
-                extensions.insert(claims);
-            }
-            Err(err) => {
-                debug!(error = ?err, "Forwarded token failed verification");
-            }
-        }
+        debug!(error = ?err, "Forwarded token failed verification");
     }
 
     repository_get_implementation(

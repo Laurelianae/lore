@@ -86,6 +86,8 @@ impl ForwardedRepositoryService for LoreForwardedRepositoryV1Service {
             repository_create::handler(
                 request,
                 self.auth_url(),
+                self.jwt_verifier.clone(),
+                self.authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.hook_dispatcher,

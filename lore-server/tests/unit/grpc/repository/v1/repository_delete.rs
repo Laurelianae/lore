@@ -116,9 +116,9 @@ async fn the_creator_check_compares_the_identity_claim() {
 #[tokio::test]
 async fn repository_delete_permission_matrix() {
     use lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
-    use lore_server::authnz::repository_authorizer::{
-        RawToken, RepositoryAuthorizer, VerifiedToken,
-    };
+    use lore_server::authnz::repository_authorizer::RawToken;
+    use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
+    use lore_server::authnz::repository_authorizer::VerifiedToken;
     use lore_server::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
     use serde_json::json;
 
@@ -146,7 +146,7 @@ async fn repository_delete_permission_matrix() {
             let (immutable_store, mutable_store, execution) = test_store_create().await.unwrap();
             Box::pin(LORE_CONTEXT.scope(execution, async move {
                 let id = random::<RepositoryId>();
-                let allowed = matches!(case, 0 | 2 | 5 | 6 | 7 | 8 | 10);
+                let allowed = matches!(case, 0 | 5 | 6 | 7 | 8 | 10);
                 let mut claims = AuthorizationToken {
                     user_id: "caller".into(),
                     ..Default::default()
@@ -309,6 +309,10 @@ async fn legacy_repository_delete_denial_preserves_repository() {
                     AuthorizationToken {
                         user_id: "caller".into(),
                         is_service_account: Some(true),
+                        extra: serde_json::json!({"roles": ["write"]})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
                         ..Default::default()
                     },
                 );
@@ -318,7 +322,7 @@ async fn legacy_repository_delete_denial_preserves_repository() {
                 request
                     .metadata_mut()
                     .insert("authorization", "Bearer verified-token".parse().unwrap());
-                let authorizer = Arc::new(GlobalGrantsAuthorizer::new(None));
+                let authorizer = Arc::new(GlobalGrantsAuthorizer::new(Some("roles".into())));
                 let result = if v1 {
                     handler(
                         request,

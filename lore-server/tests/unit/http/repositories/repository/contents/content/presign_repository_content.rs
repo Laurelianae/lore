@@ -114,14 +114,21 @@ async fn returns_400_for_unserializable_header_value() {
 
 #[tokio::test]
 async fn presign_permission_matrix() {
-    use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
+    use jsonwebtoken::Algorithm;
+    use jsonwebtoken::DecodingKey;
+    use jsonwebtoken::EncodingKey;
+    use jsonwebtoken::Header;
     use lore_revision::lore::RepositoryId;
-    use lore_server::auth::jwk::{JWKService, JWKServiceError};
+    use lore_server::auth::jwk::JWKService;
+    use lore_server::auth::jwk::JWKServiceError;
     use lore_server::auth::jwt::JwtVerifier;
     use lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
-    use lore_server::authnz::repository_authorizer::{RepositoryAuthorizer, VerifiedToken};
+    use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
+    use lore_server::authnz::repository_authorizer::VerifiedToken;
     use lore_server::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     const SECRET: &[u8] = b"presign-permission-test-secret";
     struct Keys;
@@ -190,7 +197,7 @@ async fn presign_permission_matrix() {
                     Arc::new(GlobalGrantsAuthorizer::new(Some("roles".into())));
                 match case {
                     2 => claims.is_service_account = Some(true),
-                    3 => claims.extra = json!({"roles": ["presign"]}).as_object().unwrap().clone(),
+                    3 => claims.extra = json!({"roles": ["read", "presign"]}).as_object().unwrap().clone(),
                     4..=6 => {
                         let resource = if case == 5 {
                             "all".into()
@@ -200,7 +207,7 @@ async fn presign_permission_matrix() {
                             format!("repo-{repository}")
                         };
                         claims.extra = json!({"access": {"entries": [
-                        {"id": resource, "actions": []}, {"id": resource, "actions": ["presign"]}
+                        {"id": resource, "actions": []}, {"id": resource, "actions": ["read", "presign"]}
                     ]}}).as_object().unwrap().clone();
                         authorizer = Arc::new(ResourceGrantsAuthorizer::new(
                             "access.entries".into(),

@@ -185,6 +185,9 @@ impl LoreLockService {
         request: Request<LockRequest>,
     ) -> Result<Response<LockResponse>, Status> {
         let repository = get_repository(request.metadata())?;
+        self.authorizer
+            .require_write(request.extensions(), repository)
+            .await?;
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let lock_request = request.into_inner();
@@ -298,9 +301,12 @@ impl LoreLockService {
         &self,
         request: Request<UnlockRequest>,
     ) -> Result<Response<UnlockResponse>, Status> {
+        let repository = get_repository(request.metadata())?;
+        self.authorizer
+            .require_write(request.extensions(), repository)
+            .await?;
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-        let repository = get_repository(request.metadata())?;
         let validate_user = !self.is_elevated(request.extensions(), repository).await;
         let unlock_request = request.into_inner();
 

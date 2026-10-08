@@ -271,7 +271,6 @@ impl QuicService for StorageServiceV4 {
                 let user_id = session.user_id.clone();
                 let token = session.token.clone();
                 let authorized_sources = session.authorized_sources.clone();
-                drop(session);
 
                 // Parse the storage command payload using v4-aware parsers — Copy carries an
                 // extra `target_context` field on the wire that the legacy parser cannot decode.
@@ -279,6 +278,27 @@ impl QuicService for StorageServiceV4 {
                     tracing::warn!("Failed to parse v4 storage command: {err}");
                     MessageHandleError::InternalError
                 })?;
+
+                let write_verdict = if parsed.requires_write() {
+                    session.grants.as_ref().map(|grants| grants.require_write())
+                } else {
+                    None
+                };
+                drop(session);
+
+                if parsed.requires_write() {
+                    let token = token.as_deref().map(VerifiedTokenOwned::as_token);
+                    let verdict = if let Some(verdict) = write_verdict {
+                        verdict
+                    } else {
+                        self.repository_authorizer
+                            .check_repository_write(token.as_ref(), repository)
+                            .await
+                    };
+                    verdict.map_err(|err| {
+                        MessageHandleError::AuthorizationFailure(err.message().to_string())
+                    })?;
+                }
 
                 // Dispatch to standalone handler functions with explicit session context
                 let response = match parsed {

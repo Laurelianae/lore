@@ -389,6 +389,57 @@ When `[server.auth]` is present, `jwt_issuer` and `jwt_audience` are both mandat
 
 Protected-branch push bypass requires the explicit `push-protected` action, globally in Tier 1 or on the repository in Tier 2. The `is_service_account` claim no longer grants this bypass; issuers must grant `push-protected` to mirroring accounts before deploying this change. On servers without authentication, protected pushes remain denied.
 
+Repository access requires explicit permissions in authenticated deployments:
+
+| Permissions on the repository | Read | Ordinary writes |
+| --- | --- | --- |
+| Missing grant, empty list, or unknown permissions only | Denied | Denied |
+| `read` | Allowed | Denied |
+| `write`, `admin`, or `owner` | Allowed | Allowed |
+
+Tier 1 reads global permissions from `permission_claim`: configure that claim and
+have the issuer include a recognized permission before deploying enforcement.
+A verified token alone no longer grants read access. Global `read` reaches every
+repository, and global `write` permits ordinary mutations everywhere. Use Tier 2
+to restrict access to individual repositories.
+
+Tier 2 and legacy grants retain resource matching, wildcard configuration, and
+merging across matching entries. A matching entry with `permission: []` no longer
+grants access; issuers that previously emitted empty lists must emit explicit
+permissions. Update Aidonia's broker to emit `permission: ["read"]` before deploying
+this enforcement. There is no compatibility switch for empty grants.
+
+Ordinary writes include metadata, branches, content uploads and copies, resolved
+uploads, mutable pointers, and lock acquisition and release. Copies require read
+access on the source and write access on the destination. Repository deletion also
+requires write access in addition to its existing ownership or external authorization.
+
+Privileged actions remain exact and also require baseline read access. For example,
+`["read", "presign"]` permits issuing content URLs; `["write", "push-protected"]`
+permits protected pushes. Neither `admin` nor `owner` implies those actions or
+`obliterate` or `migrate`. Lock ownership and elevated lock rules remain in effect.
+
+Claim-based repository creation requires write permission for the proposed ID
+before creation or forwarding. The issuer must grant that ID in advance; a global
+writer can create any repository. Legacy new creation uses `CreateResource` before
+hooks or storage writes. Existing repositories and existing auth resources require
+write permission for retries and name-mapping repairs. If a hook rejects creation
+after a legacy auth resource was created, that resource remains available for retry.
+
+An authorization-denied operation changes no repository or storage state and
+runs no mutation hook. Previously authorized items in a stream remain committed;
+streams do not promise batch rollback. Servers without authentication retain
+ordinary local operations and their existing privileged-operation restrictions.
+
+This fork follows [upstream PR #49](https://github.com/EpicGames/lore/pull/49),
+adapted to its configured authorizers and cached grants. Keep the permission
+regressions as the acceptance contract when replacing this patch with upstream
+implementation. Direct CLI token issuance remains blocked until permission
+coverage passes across all exposed transports. The existing CLI QUIC session
+setup sends an empty token when `auth_url` is absent; claim-only CLI push coverage
+remains blocked by that client issue. Server-side QUIC permission coverage uses
+authenticated protocol requests directly.
+
 Without legacy `auth_url`, repository deletion retains the creator check; bypass now requires `owner` or `admin`, rather than `is_service_account`. Legacy deployments retain the external `DeleteResource` authorization. Unauthenticated servers retain creator-only deletion.
 
 Issuing presigned content URLs requires the explicit `presign` action; `is_service_account` no longer grants it. Issuers must grant `presign` to accounts that vend URLs before deploying this change. Unauthenticated servers retain the existing presign behavior.

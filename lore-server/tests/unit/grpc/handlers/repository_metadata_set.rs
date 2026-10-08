@@ -34,10 +34,10 @@ impl RepositoryAuthorizer for DenyAllRepositoryAuthorizer {
     }
 }
 
-/// Permits, recording that the handler asked with `action: None`.
+/// Permits, recording that the handler asked with `action: Some("write")`.
 #[derive(Default)]
 struct RecordingPermitAuthorizer {
-    called_with_action_none: std::sync::atomic::AtomicBool,
+    called_with_write_action: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -48,8 +48,8 @@ impl RepositoryAuthorizer for RecordingPermitAuthorizer {
         _repository_id: RepositoryId,
         action: Option<&str>,
     ) -> Result<(), Status> {
-        self.called_with_action_none
-            .store(action.is_none(), std::sync::atomic::Ordering::SeqCst);
+        self.called_with_write_action
+            .store(action == Some("write"), std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 }
@@ -134,7 +134,7 @@ async fn auth_configured_with_access_allows_operation() {
                 .unwrap();
             assert!(
                 authorizer
-                    .called_with_action_none
+                    .called_with_write_action
                     .load(std::sync::atomic::Ordering::SeqCst)
             );
         })

@@ -68,7 +68,7 @@ fn insert_verified_token(context: &AttributeMap, resource_id: &str) {
     context.insert(AuthorizationToken {
         resources: Some(vec![ResourcePermission {
             resource_id: resource_id.to_string(),
-            permission: vec![],
+            permission: vec!["read".to_string()],
         }]),
         ..Default::default()
     });

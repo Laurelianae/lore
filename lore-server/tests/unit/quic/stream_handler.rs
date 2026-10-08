@@ -1536,3 +1536,307 @@ async fn test_v4_authorize_put_get_query_stop() {
     .await
     .expect("Test task failed");
 }
+
+/// Exercise both dispatchers over actual QUIC streams, including denied storage state.
+#[tokio::test]
+async fn authenticated_storage_permission_matrix_on_both_protocols() {
+    use lore_base::types::Hash;
+    use lore_base::types::KeyType;
+    use lore_base::types::RepositoryId;
+    use lore_server::auth::jwk::JWKService;
+    use lore_server::auth::jwk::JWKServiceError;
+    use lore_server::auth::jwt::AuthorizationToken;
+    use lore_server::auth::jwt::JwtVerifier;
+    use lore_server::auth::jwt::ResourcePermission;
+    use lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
+    use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
+    use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
+    use lore_server::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
+    use lore_transport::quic::command_header::COMMAND_HEADER_SIZE_V4;
+    use serde_json::json;
+
+    struct Keys;
+    #[async_trait::async_trait]
+    impl JWKService for Keys {
+        fn get_cached_key(
+            &self,
+            _kid: &str,
+        ) -> Option<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm)> {
+            Some((
+                jsonwebtoken::DecodingKey::from_secret(b"permission-test"),
+                jsonwebtoken::Algorithm::HS256,
+            ))
+        }
+        async fn get_key(
+            &self,
+            kid: &str,
+        ) -> Result<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm), JWKServiceError> {
+            Ok(self.get_cached_key(kid).unwrap())
+        }
+        async fn refresh_key(
+            &self,
+            kid: &str,
+        ) -> Result<Option<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError>
+        {
+            Ok(self.get_cached_key(kid))
+        }
+    }
+    async fn send_command(
+        harness: &mut Harness,
+        v4: bool,
+        command: Command,
+        session: u32,
+        payload: &[u8],
+    ) -> CommandHeader {
+        let header = CommandHeader::new_with_session(
+            command as QuicOpCode,
+            random::<u32>(),
+            payload.len(),
+            session,
+        );
+        let bytes = if v4 {
+            header.to_bytes_v4().to_vec()
+        } else {
+            header.to_bytes().to_vec()
+        };
+        harness.send.write_all(&bytes).await.unwrap();
+        harness.send.write_all(payload).await.unwrap();
+        harness.send.flush().await.unwrap();
+        let mut response = vec![0u8; if v4 { COMMAND_HEADER_SIZE_V4 } else { 8 }];
+        harness.recv.read_exact(&mut response).await.unwrap();
+        if v4 {
+            CommandHeader::from_bytes_v4(&response)
+        } else {
+            CommandHeader::from_bytes(&response)
+        }
+    }
+    async fn drain(harness: &mut Harness, header: &CommandHeader) -> Vec<u8> {
+        if header.error {
+            return vec![];
+        }
+        let mut bytes = vec![0; header.size_or_status as usize];
+        harness.recv.read_exact(&mut bytes).await.unwrap();
+        bytes
+    }
+
+    for v4 in [false, true] {
+        for tier in 0..3 {
+            for (actions, read, write) in [
+                (vec![], false, false),
+                (vec!["unknown"], false, false),
+                (vec!["read"], true, false),
+                (vec!["write"], true, true),
+                (vec!["admin"], true, true),
+                (vec!["owner"], true, true),
+            ] {
+                let (immutable, mutable, execution) = test_store_create().await.unwrap();
+                Box::pin(LORE_CONTEXT.scope(execution, async move {
+                    let repository = random::<RepositoryId>();
+                    let authorizer: Arc<dyn RepositoryAuthorizer> = match tier {
+                        0 => Arc::new(GlobalGrantsAuthorizer::new(Some("roles".into()))),
+                        1 => Arc::new(ResourceGrantsAuthorizer::new(
+                            "resources".into(),
+                            "resource_id".into(),
+                            None,
+                            "urc-{id}".into(),
+                            "urc-*".into(),
+                        )),
+                        _ => Arc::new(AuthClientAuthorizer::new("https://auth.invalid".into())),
+                    };
+                    let claims = AuthorizationToken {
+                        user_id: "reader".into(),
+                        audience: vec!["test".into()],
+                        expires: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs()
+                            + 60,
+                        resources: Some(vec![ResourcePermission {
+                            resource_id: format!("urc-{repository}"),
+                            permission: actions.iter().map(|action| action.to_string()).collect(),
+                        }]),
+                        extra: json!({"roles": actions}).as_object().unwrap().clone(),
+                        ..Default::default()
+                    };
+                    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+                    header.kid = Some("key".into());
+                    let token = jsonwebtoken::encode(
+                        &header,
+                        &claims,
+                        &jsonwebtoken::EncodingKey::from_secret(b"permission-test"),
+                    )
+                    .unwrap();
+                    let verifier = JwtVerifier {
+                        jwk_service: Arc::new(Keys),
+                        jwt_issuer: None,
+                        jwt_audience: Some(vec!["test".into()]),
+                        jwt_typ: None,
+                        identity_claim: "sub".into(),
+                    };
+                    let factory = TestHandlerFactory::with_authorization(
+                        immutable.clone(),
+                        mutable.clone(),
+                        Arc::new(Some(verifier)),
+                        authorizer,
+                    );
+                    let mut harness = serve_and_connect(
+                        Box::new(factory),
+                        if v4 { TEST_PROTOCOL_V4 } else { TEST_PROTOCOL },
+                    )
+                    .await;
+                    let mut auth = vec![];
+                    if v4 {
+                        auth.push(0);
+                    }
+                    auth.extend_from_slice(repository.data());
+                    if v4 {
+                        auth.push(0);
+                        auth.extend_from_slice(&(token.len() as u16).to_le_bytes());
+                    }
+                    auth.extend_from_slice(token.as_bytes());
+                    let response =
+                        send_command(&mut harness, v4, Command::Authorize, 0, &auth).await;
+                    assert_eq!(
+                        !response.error, read,
+                        "v4={v4}, tier={tier}, actions={actions:?}"
+                    );
+                    if !read {
+                        return;
+                    }
+                    let response_bytes = drain(&mut harness, &response).await;
+                    let session = if v4 {
+                        u32::from_le_bytes(response_bytes.try_into().unwrap())
+                    } else {
+                        0
+                    };
+                    let (fragment, address, payload) = generate_random();
+                    immutable
+                        .clone()
+                        .put(repository, address, fragment, Some(payload.clone()), false)
+                        .await
+                        .unwrap();
+                    let response =
+                        send_command(&mut harness, v4, Command::Get, session, address.as_bytes())
+                            .await;
+                    assert!(!response.error);
+                    drain(&mut harness, &response).await;
+                    let (new_fragment, new_address, new_payload) = generate_random();
+                    let mut put = new_address.as_bytes().to_vec();
+                    put.extend_from_slice(new_fragment.as_bytes());
+                    put.extend_from_slice(&new_payload);
+                    let response =
+                        send_command(&mut harness, v4, Command::Put, session, &put).await;
+                    assert_eq!(!response.error, write);
+                    drain(&mut harness, &response).await;
+                    assert_eq!(
+                        immutable.clone().get(repository, new_address).await.is_ok(),
+                        write
+                    );
+                    let key = random::<Hash>();
+                    let value = random::<Hash>();
+                    let mut store = key.as_bytes().to_vec();
+                    store.extend_from_slice(value.as_bytes());
+                    store.push(KeyType::Resolve as u8);
+                    let response =
+                        send_command(&mut harness, v4, Command::MutableStore, session, &store)
+                            .await;
+                    assert_eq!(!response.error, write);
+                    drain(&mut harness, &response).await;
+                    assert_eq!(
+                        mutable
+                            .clone()
+                            .load(repository, key, KeyType::Resolve)
+                            .await
+                            .unwrap_or_default(),
+                        if write { value } else { Hash::default() }
+                    );
+                    mutable
+                        .clone()
+                        .store(repository, key, value, KeyType::Resolve)
+                        .await
+                        .unwrap();
+                    let changed = random::<Hash>();
+                    let mut cas = key.as_bytes().to_vec();
+                    cas.extend_from_slice(value.as_bytes());
+                    cas.extend_from_slice(changed.as_bytes());
+                    cas.push(KeyType::Resolve as u8);
+                    let response =
+                        send_command(&mut harness, v4, Command::MutableCas, session, &cas).await;
+                    assert_eq!(!response.error, write);
+                    drain(&mut harness, &response).await;
+                    assert_eq!(
+                        mutable
+                            .clone()
+                            .load(repository, key, KeyType::Resolve)
+                            .await
+                            .unwrap(),
+                        if write { changed } else { value }
+                    );
+                    let mut copy = repository.data().to_vec();
+                    copy.extend_from_slice(address.as_bytes());
+                    if v4 {
+                        copy.extend_from_slice(random::<Context>().as_bytes());
+                    }
+                    let response =
+                        send_command(&mut harness, v4, Command::Copy, session, &copy).await;
+                    assert_eq!(!response.error, write);
+                    drain(&mut harness, &response).await;
+                    if v4 {
+                        let resolve_key = random::<Hash>();
+                        let mut resolved = resolve_key.as_bytes().to_vec();
+                        resolved.extend_from_slice(&put);
+                        let response = send_command(
+                            &mut harness,
+                            v4,
+                            Command::PutResolved,
+                            session,
+                            &resolved,
+                        )
+                        .await;
+                        assert_eq!(!response.error, write);
+                        drain(&mut harness, &response).await;
+                        assert_eq!(
+                            mutable
+                                .clone()
+                                .load(repository, resolve_key, KeyType::Resolve)
+                                .await
+                                .unwrap_or_default(),
+                            if write {
+                                new_address.hash
+                            } else {
+                                Hash::default()
+                            }
+                        );
+                        mutable
+                            .clone()
+                            .store(repository, resolve_key, value, KeyType::Resolve)
+                            .await
+                            .unwrap();
+                        let mut deletion = resolve_key.as_bytes().to_vec();
+                        deletion.extend_from_slice(&[0u8; 48 + 16]);
+                        let response = send_command(
+                            &mut harness,
+                            v4,
+                            Command::PutResolved,
+                            session,
+                            &deletion,
+                        )
+                        .await;
+                        assert_eq!(!response.error, write);
+                        drain(&mut harness, &response).await;
+                        assert_eq!(
+                            mutable
+                                .clone()
+                                .load(repository, resolve_key, KeyType::Resolve)
+                                .await
+                                .unwrap_or_default(),
+                            if write { Hash::default() } else { value }
+                        );
+                    }
+                    harness.send.finish().unwrap();
+                }))
+                .await;
+            }
+        }
+    }
+}

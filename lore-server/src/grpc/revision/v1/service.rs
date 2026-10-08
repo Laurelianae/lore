@@ -158,6 +158,12 @@ impl RevisionService for LoreRevisionV1Service {
         &self,
         request: Request<BranchCreateRequest>,
     ) -> Result<Response<BranchCreateResponse>, Status> {
+        self.repository_authorizer
+            .require_write(
+                request.extensions(),
+                crate::grpc::get_repository(request.metadata())?,
+            )
+            .await?;
         timeout_grpc(
             self.rpc_timeout,
             branch_create::handler(
@@ -177,6 +183,12 @@ impl RevisionService for LoreRevisionV1Service {
         &self,
         request: Request<BranchDeleteRequest>,
     ) -> Result<Response<BranchDeleteResponse>, Status> {
+        self.repository_authorizer
+            .require_write(
+                request.extensions(),
+                crate::grpc::get_repository(request.metadata())?,
+            )
+            .await?;
         timeout_grpc(
             self.rpc_timeout,
             branch_delete::handler(
@@ -227,6 +239,12 @@ impl RevisionService for LoreRevisionV1Service {
         &self,
         request: Request<BranchPushRequest>,
     ) -> Result<Response<BranchPushResponse>, Status> {
+        self.repository_authorizer
+            .require_write(
+                request.extensions(),
+                crate::grpc::get_repository(request.metadata())?,
+            )
+            .await?;
         timeout_grpc(
             self.rpc_timeout,
             branch_push::handler(
@@ -263,6 +281,12 @@ impl RevisionService for LoreRevisionV1Service {
         &self,
         request: Request<BranchMetadataSetRequest>,
     ) -> Result<Response<BranchMetadataSetResponse>, Status> {
+        self.repository_authorizer
+            .require_write(
+                request.extensions(),
+                crate::grpc::get_repository(request.metadata())?,
+            )
+            .await?;
         timeout_grpc(
             self.rpc_timeout,
             branch_metadata_set::handler(

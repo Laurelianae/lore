@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::str::FromStr;
 use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
@@ -24,6 +23,7 @@ use tracing::warn;
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
 use super::repository_get::repository_load_name;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
@@ -32,7 +32,8 @@ use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
-use crate::grpc::handlers::repository_create::repository_create_auth_resource;
+use crate::grpc::handlers::repository_create::authorize_repository_create;
+use crate::grpc::handlers::repository_create::validate_create;
 use crate::grpc::hook_error_to_status;
 use crate::grpc::none_or_status;
 use crate::grpc::warn_error_to_status;
@@ -54,9 +55,11 @@ use crate::util::setup_execution;
     skip_all,
     fields(requested_repo_id)
 )]
+#[allow(clippy::too_many_arguments)]
 pub async fn handler(
     request: Request<RepositoryCreateRequest>,
     auth_url: Option<String>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
@@ -66,7 +69,7 @@ pub async fn handler(
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
-    let req = request.into_inner();
+    let (_, extensions, req) = request.into_parts();
     let caller_context = CallerContext {
         repository_id: RepositoryId::default(), // RepositoryCreate has no pre-existing repository
         user_id,
@@ -77,12 +80,20 @@ pub async fn handler(
     if let Some(forwarded_requests) = forwarded_requests
         && forwarded_requests.rpc_flags().repository_create
     {
+        // The origin must authorize before forwarding; local creates authorize in
+        // authorize_repository_create before hooks or writes.
+        if auth_url.is_none() {
+            let id: RepositoryId = Context::from(req.id.clone()).into();
+            authorizer.require_write(&extensions, id).await?;
+        }
         forward_repository_create(req, caller_context, forwarded_requests).await
     } else {
         repository_create_implementation(
             req,
             caller_context,
             auth_url,
+            authorizer,
+            extensions,
             immutable_store,
             mutable_store,
             hook_dispatcher,
@@ -113,10 +124,13 @@ async fn forward_repository_create(
 }
 
 /// This `RepositoryCreateRequest` should be fulfilled by this server.
+#[allow(clippy::too_many_arguments)]
 pub async fn repository_create_implementation(
     req: RepositoryCreateRequest,
     caller_context: CallerContext,
     auth_url: Option<String>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
+    extensions: tonic::Extensions,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: &HookDispatcher,
@@ -144,6 +158,16 @@ pub async fn repository_create_implementation(
         mutable_store,
         id,
     ));
+    validate_create(&name, &description, &default_branch_name, &creator, id)?;
+    authorize_repository_create(
+        repository.clone(),
+        &name,
+        auth_url.as_deref(),
+        authorization,
+        &extensions,
+        authorizer.as_ref(),
+    )
+    .await?;
     Span::current().record("requested_repo_id", id.to_string());
 
     LORE_CONTEXT
@@ -167,8 +191,6 @@ pub async fn repository_create_implementation(
                 &default_branch_name,
                 &creator,
                 created,
-                auth_url,
-                authorization,
             )
             .await
             .inspect_err(|err| warn!(error = ?err, "Repository create failed"))?;
@@ -186,41 +208,6 @@ pub async fn repository_create_implementation(
         .await
 }
 
-/// Reject oversized string fields early to prevent resource exhaustion.
-#[lore_macro::test_pub]
-fn validate_create_input(
-    name: &str,
-    description: &str,
-    default_branch_name: &str,
-    creator: &str,
-) -> Result<(), Status> {
-    if name.len() > repository::MAX_NAME_LEN {
-        return Err(Status::invalid_argument(format!(
-            "Repository name exceeds maximum length of {} bytes",
-            repository::MAX_NAME_LEN,
-        )));
-    }
-    if description.len() > repository::MAX_DESCRIPTION_LEN {
-        return Err(Status::invalid_argument(format!(
-            "Repository description exceeds maximum length of {} bytes",
-            repository::MAX_DESCRIPTION_LEN,
-        )));
-    }
-    if default_branch_name.len() > repository::MAX_NAME_LEN {
-        return Err(Status::invalid_argument(format!(
-            "Branch name exceeds maximum length of {} bytes",
-            repository::MAX_NAME_LEN,
-        )));
-    }
-    if creator.len() > repository::MAX_NAME_LEN {
-        return Err(Status::invalid_argument(format!(
-            "Creator exceeds maximum length of {} bytes",
-            repository::MAX_NAME_LEN,
-        )));
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn repository_create_inner(
     repository: Arc<RepositoryContext>,
@@ -230,21 +217,14 @@ async fn repository_create_inner(
     default_branch_name: &str,
     creator: &str,
     created: u64,
-    auth_url: Option<String>,
-    authorization: Option<String>,
 ) -> Result<(RepositoryMetadata, lore_storage::Hash), Status> {
-    validate_create_input(name, description, default_branch_name, creator)?;
-
-    if !repository::is_valid_name(name) {
-        return Err(Status::invalid_argument("Invalid repository name"));
-    }
-
-    if let Ok(name_id) = Context::from_str(name)
-        && !name_id.is_zero()
-        && RepositoryId::from(name_id) != repository.id
-    {
-        return Err(Status::invalid_argument("Invalid repository name"));
-    }
+    validate_create(
+        name,
+        description,
+        default_branch_name,
+        creator,
+        repository.id,
+    )?;
 
     if let Ok((metadata, metadata_hash)) =
         repository_load_id(repository.clone(), repository.id, None, None)
@@ -299,11 +279,6 @@ async fn repository_create_inner(
                 name, id, repository.id
             )))
         };
-    }
-
-    if let Some(auth_url) = auth_url {
-        let client = Box::new(crate::authnz::rebac::grpc_get_rebac_client(auth_url).await?);
-        repository_create_auth_resource(client, authorization, repository.id, name).await?;
     }
 
     let metadata = RepositoryMetadata {

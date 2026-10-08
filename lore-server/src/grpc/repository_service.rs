@@ -74,6 +74,7 @@ impl RepositoryService for LoreRepositoryService {
                     .endpoint
                     .as_ref()
                     .and_then(|endpoint| endpoint.auth_url.clone()),
+                self.authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.hook_dispatcher,

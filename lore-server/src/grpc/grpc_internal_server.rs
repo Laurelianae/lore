@@ -217,6 +217,8 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
 
         router = router.add_service(ForwardedRevisionServiceServer::new(
             LoreForwardedRevisionV1Service::new(
+                self.0.jwt_verifier.clone(),
+                self.0.repository_authorizer.clone(),
                 self.0.immutable_store.clone(),
                 self.0.mutable_store.clone(),
                 self.0.notification_sender.clone(),

@@ -251,11 +251,7 @@ pub async fn store_raw_remote_retry(
                 return Err(Disconnected.into());
             }
             Err(err) => {
-                debug_assert!(false, "Remote server responded with error on put: {err}");
-                return Err(ImmutableError::internal_with_context(
-                    err,
-                    "Failed to store fragments, remote error",
-                ));
+                return Err(err).forward_any::<ImmutableError>("storing fragment on remote");
             }
         }
     }

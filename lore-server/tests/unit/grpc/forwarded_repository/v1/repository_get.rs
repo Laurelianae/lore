@@ -287,6 +287,24 @@ mod token_verification {
         encode(&header, &claims, &key).unwrap()
     }
 
+    #[tokio::test]
+    async fn strict_forwarded_verification_rejects_missing_and_invalid_tokens() {
+        let verifier = make_verifier();
+        for authorization in [None, Some("Basic token"), Some("Bearer not-a-jwt")] {
+            let context = CallerContext {
+                repository_id: RepositoryId::default(),
+                user_id: "alice".into(),
+                correlation_id: String::new(),
+                authorization: authorization.map(str::to_string),
+            };
+            let err = context
+                .verified_extensions(Some(&verifier))
+                .await
+                .expect_err("strict policy must reject an unverified token");
+            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        }
+    }
+
     /// Permits, recording the `(raw, user_id)` pair of the token it was
     /// handed, or `None` when it was handed no token.
     #[derive(Default)]

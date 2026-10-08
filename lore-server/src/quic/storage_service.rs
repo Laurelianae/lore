@@ -30,7 +30,10 @@ use tracing::info_span;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::PartitionGrants;
+use crate::authnz::repository_authorizer::RawToken;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
@@ -298,6 +301,22 @@ pub enum ParsedStorageRequest {
     MutableCas(requests::MutableCas),
 }
 
+impl ParsedStorageRequest {
+    /// Commands that mutate content or mutable pointers.
+    /// `Verify` with healing retains read authorization: it repairs from the
+    /// authoritative copy using only an address, without accepting caller content.
+    pub(crate) fn requires_write(&self) -> bool {
+        matches!(
+            self,
+            Self::Put(_)
+                | Self::PutResolved(_)
+                | Self::Copy(_)
+                | Self::MutableStoreOp(_)
+                | Self::MutableCas(_)
+        )
+    }
+}
+
 fn quic_error(message_error: &MessageHandleError) -> QuicServiceError {
     match message_error {
         MessageHandleError::AuthorizationFailure(_) | MessageHandleError::MissingToken => {
@@ -488,6 +507,26 @@ impl QuicService for StorageService {
         context: Arc<AttributeMap>,
         request: Self::ParsedRequestType,
     ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
+        if request.requires_write() {
+            let repository = *context
+                .get_or::<RepositoryId, MessageHandleError>(MessageHandleError::NotConnected)?;
+            let claims = context.get::<AuthorizationToken>();
+            let raw = context.get::<RawToken>();
+            let token = raw
+                .as_ref()
+                .zip(claims.as_ref())
+                .map(|(raw, claims)| VerifiedToken {
+                    raw: &raw.0,
+                    claims,
+                });
+            let grants = context.get::<PartitionGrants>();
+            self.repository_authorizer
+                .require_write_with_grants(token.as_ref(), repository, grants.as_deref())
+                .await
+                .map_err(|err| {
+                    MessageHandleError::AuthorizationFailure(err.message().to_string())
+                })?;
+        }
         let lore_response = match request {
             ParsedStorageRequest::Connect(request) => {
                 request

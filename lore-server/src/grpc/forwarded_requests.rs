@@ -94,6 +94,42 @@ impl CallerContext {
         })
     }
 
+    /// Verify the forwarded end-user token using the destination's verifier.
+    pub async fn verified_extensions(
+        &self,
+        verifier: Option<&crate::auth::jwt::JwtVerifier>,
+    ) -> Result<tonic::Extensions, Status> {
+        let mut extensions = tonic::Extensions::new();
+        self.verify_and_insert_token(verifier, &mut extensions)
+            .await?;
+        Ok(extensions)
+    }
+
+    /// Insert verified claims and the raw token only after successful verification.
+    /// Callers choose whether a verification failure is returned or hidden.
+    pub(crate) async fn verify_and_insert_token(
+        &self,
+        verifier: Option<&crate::auth::jwt::JwtVerifier>,
+        extensions: &mut tonic::Extensions,
+    ) -> Result<(), Status> {
+        if let Some(verifier) = verifier {
+            let raw = self
+                .authorization
+                .as_deref()
+                .and_then(|header| header.strip_prefix("Bearer "))
+                .ok_or_else(|| Status::unauthenticated("Missing forwarded token"))?;
+            let claims = verifier
+                .verify_token(raw)
+                .await
+                .map_err(|_denied| Status::unauthenticated("Invalid forwarded token"))?;
+            extensions.insert(crate::authnz::repository_authorizer::RawToken(
+                raw.to_string(),
+            ));
+            extensions.insert(claims);
+        }
+        Ok(())
+    }
+
     /// Wraps `body` in a `Request` and stamps the caller's identity into the
     /// metadata so the receiving server can reconstruct this context via
     /// [`Self::from_forwarded_request`].

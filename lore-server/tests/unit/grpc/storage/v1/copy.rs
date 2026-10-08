@@ -40,7 +40,7 @@ fn access_token(resource_ids: &[String]) -> Arc<VerifiedTokenOwned> {
                     .iter()
                     .map(|resource_id| ResourcePermission {
                         resource_id: resource_id.clone(),
-                        permission: vec![],
+                        permission: vec!["read".to_string()],
                     })
                     .collect(),
             ),

@@ -128,3 +128,52 @@ mod base_branch_list_handler {
         .await;
     }
 }
+
+#[tokio::test]
+async fn service_bounds_stalled_authorization() {
+    use std::time::Duration;
+
+    use lore_proto::lore::revision::v1::forwarded_revision_service_server::ForwardedRevisionService;
+    use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
+    use lore_server::authnz::repository_authorizer::VerifiedToken;
+    use lore_server::grpc::forwarded_revision::v1::service::LoreForwardedRevisionV1Service;
+    use lore_server::hooks::HookDispatcher;
+
+    use crate::notification::testing::MockNotificationSender;
+
+    struct StalledAuthorizer;
+
+    #[async_trait::async_trait]
+    impl RepositoryAuthorizer for StalledAuthorizer {
+        async fn check_repository_access(
+            &self,
+            _token: Option<&VerifiedToken<'_>>,
+            _repository_id: RepositoryId,
+            _action: Option<&str>,
+        ) -> Result<(), tonic::Status> {
+            std::future::pending().await
+        }
+    }
+
+    let (immutable_store, mutable_store, _execution) =
+        test_store_create().await.expect("Failed to create stores");
+    let service = LoreForwardedRevisionV1Service::new(
+        None,
+        Arc::new(StalledAuthorizer),
+        immutable_store,
+        mutable_store,
+        Arc::new(MockNotificationSender::new()),
+        Arc::new(HookDispatcher::empty()),
+        Duration::from_millis(10),
+    );
+    let err = tokio::time::timeout(
+        Duration::from_secs(1),
+        service.branch_list(make_forwarded_request(random())),
+    )
+    .await
+    .expect("authorization must be bounded by the RPC timeout")
+    .map(|_| ())
+    .expect_err("stalled authorization must time out");
+    assert_eq!(err.code(), tonic::Code::Cancelled);
+    assert_eq!(err.message(), "Request handler timeout exceeded");
+}

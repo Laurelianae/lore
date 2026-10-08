@@ -450,14 +450,14 @@ mod grants {
         assert!(!Grants::Denied.permits("anything"));
 
         let actions = Grants::Actions(["migrate".to_string()].into());
-        assert!(actions.reachable());
+        assert!(!actions.reachable());
         assert!(actions.permits("migrate"));
         assert!(!actions.permits("obliterate"));
 
-        // Reachable with nothing granted: a matched entry with an empty
+        // Unreachable with nothing granted: a matched entry with an empty
         // permission list, or Tier 1 without a permission claim.
         let none = Grants::Actions(HashSet::new());
-        assert!(none.reachable());
+        assert!(!none.reachable());
         assert!(!none.permits("read"));
     }
 
@@ -516,7 +516,7 @@ fn upstream_request_carries_resource_and_authorization() {
 
 #[test]
 fn named_action_requires_membership_in_the_permission_list() {
-    let response = response(vec![entry("urc-abc", &["obliterate"])]);
+    let response = response(vec![entry("urc-abc", &["read", "obliterate"])]);
     evaluate_check_user_permission(&response, "urc-abc", Some("obliterate")).unwrap();
     evaluate_check_user_permission(&response, "urc-abc", None).unwrap();
     // The fail-open case: an authorizer that ignores the action would
@@ -530,8 +530,8 @@ fn empty_permission_list_denies_every_named_action() {
     let response = response(vec![entry("urc-abc", &[])]);
     let err = evaluate_check_user_permission(&response, "urc-abc", Some("obliterate")).unwrap_err();
     assert_eq!(err.code(), Code::PermissionDenied);
-    // The resource still appears, which is all `None` asks.
-    evaluate_check_user_permission(&response, "urc-abc", None).unwrap();
+    // A matching resource without read-like permission is also unreachable.
+    evaluate_check_user_permission(&response, "urc-abc", None).unwrap_err();
 }
 
 #[test]
@@ -556,7 +556,7 @@ fn mismatched_resource_denies() {
 fn plain_access_finds_the_resource_past_the_first_entry() {
     let response = response(vec![
         entry("urc-other", &["obliterate"]),
-        entry("urc-abc", &[]),
+        entry("urc-abc", &["read"]),
     ]);
     evaluate_check_user_permission(&response, "urc-abc", None).unwrap();
     let err = evaluate_check_user_permission(&response, "urc-abc", Some("obliterate")).unwrap_err();
@@ -656,5 +656,135 @@ fn selection_display_names_the_implementation() {
     assert_eq!(
         AuthorizerSelection::ResourceGrants.to_string(),
         "ResourceGrantsAuthorizer"
+    );
+}
+
+/// The same policy must hold for every claim reader, cached grant, and linked read.
+#[tokio::test]
+async fn ordinary_permission_matrix_agrees_across_authorizers_and_cached_grants() {
+    use lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
+    use lore_server::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
+    use serde_json::json;
+
+    let repository = RepositoryId::from([7u8; 16]);
+    let other = RepositoryId::from([8u8; 16]);
+    for (permissions, read, write) in [
+        (None, false, false),
+        (Some(vec![]), false, false),
+        (Some(vec!["unknown"]), false, false),
+        (Some(vec!["presign"]), false, false),
+        (Some(vec!["read"]), true, false),
+        (Some(vec!["write"]), true, true),
+        (Some(vec!["admin"]), true, true),
+        (Some(vec!["owner"]), true, true),
+    ] {
+        let actions = permissions.clone().unwrap_or_default();
+        let resources: Vec<_> = permissions
+            .as_ref()
+            .map(|_| {
+                vec![lore_server::auth::jwt::ResourcePermission {
+                    resource_id: format!("urc-{repository}"),
+                    permission: actions.iter().map(|action| action.to_string()).collect(),
+                }]
+            })
+            .unwrap_or_default();
+        let claims = AuthorizationToken {
+            resources: Some(resources),
+            extra: json!({"roles": actions}).as_object().unwrap().clone(),
+            ..Default::default()
+        };
+        let token = VerifiedToken {
+            raw: "verified",
+            claims: &claims,
+        };
+        let authorizers: Vec<Arc<dyn RepositoryAuthorizer>> = vec![
+            Arc::new(GlobalGrantsAuthorizer::new(Some("roles".into()))),
+            Arc::new(ResourceGrantsAuthorizer::new(
+                "resources".into(),
+                "resource_id".into(),
+                None,
+                "urc-{id}".into(),
+                "urc-*".into(),
+            )),
+            Arc::new(AuthClientAuthorizer::new("https://auth.invalid".into())),
+        ];
+        for (tier, authorizer) in authorizers.iter().enumerate() {
+            let grants = authorizer
+                .granted_actions(Some(&token), repository)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(grants.reachable(), read, "{permissions:?} tier {tier}");
+            assert_eq!(grants.writable(), write);
+            assert_eq!(
+                authorizer
+                    .check_repository_access(Some(&token), repository, None)
+                    .await
+                    .is_ok(),
+                read
+            );
+            assert_eq!(
+                authorizer
+                    .check_repository_access_sync(Some(&token), repository, None)
+                    .unwrap()
+                    .is_ok(),
+                read
+            );
+            assert_eq!(
+                authorizer
+                    .check_repository_write(Some(&token), repository)
+                    .await
+                    .is_ok(),
+                write
+            );
+            let mut extensions = tonic::Extensions::new();
+            extensions.insert(claims.clone());
+            extensions.insert(RawToken("verified".into()));
+            extensions.insert(PartitionGrants {
+                repository_id: repository,
+                grants,
+            });
+            assert_eq!(
+                authorizer
+                    .require_write(&extensions, repository)
+                    .await
+                    .is_ok(),
+                write
+            );
+            for privileged in ["push-protected", "obliterate", "migrate"] {
+                assert!(
+                    !authorizer
+                        .permits(&extensions, repository, privileged)
+                        .await
+                );
+            }
+            if tier != 0 {
+                assert!(authorizer.require_write(&extensions, other).await.is_err());
+            }
+        }
+        let entries = permissions
+            .as_ref()
+            .map(|_| vec![entry(&format!("urc-{repository}"), &actions)])
+            .unwrap_or_default();
+        let response = response(entries);
+        let grants = grants_from_response(&response, &format!("urc-{repository}"));
+        assert_eq!(grants.reachable(), read);
+        assert_eq!(grants.writable(), write);
+        assert_eq!(
+            evaluate_check_user_permission(&response, &format!("urc-{repository}"), None).is_ok(),
+            read
+        );
+    }
+    let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(AllowAllRepositoryAuthorizer);
+    assert!(
+        authorizer
+            .require_write(&tonic::Extensions::new(), repository)
+            .await
+            .is_ok()
+    );
+    assert!(
+        !authorizer
+            .permits(&tonic::Extensions::new(), repository, "presign")
+            .await
     );
 }
