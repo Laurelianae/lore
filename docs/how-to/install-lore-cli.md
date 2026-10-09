@@ -19,7 +19,7 @@ The two paths are mutually exclusive, and each one below is complete on its own 
 
 ### Install the prebuilt binary
 
-Pick this path for a normal install from a published release.
+Pick this path for a normal install from a published [Aidonia fork release](https://github.com/Laurelianae/lore/releases). Linux downloads require glibc 2.39 or newer; macOS downloads support Apple Silicon, and Windows downloads support AMD64.
 
 1. **Run the installer.**
 
@@ -29,25 +29,21 @@ Pick this path for a normal install from a published release.
     **macOS / Linux**
 
     ```bash
-    curl -fsSL https://raw.githubusercontent.com/EpicGames/lore/main/scripts/install.sh | bash
+    curl -fsSL https://raw.githubusercontent.com/Laurelianae/lore/aidonia/main/scripts/install.sh | bash
     ```
 
     <!-- tab -->
     **Windows**
 
     ```powershell
-    irm https://raw.githubusercontent.com/EpicGames/lore/main/scripts/install.ps1 | iex
-    ```
-
-    Or install with [Scoop](https://scoop.sh):
-
-    ```powershell
-    scoop install lore
+    irm https://raw.githubusercontent.com/Laurelianae/lore/aidonia/main/scripts/install.ps1 | iex
     ```
 
     <!-- tabs:end -->
 
     The installer downloads the binary for your platform and adds it to your PATH. Open a new terminal session for the PATH change to take effect.
+
+    Both installers default to `Laurelianae/lore`. Set `LORE_REPO=EpicGames/lore` or pass `--repo EpicGames/lore` (PowerShell: `-Repo EpicGames/lore`) to select upstream instead. Use `--version aidonia-v0.1.0` or `-Version aidonia-v0.1.0` to select an exact fork release. Fork standalone server downloads and the installer's demo mode are available on Linux only. Use the [Docker image](../../lore-server/DOCKER.md) for a local server on Apple Silicon or Windows with Linux containers.
 
 ### Build from source and install
 

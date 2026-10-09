@@ -1,12 +1,12 @@
-<!--
-SPDX-FileCopyrightText: 2026 Epic Games, Inc.
-SPDX-License-Identifier: MIT
--->
-
 ---
 status: accepted
 date: 2026-09-14
 ---
+
+<!--
+SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+SPDX-License-Identifier: MIT
+-->
 
 # ADR-00019: Portable aarch64 Linux build, with Neoverse V1 tuning opt-in
 
@@ -59,10 +59,9 @@ lore-base/neoverse-512tvb`. The Cargo feature is a second, independent switch: i
 versa. The feature name says exactly which tuning it mirrors, and the two flags are meant to be
 passed together.
 
-`lore-server/Dockerfile` always adds the tuning flags for `arm64` too (keyed off buildx's
-`TARGETARCH`), matching the published `-graviton` release image — building `linux/arm64` still
-needs to happen under `--platform linux/amd64` emulation on non-Graviton hosts, unchanged from
-before this decision.
+At the time of this decision, `lore-server/Dockerfile` also selected the tuning flags for
+`arm64`, matching the upstream `-graviton` release image. The fork release system subsequently
+changed Docker's default to the portable baseline; see [LP-010](../upstream-patches.md#lp-010-portable-docker-builds-and-fork-release-delivery).
 
 ### Consequences
 
@@ -74,8 +73,8 @@ before this decision.
   explicit feature, not on a detection proxy.
 - Bad, because a tuned build needs two flags passed together (`--config` and `--features`) instead
   of one; forgetting the feature flag builds Rust tuned but rpmalloc portable.
-- Neutral, because the published release binary and Docker image are unaffected here: their build
-  paths already tune for aarch64, so those outputs are the same as before this change.
+- Neutral, because this decision originally left the published release binary and Docker image
+  unchanged. The subsequent fork release change uses portable ARM64 binaries for its default image.
 
 ## Pros and Cons of the Options
 

@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
 ARG TARGETARCH
 
 COPY dist/${TARGETARCH}/loreserver /usr/local/bin/loreserver
-# The archive stores it 0644 and COPY carries that mode through.
+# Also support artifacts staged by tools that do not preserve file modes.
 RUN chmod 0755 /usr/local/bin/loreserver
 COPY dist/${TARGETARCH}/LICENSE.txt /usr/share/doc/loreserver/LICENSE.txt
 COPY dist/${TARGETARCH}/THIRD-PARTY-NOTICES.txt /usr/share/doc/loreserver/THIRD-PARTY-NOTICES.txt

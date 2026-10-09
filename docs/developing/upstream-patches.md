@@ -38,6 +38,7 @@ IDs remain stable through rebases, splits, and retirement. The table is in repla
 | LP-007 | [ca0b042](https://github.com/Laurelianae/lore/commit/ca0b04201cd9350b419ecb5120e9d7ac00595012) | Supplied access tokens in QUIC sessions | Extends LP-006 smoke coverage; same storage client later changed by LP-009 | Active |
 | LP-008 | [e799c84](https://github.com/Laurelianae/lore/commit/e799c84368a25a43f98d8ccad0c0e95f5f9a5700) | Scoped tokens for repository RPCs | Extends LP-006 smoke coverage; complements LP-007 | Active |
 | LP-009 | [4bfa0ec](https://github.com/Laurelianae/lore/commit/4bfa0ec058d08ba9c2aa7abb783d7299c9829820) | Cached QUIC authorization expiry and recovery | Uses LP-006 cached grants and LP-007 current-token selection | Active |
+| LP-010 | Pending commit | Portable Docker builds and fork release delivery | Reuses the portable ARM baseline, version stamping, and notices generation | Active in working tree |
 
 ## Patch details and acceptance contracts
 
@@ -166,6 +167,26 @@ The transport maps wire status `AuthorizationExpired = 6` to `NotAuthenticated`.
 **Compatibility:** Status 6 is emitted without ALPN negotiation. Older clients fail closed through unknown-status handling and may report a generic/internal error. Upgraded clients cannot impose server-side expiry when connected to an older server that still accepts expired grants. Preserve both server enforcement and client recovery when splitting this patch.
 
 **Retire when:** Upstream passes expiry admission and sticky-retirement checks on both protocols, plus bounded v4 recovery, concurrent credential rotation, new-grant enforcement, and cleanup regressions. A server-only expiry fix replaces only part of this patch.
+
+### LP-010: Portable Docker builds and fork release delivery
+
+**Purpose:** Distribute this fork's tested binaries and server images under an independent Aidonia release identity. The recorded nine-commit comparison above remains historical; this entry describes new work pending commit.
+
+**Before:** Source Docker builds tuned every ARM64 binary for Graviton3+, and the image publisher expected upstream release assets and published to EpicGames' namespace. Installer defaults selected upstream releases.
+
+**Current:** Source Docker builds use portable AMD64/ARM64 code and the production `release-lto` profile. The server CLI reports the stamped library version, matching startup logs and the client. Fork tags prepare tested client archives for four targets and Linux server archives in a draft. Published releases produce one signed multi-platform image in the fork's GHCR namespace, using checksum-verified released server binaries and configuration from the same source commit. Both installers default to this fork while retaining repository overrides.
+
+**Acceptance:** No default ARM64 build selects Neoverse tuning. Both container transports are exposed and tested; pushed data survives container recreation with the same volume. Every download identifies the fork version and source commit and includes license notices. Failed validation creates no draft. Exact published versions are preserved on retries, and prereleases and older backfills do not take newer moving tags.
+
+**Code and regressions:** `lore-server/tests/unit/server.rs::cli_version::version_reports_the_stamped_library_version`, [release contracts](../../scripts/release/tests/test_release.py), [native container smoke flow](../../scripts/release/smoke-image.py), [release preparation](../../.github/workflows/prepare-release.yml), [image publication](../../.github/workflows/publish-loreserver-image.yml), and [release guide](releases.md).
+
+**Replay:** Keep fork registry and installer destinations, tag namespace, ancestry checks, and source-stamp checks when updating upstream packaging. The core portable ARM build configuration is reused without modification.
+
+**Compatibility:** Default ARM64 images now run on general ARM64 Linux hosts. Graviton-specific images are not part of this fork's release stream. Linux downloads initially require glibc 2.39 or newer; macOS and Windows clients are distributed without certificate signing or notarization.
+
+**Validation (2026-10-09):** All 1,386 server unit tests passed outside the filesystem/network sandbox, including the CLI version regression. All 19 release contract tests passed. Local Linux release binaries were rebuilt, stamped, and packaged with generated notices; notices generation passed for all six planned archives. The AMD64 packaging image passed startup, health, push/clone on both transports, and persistence after container recreation with the same volume. Focused server Clippy, nightly formatting, Actionlint, ShellCheck, Ruff, Pyright, changed-document Markdownlint, and whitespace checks passed. ARM64/macOS/Windows native builds and hosted signing/publication remain to be verified by GitHub Actions. Vale and lychee were unavailable, and a broader Markdownlint scan reported existing findings in unrelated documentation.
+
+**Retire when:** Replacement release tooling satisfies these acceptance contracts and preserves fork identity, downloads, signatures, and immutable exact versions. Upstream publishing to its own namespace does not replace fork delivery.
 
 ## Inspect and export the recorded series
 

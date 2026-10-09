@@ -1,5 +1,24 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+mod cli_version {
+    use clap::Parser;
+    use clap::error::ErrorKind;
+    use lore_base::version::LORE_LIBRARY_VERSION;
+    use lore_server::server::Cli;
+
+    #[test]
+    fn version_reports_the_stamped_library_version() {
+        let error = Cli::try_parse_from(["loreserver", "--version"])
+            .expect_err("--version exits before starting the server");
+
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        assert_eq!(
+            error.to_string(),
+            format!("loreserver {}\n", LORE_LIBRARY_VERSION.as_str())
+        );
+    }
+}
+
 /// Covers where the local store ends up on disk, and whether that location
 /// survives a reboot.
 mod local_store_path_resolution {

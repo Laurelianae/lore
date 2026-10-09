@@ -1,4 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-FileCopyrightText: 2026 Laurelianae
 # SPDX-License-Identifier: MIT
 
 # Runs the test suite on GitHub-hosted runners. This workflow needs no secrets:
@@ -9,12 +10,23 @@ name: PR Validate
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: ""
+      rust_toolchain:
+        type: string
+        default: stable
+      run_smoke:
+        type: boolean
+        default: true
 
 permissions: {}
 
 concurrency:
-  group: pr-validate-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: pr-validate-${{ github.event.pull_request.number || inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,8 +60,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: ${{ inputs.rust_toolchain || 'stable' }}
 
       # `cargo test --workspace` builds a debug test binary for every crate with
       # embedded DWARF, which does not fit on the runner's root filesystem. The
@@ -64,12 +79,15 @@ jobs:
           echo "CARGO_TARGET_DIR=/mnt/cargo-target" >> "$GITHUB_ENV"
           df -h / /mnt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: unit-${{ matrix.name }}
 
       - name: cargo test
-        run: cargo test --workspace --verbose
+        run: cargo test --locked --workspace --verbose
+
+      - name: Release contracts
+        run: python3 -m unittest discover -s scripts/release/tests -v
 
   # Runs the integration tests against the MinIO, DynamoDB Local, and Consul
   # services that Docker Compose starts. Only the Linux runners provide Docker.
@@ -84,8 +102,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: ${{ inputs.rust_toolchain || 'stable' }}
 
       # Build on /mnt. See the unit job for the reason.
       - name: Build on the larger /mnt volume
@@ -95,7 +116,7 @@ jobs:
           echo "CARGO_TARGET_DIR=/mnt/cargo-target" >> "$GITHUB_ENV"
           df -h / /mnt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: integration
 
@@ -123,7 +144,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: lorelocal
           AWS_REGION: us-east-1
         run: >
-          cargo test --package lore-integration-tests
+          cargo test --locked --package lore-integration-tests
           --features integration_tests --verbose
 
       - name: Dump service logs on failure
@@ -138,6 +159,7 @@ jobs:
   # against release binaries built here. The server build enables
   # failure_generator so the fault injection tests run instead of skipping.
   smoke:
+    if: ${{ github.event_name == 'pull_request' || inputs.run_smoke }}
     name: smoke (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     permissions:
@@ -165,8 +187,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: ${{ inputs.rust_toolchain || 'stable' }}
 
       # Build on /mnt. See the unit job for the reason. conftest resolves the
       # `release` binary keyword to <cwd>/target/release, which stays empty when
@@ -185,11 +210,11 @@ jobs:
           } >> "$GITHUB_ENV"
           df -h / /mnt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: smoke-${{ matrix.name }}
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: Build lore and loreserver (release)
         run: >
@@ -230,7 +255,8 @@ jobs:
           echo "smoke=${{ needs.smoke.result }}"
           if [ "${{ needs.unit.result }}" != "success" ] \
              || [ "${{ needs.integration.result }}" != "success" ] \
-             || [ "${{ needs.smoke.result }}" != "success" ]; then
+             || { [ "${{ needs.smoke.result }}" != "success" ] \
+                  && [ "${{ needs.smoke.result }}" != "skipped" ]; }; then
             echo "One or more validation jobs failed."
             exit 1
           fi

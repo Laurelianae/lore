@@ -1,0 +1,215 @@
+# SPDX-FileCopyrightText: 2026 Laurelianae
+# SPDX-License-Identifier: MIT
+name: Prepare fork release
+
+on:
+  push:
+    tags: ["aidonia-v*"]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Existing aidonia-v tag to prepare or retry
+        type: string
+        required: true
+
+permissions: {}
+concurrency:
+  group: prepare-release-${{ inputs.release || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RUST_VERSION: "1.98.1"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  meta:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      source_commit: ${{ steps.meta.outputs.source_commit }}
+      build_name: ${{ steps.meta.outputs.build_name }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Restrict manual retries to the default branch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          REF: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: test "$REF" = "$DEFAULT_BRANCH"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: meta
+        env:
+          TAG: ${{ inputs.release || github.ref_name }}
+        run: |
+          python3 -m unittest discover -s scripts/release/tests -v
+          python3 scripts/release/release.py metadata --tag "$TAG" --github-output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-context
+          path: release-context.json
+          if-no-files-found: error
+
+  validate:
+    needs: meta
+    permissions:
+      contents: read
+    uses: ./.github/workflows/pr-validate.yml
+    with:
+      ref: ${{ needs.meta.outputs.source_commit }}
+      rust_toolchain: "1.98.1"
+      run_smoke: false
+
+  notices:
+    needs: meta
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.source_commit }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: release-notices
+      - run: cargo install cargo-about --version 0.9.0 --locked --features cli
+      - name: Generate notices for every binary and target
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            mkdir -p "release-notices/$target"
+            bash notices/generate-notices.sh lore "$target" lore-client/Cargo.toml "release-notices/$target/lore.txt"
+            if [[ "$target" == *linux* ]]; then
+              bash notices/generate-notices.sh loreserver "$target" lore-server/Cargo.toml "release-notices/$target/loreserver.txt"
+            fi
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notices
+          path: release-notices/
+          if-no-files-found: error
+
+  build:
+    needs: [meta, notices]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-24.04, target: x86_64-unknown-linux-gnu}
+          - {os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu}
+          - {os: macos-14, target: aarch64-apple-darwin}
+          - {os: windows-2022, target: x86_64-pc-windows-msvc}
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+      BUILD_NAME: ${{ needs.meta.outputs.build_name }}
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.source_commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-context
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notices
+          path: release-notices
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+      - name: Select build directory and executable paths
+        run: |
+          set -euo pipefail
+          build_dir="$GITHUB_WORKSPACE/target"
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo mkdir -p /mnt/cargo-target
+            sudo chown "$(id -u):$(id -g)" /mnt/cargo-target
+            build_dir=/mnt/cargo-target
+          fi
+          suffix=""
+          if [[ "$RUNNER_OS" == Windows ]]; then suffix=.exe; fi
+          {
+            echo "CARGO_TARGET_DIR=$build_dir"
+            echo "BIN_DIR=$build_dir/$TARGET/release-lto"
+            echo "LORE_EXECUTABLE_PATH=$build_dir/$TARGET/release-lto/lore$suffix"
+            echo "LORE_SERVER_EXECUTABLE_PATH=$build_dir/$TARGET/release-lto/loreserver$suffix"
+          } >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: release-${{ matrix.target }}
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.11.30"
+          python-version: "3.13"
+      - name: Build production binaries
+        run: cargo build --locked --profile release-lto --target "$TARGET" -p lore-client -p lore-server --bin lore --bin loreserver
+      - name: Stamp the fork version and source commit
+        run: |
+          CARGO_TARGET_DIR="$RUNNER_TEMP/lore-stamp" cargo run --locked --release -p lore-base --bin lore-stamp -- \
+            --build "$BUILD_NAME" "$LORE_EXECUTABLE_PATH" "$LORE_SERVER_EXECUTABLE_PATH"
+      - name: Smoke test the production binaries
+        run: |
+          args=()
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            args+=(--lore-remote-http-port 41339 --lore-remote-quic-port 41338 --lore-remote-grpc-port 41338 --lore-remote-internal-port 41340)
+          fi
+          uv run --locked pytest scripts/test/ -m smoke -n 2 "${args[@]}"
+      - name: Package verified binaries
+        run: uv run --locked python scripts/release/release.py package --target "$TARGET" --bin-dir "$BIN_DIR" --notices-dir "release-notices/$TARGET"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/*
+          compression-level: 0
+          if-no-files-found: error
+
+  draft:
+    needs: [meta, validate, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.source_commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-context
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: dist
+      - name: Assemble and verify the complete release
+        run: |
+          python3 scripts/release/release.py assemble
+          python3 scripts/release/release.py verify --require-all
+      - name: Create or complete the draft without replacing assets
+        run: python3 scripts/release/release.py draft
+      - name: Report the draft
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          gh release view "$TAG" --json url --jq '"Review the draft release: " + .url' >> "$GITHUB_STEP_SUMMARY"

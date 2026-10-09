@@ -1,4 +1,6 @@
-FROM rust:slim-trixie AS builder
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+FROM rust:1.98.1-slim-trixie AS builder
 
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -8,18 +10,12 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /build
 COPY . .
 
-# arm64 always builds Graviton3+/Neoverse V1-tuned.
-ARG TARGETARCH
+# Both architectures use the portable baseline, including the native C code.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    if [ "$TARGETARCH" = "arm64" ]; then \
-        cargo build --release --bin loreserver \
-            --config .cargo/neoverse-512tvb.toml --features lore-base/neoverse-512tvb; \
-    else \
-        cargo build --release --bin loreserver; \
-    fi && \
-    cp /build/target/release/loreserver /build/loreserver-bin
+    cargo build --locked --profile release-lto --bin loreserver && \
+    cp /build/target/release-lto/loreserver /build/loreserver-bin
 
 FROM debian:trixie-slim
 
@@ -50,6 +46,6 @@ RUN mkdir -p /data
 VOLUME /data
 
 # QUIC + gRPC: 41337, HTTP: 41339
-EXPOSE 41337 41339
+EXPOSE 41337/tcp 41337/udp 41339/tcp
 
 ENTRYPOINT ["loreserver"]

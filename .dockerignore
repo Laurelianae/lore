@@ -1,2 +1,12 @@
 target/
 **/target/
+.git/
+.venv/
+.pytest_cache/
+.ruff_cache/
+**/__pycache__/
+.lore/
+.urc/
+.aws/
+.codex/
+.agents/

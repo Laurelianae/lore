@@ -147,7 +147,11 @@ mod store_mode {
 /// defaults baked into the binary. Both flags also fall back to their
 /// corresponding environment variables.
 #[derive(Debug, Parser)]
-#[command(name = "loreserver", version, about = "Lore revision control server")]
+#[command(
+    name = "loreserver",
+    version = LORE_LIBRARY_VERSION.as_str(),
+    about = "Lore revision control server"
+)]
 pub struct Cli {
     /// Directory of TOML config files layered over the built-in defaults.
     ///
