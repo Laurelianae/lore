@@ -99,7 +99,7 @@ pub struct StorageServiceV4 {
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     session_map: Arc<SessionMap>,
-    clock: crate::auth::jwt::AuthorizationClock,
+    pub(super) clock: crate::auth::jwt::AuthorizationClock,
     user_agent_filter: Arc<UserAgentFilter>,
 }
 

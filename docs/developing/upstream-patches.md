@@ -166,6 +166,10 @@ The transport maps wire status `AuthorizationExpired = 6` to `NotAuthenticated`.
 
 **Compatibility:** Status 6 is emitted without ALPN negotiation. Older clients fail closed through unknown-status handling and may report a generic/internal error. Upgraded clients cannot impose server-side expiry when connected to an older server that still accepts expired grants. Preserve both server enforcement and client recovery when splitting this patch.
 
+**Build compatibility (2026-10-09):** Both QUIC storage services expose only their authorization clock fields to the parent module with `pub(super)`. The shared test handler factory can therefore inject clocks when built with `integration_tests` alone; previously this failed with E0616 unless `test-util` also widened the fields. Preserve the existing test annotations and expiry behavior. Acceptance requires the standalone integration build and suite to pass without relying on workspace feature unification, together with the QUIC unit regressions.
+
+**Validation (2026-10-09):** `cargo test --locked -p lore-integration-tests --features integration_tests --no-run` passed independently of workspace tests. With the Compose services running and CI AWS environment settings, the same command without `--no-run` passed 363 integration tests (4 ignored) and the separate GC trigger test. `cargo test --locked -p lore-server --test unit quic::` passed all 76 selected tests. `cargo +nightly fmt --all --check`, `cargo clippy --locked -p lore-server --all-targets --features integration_tests -- -D warnings --no-deps`, and `git diff --check` passed. `bash scripts/docs-lint.sh` could not validate documentation because Vale, markdownlint-cli2, and lychee were unavailable.
+
 **Retire when:** Upstream passes expiry admission and sticky-retirement checks on both protocols, plus bounded v4 recovery, concurrent credential rotation, new-grant enforcement, and cleanup regressions. A server-only expiry fix replaces only part of this patch.
 
 ### LP-010: Portable Docker builds and fork release delivery

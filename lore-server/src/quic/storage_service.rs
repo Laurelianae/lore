@@ -467,7 +467,7 @@ struct AuthorizationRetired;
 #[lore_macro::test_pub]
 pub struct StorageService {
     jwt_verifier: Arc<Option<JwtVerifier>>,
-    clock: crate::auth::jwt::AuthorizationClock,
+    pub(super) clock: crate::auth::jwt::AuthorizationClock,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
