@@ -32,4 +32,4 @@ Use Rust's test harness and Tokio for async tests. Register unit-test modules th
 
 ## Commit & Pull Request Guidelines
 
-Recent commits use prefixes such as `fix:`, `docs:`, and `authz:`. Keep imperative subjects under 72 characters and sign every commit with `git commit -s`. Submit focused PRs to `main` with the problem, approach, linked issue, validation, and relevant documentation updates; two maintainer approvals are required. Follow `CONTRIBUTING.md` for issue/LEP prerequisites. Disclose AI assistance and write the PR description yourself.
+Recent commits use prefixes such as `fix:`, `docs:`, and `authz:`. Keep imperative subjects under 72 characters and sign every commit with `git commit -s`. Submit focused PRs to `main` with the problem, approach, linked issue, validation, and relevant documentation updates; two maintainer approvals are required. Follow `CONTRIBUTING.md` for issue/LEP prerequisites.
