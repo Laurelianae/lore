@@ -38,7 +38,7 @@ IDs remain stable through rebases, splits, and retirement. The table is in repla
 | LP-007 | [ca0b042](https://github.com/Laurelianae/lore/commit/ca0b04201cd9350b419ecb5120e9d7ac00595012) | Supplied access tokens in QUIC sessions | Extends LP-006 smoke coverage; same storage client later changed by LP-009 | Active |
 | LP-008 | [e799c84](https://github.com/Laurelianae/lore/commit/e799c84368a25a43f98d8ccad0c0e95f5f9a5700) | Scoped tokens for repository RPCs | Extends LP-006 smoke coverage; complements LP-007 | Active |
 | LP-009 | [4bfa0ec](https://github.com/Laurelianae/lore/commit/4bfa0ec058d08ba9c2aa7abb783d7299c9829820) | Cached QUIC authorization expiry and recovery | Uses LP-006 cached grants and LP-007 current-token selection | Active |
-| LP-010 | Pending commit | Portable Docker builds and fork release delivery | Reuses the portable ARM baseline, version stamping, and notices generation | Active in working tree |
+| LP-010 | [eabb070](https://github.com/Laurelianae/lore/commit/eabb0702aa04b08861e60008b4cd8dc1921df1cc) | Portable Docker builds and fork release delivery | Reuses the portable ARM baseline, version stamping, and notices generation | Active |
 
 ## Patch details and acceptance contracts
 
@@ -170,7 +170,7 @@ The transport maps wire status `AuthorizationExpired = 6` to `NotAuthenticated`.
 
 ### LP-010: Portable Docker builds and fork release delivery
 
-**Purpose:** Distribute this fork's tested binaries and server images under an independent Aidonia release identity. The recorded nine-commit comparison above remains historical; this entry describes new work pending commit.
+**Purpose:** Distribute this fork's tested binaries and server images under an independent Aidonia release identity. The recorded nine-commit comparison above remains historical; this entry tracks the subsequent release implementation.
 
 **Before:** Source Docker builds tuned every ARM64 binary for Graviton3+, and the image publisher expected upstream release assets and published to EpicGames' namespace. Installer defaults selected upstream releases.
 
