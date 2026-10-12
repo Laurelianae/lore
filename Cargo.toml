@@ -193,13 +193,17 @@ panic = "abort"
 inherits = "release"
 lto = "off"
 
-# The actual release build
+# The actual release build. Thin LTO and line tables keep peak rustc and linker
+# memory inside the hosted release runners (7 GB macOS, 16 GB Linux/Windows);
+# full DWARF with fat LTO OOM-killed Linux/Windows and thrashed macOS into the
+# 180-minute timeout. Line tables keep file-and-line crash backtraces, the same
+# tradeoff the dev and release profiles document above.
 [profile.release-lto]
 inherits = "release"
 incremental = false
 opt-level = 3
-debug = 2
-lto = "fat"
+debug = "line-tables-only"
+lto = "thin"
 codegen-units = 4
 debug-assertions = false
 
