@@ -11,17 +11,38 @@ This register tracks the patches maintained on `aidonia/main` relative to local 
 
 | Item | Recorded value |
 | --- | --- |
-| Review date | 2026-10-08 |
+| Review date | 2026-10-13 |
 | Upstream project | [EpicGames/lore](https://github.com/EpicGames/lore) |
 | Fork | [Laurelianae/lore](https://github.com/Laurelianae/lore), branch `aidonia/main` |
-| Baseline | Local `main`: `491a7ed75c9b0dac7de50ada6d2a9c38f3cbc046` |
-| Fork revision | `4bfa0ec058d08ba9c2aa7abb783d7299c9829820` |
-| Comparison | Nine commits; 86 changed files; 5,306 insertions and 513 deletions |
-| Upstream freshness | Unverified. The upstream network check failed because `github.com` could not be resolved. |
+| Baseline | Upstream `c094c64ebf9560f62065b988bd3227d6c846912b` (merged head; contains the previously verified `db1b7c3e07ec2f149178229f34ceee6a309d80ab`) |
+| Fork revision | Merge commit `9e7966fd6a6fdc4e77629ba6a26bdb6aea7e1510` |
+| Comparison | Seventeen series commits plus the merge; 110 changed files; 7,238 insertions and 1,063 deletions versus `c094c64` |
+| Upstream freshness | Verified via `ls-remote`: `EpicGames/lore@main` = `c094c64`. An earlier check the same day returned `db1b7c3`; upstream advanced by two commits (`0595e60`, `c094c64`) before execution, and the newer head was merged instead. |
 
-The configured remote is the fork, `origin`; there is no configured `upstream` remote. Local `main` and `origin/main` pointed to the same baseline during this review. This establishes the local comparison, not whether upstream has since incorporated any of these patches. The working tree was clean before this documentation change.
+The 2026-10-08 review recorded `491a7ed75c9b0dac7de50ada6d2a9c38f3cbc046` as baseline with fork revision `4bfa0ec058d08ba9c2aa7abb783d7299c9829820` (nine commits; 86 files; 5,306 insertions and 513 deletions) and could not reach the network. Its values are superseded by the table above; the narrative below is retained as provenance.
+
+The configured remote is the fork, `origin`; there is no configured `upstream` remote. Local `main` and `origin/main` pointed to the same baseline during that review. This establishes the local comparison, not whether upstream has since incorporated any of these patches. The working tree was clean before that documentation change.
 
 [Upstream PR #49](https://github.com/EpicGames/lore/pull/49) is a comparison lead already recorded in the [server authorization configuration](../reference/lore-server-config.md). Its current status, merge commit, and behavioral equivalence are unverified. Do not mark a patch retired merely because that PR exists or touches similar code.
+
+## Reconciliation 2026-10-13
+
+**Landing strategy.** Upstream was landed as a merge, not a replay: `git merge c094c64` on review branch `codex/upstream-patch-review-20261013`, producing merge commit `9e7966fd6a6fdc4e77629ba6a26bdb6aea7e1510` (“Merge upstream main c094c64 into aidonia patch series”), then fast-forwarded onto `aidonia/main` and pushed as an ordinary push. A merge was chosen over cherry-pick/replay because this fork syncs repeatedly: merges keep `origin/aidonia/main` an ancestor of every future tip, preserve the original patch commit SHAs below (provenance stays valid), and accumulate conflict resolutions. `db1b7c3` had been fast-forwarded into `origin/main` on 2026-10-13; the live `ls-remote` then showed upstream at `c094c64` (two commits ahead: `0595e60` docs, `c094c64` lore-revision progress counting), and the newer head was merged instead. The two extra commits touch `lore-revision/src/commit.rs`, its unit tests, and docs, none of which the series modifies.
+
+**Retirement review.** All ten patches remain **Active** with their original commit SHAs; no replayed-SHA mapping is needed. Marker checks against `c094c64` found no fork behavior upstream: no `push-protected` in `lore-server/src`, no `AuthorizationExpired` in `lore-transport`, no access-token selection in `lore-transport/src/grpc/repository_client.rs`, while the pre-fork behavior is intact (`is_service_account` bypass in both push/delete handlers, `can_obliterate` in `lore-server/src/grpc/mod.rs` and `handlers/obliterate.rs`, “Only service accounts may vend presigned URLs” in the presign handler). [PR #49](https://github.com/EpicGames/lore/pull/49) remains open with the maintainer’s 2026-07-07 comment deferring granular permissions to a future authn/authz overhaul. Upstream added `auth_mode` (commit `7c04530`) — an orthogonal gRPC-vs-OIDC auth *path* selector (`lore-revision/src/auth/mode.rs`, resolved in `lore-client/src/cli/cli.rs`); it introduces no credential source, so LP-008’s precedence (supplied access token → supplied identity token → stored auth token) was left untouched.
+
+**Conflict resolution.** Git auto-merged all but four files; each auto-merge was verified against the acceptance contracts (store-request metrics from `0f99022` coexist with the LP-001 gate in `branch_push.rs`; `[profile.release-lto]` kept beside upstream’s `[workspace.lints]`; `pub(super)` authorization clocks in both QUIC storage services; `ParallelChunking` wired around the expiry admission checks; token precedence kept in `lore-transport/src/grpc/mod.rs`). Resolved conflicts: `lore-transport/src/session.rs` — upstream’s pooled-session turn plumbing (`with_resolved(turn, …)`, `project_current`, `resolve_pending`, `AtomicBool` pool staleness) adapted around the fork’s `SessionAuthorization` replay lifecycle, whose `Drop` remains the sole `session_stop` owner; `lore-revision/src/immutable.rs` — fork’s authorization-error forwarding kept against upstream’s internal-error wrapping; `lore-transport/tests/unit/session.rs` — fork’s `expiry_recovery` tests unioned with upstream’s `pooled` tests; `docs/reference/lore-cli-commands.md` — regenerated to match the merged `lore-client/src/cli/cli.rs` and `commands/repository.rs` help text. Two mechanical lint fixes completed the gate: collapsed identical match arms in the merged `Drop` and `Box::pin` for a `large_futures` warning in upstream’s new `cache_tests.rs` under upstream’s own `[workspace.lints]`.
+
+**Validation (executed 2026-10-13, on the review branch).**
+
+- `cargo build --release`, `cargo +nightly fmt --all --check`, `cargo clippy --all-targets -- -D warnings --no-deps`: all clean (after the two lint fixes above).
+- `cargo test --workspace`: green; three `lore --test unit remote::network` tests fail only in this sandbox (`/run/user/1000` is a read-only filesystem) and pass with `XDG_RUNTIME_DIR` pointed at a writable directory.
+- LP-009 build compatibility: `cargo test --locked -p lore-integration-tests --features integration_tests --no-run` passed standalone. The Compose services were not run (no AWS environment available in this sandbox), so the full integration suite was not executed — recorded as a limitation per §Reconcile step 7.
+- Focused regressions: `cargo test -p lore-server --test unit quic::` 77 passed, `authnz::` 67 passed, `grpc::` 450 passed, `cargo test -p lore-transport` 173 passed.
+- Smoke (release binaries): `uv run pytest scripts/test/test_repository_permissions.py` — 96 passed, 45 skipped (matches the LP-008 recorded counts); `uv run pytest scripts/test/ -m smoke` — 1,282 passed, 7 failed, 83 skipped, 22 deselected. The 7 failures (`test_merge_restart`, `test_lock_query` owner-name resolution, `test_search_nearest_layer_metadata`, and four `scripts/test/link/` tests) were reproduced on **both** the pure fork `e0eb83a` and pure upstream `c094c64` in isolated worktrees — they pre-date this reconciliation on both sides and are not merge regressions. The four link tests are upstream-new and fail on upstream itself.
+- `pre-commit run --all-files`: 17 hooks passed. `actionlint` could not run: its golang hook environment cannot fetch modules because the sandbox proxy forbids `proxy.golang.org`, `golang.org`, `gopkg.in`, and mirrors.
+
+**Future comparisons** should use `git diff c094c64 <fork-tip>` — or the then-current merge-base — rather than the retired `491a7ed` baseline, and keep this section’s marker checks (§ above) as the retirement screen.
 
 ## Patch inventory
 
