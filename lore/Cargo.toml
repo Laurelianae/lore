@@ -13,6 +13,7 @@ bitcode = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
+futures = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -51,3 +52,6 @@ lore-base = { workspace = true, features = ["test-util"] }
 rand = { workspace = true }
 serial_test = { workspace = true }
 lore = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

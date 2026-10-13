@@ -6,6 +6,7 @@ use std::sync::Once;
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
 
+use lore_base::env::AUTH_PATH_VAR;
 use lore_base::lore_debug;
 use lore_base::lore_spawn_net;
 use lore_base::lore_trace;
@@ -28,6 +29,12 @@ use crate::session::StorageSession;
 use crate::traits::*;
 use crate::types::*;
 
+/// Most storage connections a command opens.
+///
+/// The server paces each QUIC connection on its own, so one connection to a distant remote
+/// delivers a few MiB/s however many requests it carries, and bulk reads scale with the number
+/// of connections they are spread over. They connect in parallel, and storage is ready once the
+/// slowest of them has.
 pub static MAX_STORAGE_CONNECTIONS: usize = 10;
 pub static DEFAULT_PROTOCOL: &str = "lores";
 
@@ -83,13 +90,19 @@ pub fn add(scheme: &str, protocol: Arc<dyn Protocol>) -> Result<(), ProtocolErro
 /// [`SuppliedCredentials`] carries a rotation within one mode.
 type FromSuppliedCredentials = bool;
 
-#[allow(clippy::type_complexity)]
-/// Connections are keyed by `(remote_url, identity, from_supplied_credentials)`. Storage uses per-session auth,
-/// and non-storage services (revision, admin, lock) are created lazily per-repository
-/// with per-repository authz tokens.
-static CONNECTION_MAP: Mutex<
-    Option<HashMap<(String, String, FromSuppliedCredentials), Arc<Connection>>>,
-> = Mutex::new(None);
+/// The token store a call reads its credentials from, by the directory naming it: empty for the
+/// per-user default. A process carrying out calls for other processes reads the store each caller
+/// names, so what is cached from a store is keyed by it.
+pub(crate) type CredentialStore = String;
+
+/// What a connection is cached under: the remote URL, the identity, whether the caller supplied
+/// its own credentials, and the token store the connection authenticated from.
+type ConnectionKey = (String, String, FromSuppliedCredentials, CredentialStore);
+
+/// Connections are keyed by [`ConnectionKey`]. Storage uses per-session auth, and non-storage
+/// services (revision, admin, lock) are created lazily per-repository with per-repository authz
+/// tokens.
+static CONNECTION_MAP: Mutex<Option<HashMap<ConnectionKey, Arc<Connection>>>> = Mutex::new(None);
 
 /// Whether a cached connection answers for `remote_url` in this mode, for the
 /// fallback that serves a caller who has not resolved an identity yet.
@@ -101,8 +114,8 @@ static CONNECTION_MAP: Mutex<
 /// alone, rather than on the full key.
 ///
 /// Only a call working from the token store may. The identity it will resolve is
-/// deterministic for a given URL and store, so any entry under that URL is the
-/// one it would have opened anyway.
+/// deterministic for a given URL and store, so any entry under that URL opened
+/// from the same store is the one it would have opened anyway.
 ///
 /// A call that supplied its own credentials is the opposite case: whose
 /// connection sits under that URL depends on whose token opened it, and the URL
@@ -121,13 +134,19 @@ fn may_match_on_url_alone(
 }
 
 #[lore_macro::test_pub]
-fn matches_url_and_mode(
-    key: &(String, String, FromSuppliedCredentials),
+fn matches_url_mode_and_store(
+    key: &ConnectionKey,
     remote_url: &str,
     from_supplied_credentials: FromSuppliedCredentials,
+    credential_store: &str,
 ) -> bool {
-    let (url, _identity, supplied) = key;
-    url == remote_url && *supplied == from_supplied_credentials
+    let (url, _identity, supplied, store) = key;
+    url == remote_url && *supplied == from_supplied_credentials && store == credential_store
+}
+
+/// The [`CredentialStore`] this call reads.
+pub(crate) fn credential_store() -> CredentialStore {
+    lore_base::env::var(AUTH_PATH_VAR).unwrap_or_default()
 }
 
 pub fn find_connection(
@@ -142,10 +161,12 @@ pub fn find_connection(
     // cached the resolved entry. An identity-less call takes this too: it only
     // matches an entry that also resolved no identity, such as one opened against
     // a server that does not authenticate.
+    let credential_store = credential_store();
     let key = (
         remote_url.to_string(),
         identity.to_string(),
         from_supplied_credentials,
+        credential_store,
     );
     if let Some(connection) = map.get(&key) {
         if !connection.stale.load(Ordering::Relaxed) {
@@ -160,12 +181,12 @@ pub fn find_connection(
 
     // Caller has no identity yet (config omits it). The resolved identity is
     // deterministic for a given url/credential store, so reuse any non-stale entry
-    // keyed under the same URL. Without this, every call that omits an identity
-    // re-enters `connect_impl` and re-issues `EnvironmentService/Get` even though
-    // the Connection would be reused by the inner lookup after auth_exchange.
+    // keyed under the same URL and store. Without this, every call that omits an
+    // identity re-enters `connect_impl` and re-issues `EnvironmentService/Get` even
+    // though the Connection would be reused by the inner lookup after auth_exchange.
     map.iter()
-        .find(|(key, c)| {
-            matches_url_and_mode(key, remote_url, from_supplied_credentials)
+        .find(|(candidate, c)| {
+            matches_url_mode_and_store(candidate, remote_url, from_supplied_credentials, &key.3)
                 && !c.stale.load(Ordering::Relaxed)
         })
         .map(|(_, c)| c.clone())
@@ -181,6 +202,7 @@ pub fn add_connection(
         remote_url.to_string(),
         identity.to_string(),
         from_supplied_credentials,
+        credential_store(),
     );
     let mut map = CONNECTION_MAP.lock();
     if let Some(map) = map.as_mut() {
@@ -419,27 +441,14 @@ async fn connect_impl(
 
     let credentials = Arc::new(SuppliedCredentials::new(&identity_token, &access_token));
 
-    let connection = Arc::new(Connection {
-        remote_url: remote_url.clone(),
-        auth_url: auth_url.clone(),
-        identity: identity.clone(),
-        credentials: credentials.clone(),
-        protocol: protocol.clone(),
+    let connection = Arc::new(Connection::unconnected(
+        remote_url.clone(),
+        auth_url.clone(),
+        identity.clone(),
+        credentials.clone(),
         environment,
-        storage_ready: ServiceReady::new(),
-        revision_ready: ServiceReady::new(),
-        lock_ready: ServiceReady::new(),
-        repository_ready: ServiceReady::new(),
-        storage_building: tokio::sync::Mutex::new(None),
-        storage: parking_lot::RwLock::new(None),
-        revision: dashmap::DashMap::new(),
-        admin: dashmap::DashMap::new(),
-        lock: dashmap::DashMap::new(),
-        repository: tokio::sync::Mutex::new(None),
-        session_cache: dashmap::DashMap::new(),
-        connector: tokio::sync::Mutex::new(None),
-        stale: std::sync::atomic::AtomicBool::new(false),
-    });
+        protocol.clone(),
+    ));
 
     let subtask_aborts: Arc<parking_lot::Mutex<Vec<tokio::task::AbortHandle>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -875,6 +884,9 @@ pub struct Connection {
     session_cache: dashmap::DashMap<(Partition, String), Arc<SessionPool>>,
     connector: tokio::sync::Mutex<Option<Connector>>,
     pub stale: std::sync::atomic::AtomicBool,
+    /// Permits for the gets callers run over this connection to cache fragments ahead of a read,
+    /// made by the first caller to ask ([`Self::cache_get_permits`]); `None` for no cap.
+    cache_gets: std::sync::OnceLock<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl Drop for Connection {
@@ -895,8 +907,77 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    /// A connection to `remote_url` that has connected to nothing yet: every service pending and
+    /// every cache empty.
+    fn unconnected(
+        remote_url: Url,
+        auth_url: String,
+        identity: String,
+        credentials: Arc<SuppliedCredentials>,
+        environment: EnvironmentConfig,
+        protocol: Arc<dyn Protocol>,
+    ) -> Self {
+        Connection {
+            remote_url,
+            auth_url,
+            identity,
+            credentials,
+            protocol,
+            environment,
+            storage_ready: ServiceReady::new(),
+            revision_ready: ServiceReady::new(),
+            lock_ready: ServiceReady::new(),
+            repository_ready: ServiceReady::new(),
+            storage_building: tokio::sync::Mutex::new(None),
+            storage: parking_lot::RwLock::new(None),
+            revision: dashmap::DashMap::new(),
+            admin: dashmap::DashMap::new(),
+            lock: dashmap::DashMap::new(),
+            repository: tokio::sync::Mutex::new(None),
+            session_cache: dashmap::DashMap::new(),
+            connector: tokio::sync::Mutex::new(None),
+            stale: std::sync::atomic::AtomicBool::new(false),
+            cache_gets: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// A connection over `storage` that reaches no other service, for tests that connect
+    /// storage themselves.
+    #[cfg(feature = "test-util")]
+    pub fn detached(storage: Vec<Arc<dyn Storage>>) -> Arc<Self> {
+        let connection = Arc::new(Connection::unconnected(
+            Url::parse("lore://detached.invalid").expect("valid URL"),
+            String::new(),
+            String::new(),
+            Arc::default(),
+            EnvironmentConfig::default(),
+            Arc::new(LoreProtocol::default()),
+        ));
+        if !storage.is_empty() {
+            *connection.storage.write() = Some(Arc::new(StorageConnector::new(storage)));
+        }
+        connection.storage_ready.complete(Ok(()));
+        connection
+    }
+
     pub fn remote_url(&self) -> &str {
         self.remote_url.as_str()
+    }
+
+    /// The permits gets that cache fragments over this connection take: `cap` of them, at most
+    /// [`tokio::sync::Semaphore::MAX_PERMITS`], fixed by the first call; `None` for a cap of zero.
+    /// Each connection has its own, so a stalled remote holds back only the cache gets over its
+    /// connections, and a connection that replaces a stale one has permits of its own.
+    pub fn cache_get_permits(&self, cap: usize) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.cache_gets
+            .get_or_init(|| {
+                (cap > 0).then(|| {
+                    Arc::new(tokio::sync::Semaphore::new(
+                        cap.min(tokio::sync::Semaphore::MAX_PERMITS),
+                    ))
+                })
+            })
+            .clone()
     }
 
     pub fn auth_url(&self) -> &str {
@@ -1019,17 +1100,21 @@ impl Connection {
     }
 
     /// Creates or reuses a `SessionPool` for the given partition and correlation
-    /// ID, returning a round-robin-picked session from it. The pool is pinned in
-    /// the connection's session cache so the `Weak` in `StorageConnector` stays
-    /// upgradeable for subsequent calls within the same command, keeping every
-    /// session in the pool alive without start/stop churn. Call
-    /// `release_session()` when the API call completes to release the pool.
+    /// ID, returning a session over it that runs each operation on the next
+    /// session of the pool, so a caller's operations spread over every storage
+    /// connection. The pool is pinned in the connection's session cache so the
+    /// `Weak` in `StorageConnector` stays upgradeable for subsequent calls within
+    /// the same command, keeping every session in the pool alive without
+    /// start/stop churn. Call `release_session()` when the API call completes to
+    /// release the pool.
     pub async fn session(
         self: &Arc<Self>,
         partition: Partition,
         correlation_id: &str,
     ) -> Result<Arc<StorageSession>, ProtocolError> {
-        Ok(self.session_pool(partition, correlation_id).await?.pick())
+        Ok(Arc::new(StorageSession::pooled(
+            self.session_pool(partition, correlation_id).await?,
+        )))
     }
 
     /// The pool of sessions for `(partition, correlation_id)`, pinned here so the
@@ -1084,16 +1169,17 @@ impl Connection {
             .remove(&(partition, correlation_id.to_string()));
     }
 
-    /// Drop every pinned `SessionPool`. Once no other strong refs hold the
-    /// pools alive (typically true between operations, or after callers
-    /// re-resolve their `StorageSession`), the `Weak`s in `StorageConnector`
-    /// fall out of scope and the next `Connection::session` call rebuilds
-    /// the pool — re-running `session_start` against the current connection
-    /// to obtain a fresh `session_id` the server actually knows about.
-    /// Called from `StorageSession::invalidate` when a server response
+    /// Mark every pinned `SessionPool` stale and drop it, so the next
+    /// `Connection::session` call rebuilds the pool even while another holder
+    /// keeps the old one — re-running `session_start` against the current
+    /// connection to obtain a fresh `session_id` the server actually knows
+    /// about. Called from `StorageSession::invalidate` when a server response
     /// indicates the session-id is stale (e.g. after a QUIC reconnect that
     /// rotated the server's `SessionMap`).
     pub fn invalidate_all_sessions(&self) {
+        for pool in self.session_cache.iter() {
+            pool.mark_stale();
+        }
         self.session_cache.clear();
     }
 

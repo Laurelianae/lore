@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
@@ -107,7 +106,7 @@ impl EventError for DiffError {
 
 /// Data for the event carrying the diff of a single file.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileDiffEventData {
     /// Path of the file.
@@ -1184,6 +1183,8 @@ async fn diff_read_file(
         DiffSide::Working(operation) => {
             let content = operation
                 .content_source(relative_path)
+                .await
+                .forward::<DiffError>("naming the content of the file to diff")?
                 .read_all()
                 .await
                 .forward_any::<DiffError>("Failed reading file for diff")?;

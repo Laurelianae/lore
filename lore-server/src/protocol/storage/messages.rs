@@ -92,6 +92,8 @@ pub enum MessageHandleError {
     HandlerTimeout,
     #[error("Session Limit Reached")]
     SessionLimitReached,
+    #[error("Invalid argument ({0})")]
+    InvalidArgument(String),
 }
 
 impl From<StoreError> for MessageHandleError {

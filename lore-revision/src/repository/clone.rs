@@ -16,7 +16,6 @@ use dashmap::Entry;
 use futures::FutureExt;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Notify;
 use tokio::sync::OwnedSemaphorePermit;
@@ -33,6 +32,7 @@ use super::RepositoryWriteToken;
 use super::SharedStoreToUseConfig;
 use super::VfsConfig;
 use super::get_dot_lore_path;
+use super::load_repository_config_from_dot_dir;
 use crate::branch;
 use crate::branch::BranchLatestStatus;
 use crate::dependency;
@@ -42,11 +42,13 @@ use crate::event::EventError;
 use crate::filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::filesystem_provider::HoldOptions;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::create_empty_directory;
 use crate::fs::filesystem_provider::match_node_executable;
 use crate::fs::filesystem_provider::set_file_to_node;
+use crate::fs::hold;
 use crate::hash::hash_string_bytes;
 use crate::instance::InstanceId;
 use crate::interface::LoreArray;
@@ -180,7 +182,7 @@ impl Drop for RepositoryCloneGuard {
 
 /// Data for the event emitted when a clone starts.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCloneBeginEventData {
     /// Identifier of the repository being cloned.
@@ -195,7 +197,7 @@ pub struct LoreRepositoryCloneBeginEventData {
 
 /// Progress counts for a clone operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCloneCountData {
     /// Number of files finished.
@@ -238,16 +240,17 @@ impl LoreRepositoryCloneCountData {
 
 /// Data for the event emitted to report clone progress.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCloneProgressEventData {
     /// Current progress counts.
     pub count: LoreRepositoryCloneCountData,
 }
 
-/// Data for the event emitted when a clone finishes.
+/// Data for the event emitted when a clone succeeds. A clone that fails sends no such event, and
+/// reports its outcome on the complete event as every clone does.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCloneEndEventData {
     /// Name of the branch that was cloned.
@@ -324,6 +327,10 @@ pub struct CloneOptions {
     pub dependency_recursive: bool,
     /// Maximum dependency traversal depth. 0 means unlimited.
     pub dependency_depth_limit: u32,
+    /// Where the clone writes its files, cache every file metadata block of the cloned revision,
+    /// which staging and committing write to, so both work without the remote, and fail the clone
+    /// if that fails.
+    pub cache_file_metadata: bool,
 }
 
 pub struct CloneWorkItem {
@@ -560,90 +567,93 @@ async fn process_block_item(
         node.walk_step(current_node_id, expected_parent, &mut cycle)
             .forward::<CloneError>("invalid node hierarchy in revision state")?;
 
-        let node_name = block
-            .node_name_ref(node_index)
+        if let Some(node_name) = block
+            .node_name_ref_or_skip(node_index, current_node_id)
             .forward::<CloneError>("Failed to deserialize node name")?
-            .freeze();
+        {
+            let node_name = node_name.freeze();
+            if node_name.is_empty() {
+                return Err(CloneError::internal("Failed to deserialize node name"));
+            }
 
-        if node_name.is_empty() {
-            return Err(CloneError::internal("Failed to deserialize node name"));
-        }
+            let node_path = item.repository_path.join(&node_name);
 
-        let node_path = item.repository_path.join(&node_name);
+            let (node_states, excluded) = dispatcher.repository.filter.child_emit_excludes(
+                item.states,
+                &node_path,
+                node.is_directory(),
+                FilterMode::View,
+            );
+            if !excluded {
+                visited_child = true;
+                if node.is_file() {
+                    dispatcher
+                        .stats
+                        .discovery
+                        .total_files
+                        .fetch_add(1, Ordering::Relaxed);
+                    dispatcher
+                        .stats
+                        .discovery
+                        .total_bytes
+                        .fetch_add(node.size, Ordering::Relaxed);
 
-        let (node_states, excluded) = dispatcher.repository.filter.child_emit_excludes(
-            item.states,
-            &node_path,
-            node.is_directory(),
-            FilterMode::View,
-        );
-        if !excluded {
-            visited_child = true;
-            if node.is_file() {
-                dispatcher
-                    .stats
-                    .discovery
-                    .total_files
-                    .fetch_add(1, Ordering::Relaxed);
-                dispatcher
-                    .stats
-                    .discovery
-                    .total_bytes
-                    .fetch_add(node.size, Ordering::Relaxed);
-
-                let Ok(permit) = dispatcher.file_tx.reserve().await else {
-                    // Receiver dropped, consumer encountered an error
-                    return Err(CloneError::internal("Recursion task failed"));
-                };
-                permit.send(CloneWorkItem {
-                    repository: dispatcher.repository.clone(),
-                    node,
-                    repository_path: node_path,
-                });
-            } else if node.is_link() {
-                if dispatcher.is_shutdown() {
-                    dispatcher.item_complete();
-                    return Ok(());
-                }
-                dispatcher.inner.pending.fetch_add(1, Ordering::AcqRel);
-
-                let d = Arc::clone(dispatcher);
-                let link_node = node;
-                let link_ctx = CloneContext {
-                    repository: dispatcher.repository.clone(),
-                    state: dispatcher.state.clone(),
-                    operation: dispatcher.operation.clone(),
-                    options: dispatcher.options.clone(),
-                    stats: dispatcher.stats.clone(),
-                    modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
-                };
-                let link_tx = dispatcher.file_tx.clone();
-                lore_spawn!(async move {
-                    let result = clone_discover_link(link_ctx, link_node, node_path, link_tx).await;
-                    if let Err(err) = result {
-                        d.set_error(err);
-                    }
-                    d.item_complete();
-                });
-            } else if node.is_directory() {
-                if execution_context().globals().dry_run() {
-                    lore_info!("{}", node_path);
-                }
-
-                if let Some(first_child) = node.child() {
-                    dispatcher.dispatch(BlockDiscoverItem {
-                        node_id: first_child,
-                        expected_parent: current_node_id,
+                    let Ok(permit) = dispatcher.file_tx.reserve().await else {
+                        // Receiver dropped, consumer encountered an error
+                        return Err(CloneError::internal("Recursion task failed"));
+                    };
+                    permit.send(CloneWorkItem {
+                        repository: dispatcher.repository.clone(),
+                        node,
                         repository_path: node_path,
-                        states: node_states,
-                        dep_context: None,
-                        follow_deps: false,
-                        depth: 0,
-                        cycle: SiblingCycleGuard::new(current_node_id),
-                        visited_child: false,
                     });
-                } else if !execution_context().globals().dry_run() {
-                    create_empty_directory::<CloneError>(&dispatcher.operation, &node_path).await?;
+                } else if node.is_link() {
+                    if dispatcher.is_shutdown() {
+                        dispatcher.item_complete();
+                        return Ok(());
+                    }
+                    dispatcher.inner.pending.fetch_add(1, Ordering::AcqRel);
+
+                    let d = Arc::clone(dispatcher);
+                    let link_node = node;
+                    let link_ctx = CloneContext {
+                        repository: dispatcher.repository.clone(),
+                        state: dispatcher.state.clone(),
+                        operation: dispatcher.operation.clone(),
+                        options: dispatcher.options.clone(),
+                        stats: dispatcher.stats.clone(),
+                        modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
+                    };
+                    let link_tx = dispatcher.file_tx.clone();
+                    lore_spawn!(async move {
+                        let result =
+                            clone_discover_link(link_ctx, link_node, node_path, link_tx).await;
+                        if let Err(err) = result {
+                            d.set_error(err);
+                        }
+                        d.item_complete();
+                    });
+                } else if node.is_directory() {
+                    if execution_context().globals().dry_run() {
+                        lore_info!("{}", node_path);
+                    }
+
+                    if let Some(first_child) = node.child() {
+                        dispatcher.dispatch(BlockDiscoverItem {
+                            node_id: first_child,
+                            expected_parent: current_node_id,
+                            repository_path: node_path,
+                            states: node_states,
+                            dep_context: None,
+                            follow_deps: false,
+                            depth: 0,
+                            cycle: SiblingCycleGuard::new(current_node_id),
+                            visited_child: false,
+                        });
+                    } else if !execution_context().globals().dry_run() {
+                        create_empty_directory::<CloneError>(&dispatcher.operation, &node_path)
+                            .await?;
+                    }
                 }
             }
         }
@@ -849,7 +859,10 @@ pub async fn clone(
 
     let existing_dot_dir = get_dot_lore_path(path)?;
     if existing_dot_dir.exists() {
-        if call.force() {
+        let existing_repository_is_swfs =
+            load_repository_config_from_dot_dir(existing_dot_dir.as_path())
+                .is_ok_and(|config| config.is_swfs());
+        if call.force() && !existing_repository_is_swfs {
             lore_io::IoDriver::global()
                 .remove_dir_all(existing_dot_dir.as_path())
                 .await
@@ -1015,6 +1028,9 @@ pub async fn clone(
 /// Completes [`clone`] once the repository exists locally and its branch is fetched: applies the
 /// view, resolves the revision and layer, records the branch and materializes the tree.
 ///
+/// Sends the clone end event only for a clone that succeeded. A failure to materialize the tree
+/// is reported ahead of a failure to record the branch or to finish the operation.
+///
 /// A function of its own because its locals live across several awaits: kept in [`clone`] they
 /// would take space in its future while the repository is created as well.
 #[allow(clippy::too_many_arguments)]
@@ -1145,7 +1161,7 @@ async fn clone_into(
         );
 
         lore_info!("Resolving layer revisions");
-        let module = Arc::new(repository.to_layer_context(repository_id).await);
+        let module = repository.to_layer_context(repository_id).await;
         let layer_latest = layer::latest_revision(module.clone(), branch_id)
             .await
             .forward::<CloneError>("Failed to get layer latest revision")?;
@@ -1174,6 +1190,7 @@ async fn clone_into(
             );
         }
     }
+    refuse_on_held_state(&repository, &options, revision)?;
 
     let (state, metadata) = tokio::try_join!(
         async {
@@ -1275,6 +1292,8 @@ async fn clone_into(
         let _ = task.await;
     }
 
+    materialize_result.and(store_result).and(operation_result)?;
+
     event::LoreEvent::RepositoryCloneEnd(LoreRepositoryCloneEndEventData {
         branch: branch_name.into(),
         revision,
@@ -1282,7 +1301,7 @@ async fn clone_into(
     })
     .send();
 
-    operation_result.and(materialize_result.and(store_result))
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1296,6 +1315,52 @@ pub struct CloneContext {
     pub modified_times: Arc<state::RecordedModifiedTimes>,
 }
 
+/// Refuses a clone of `revision` restricted to a dependency set onto a provider that holds its
+/// state in a `State` ([`FilesystemProvider::holds_state`](crate::fs::filesystem_provider::FilesystemProvider::holds_state)),
+/// which holds whole revisions. A bare clone, or one of an empty repository, writes no tree, so it
+/// is refused nothing.
+#[lore_macro::test_pub]
+fn refuse_on_held_state(
+    repository: &RepositoryContext,
+    options: &CloneOptions,
+    revision: Hash,
+) -> Result<(), CloneError> {
+    if options.bare
+        || revision.is_zero()
+        || options.root_files.is_empty()
+        || !repository.file_system().holds_state()
+    {
+        return Ok(());
+    }
+    Err(hold::refused("restrict a clone to a dependency set").into())
+}
+
+/// Hands `ctx.state` to the operation to hold ([`InstanceOperationImpl::hold_state`]), for a
+/// provider that holds its state in a `State` ([`InstanceOperationImpl::holds_state`]).
+///
+/// A bare clone, or one of an empty repository, hands it nothing, as either writes no tree, and
+/// so does a dry run.
+#[lore_macro::test_pub]
+async fn clone_materialize_hold(ctx: &CloneContext) -> Result<(), CloneError> {
+    if ctx.options.bare || ctx.state.revision().is_zero() {
+        return Ok(());
+    }
+    if execution_context().globals().dry_run() {
+        return Ok(());
+    }
+    ctx.operation
+        .hold_state(
+            ctx.repository.clone(),
+            ctx.state.clone(),
+            HoldOptions::default(),
+        )
+        .await
+        .forward::<CloneError>("Holding the cloned revision")
+}
+
+/// Materializes `revision` in the working tree and records it, and `branch_id`, as the instance's
+/// current state, which it records whether or not materializing succeeded. A failure to
+/// materialize is reported ahead of a failure to record the state.
 async fn clone_materialize(
     ctx: CloneContext,
     remote: Arc<lore_transport::Connection>,
@@ -1312,7 +1377,9 @@ async fn clone_materialize(
     let mut clone_result = Ok(());
     let mut cache_task = None;
 
-    if !options.bare && !revision.is_zero() {
+    if ctx.operation.holds_state() {
+        clone_materialize_hold(&ctx).await?;
+    } else if !options.bare && !revision.is_zero() {
         lore_info!("Pull state {revision}");
         let correlation_id = execution_context().globals().correlation_id.to_string();
         let _storage = remote
@@ -1338,8 +1405,11 @@ async fn clone_materialize(
 
         let cache_repository = repository.clone();
         let cache_state = state.clone();
+        let cache_file_metadata = options.cache_file_metadata;
         cache_task = Some(lore_spawn!(async move {
-            let _ = cache_state.cache_fragments(cache_repository).await;
+            cache_state
+                .cache_fragments(cache_repository, cache_file_metadata)
+                .await
         }));
 
         clone_result = clone_in_path(ctx).await;
@@ -1351,20 +1421,32 @@ async fn clone_materialize(
     .send();
 
     if let Some(task) = cache_task {
-        let _ = task.await;
+        let cached = task.await;
+        if options.cache_file_metadata {
+            clone_result = clone_result.and_then(|()| {
+                cached
+                    .internal("Caching the cloned state")?
+                    .forward("Failed to cache file metadata for working offline")
+            });
+        }
     }
 
-    crate::instance::store_current_anchor_branch(&repository, branch_id)
-        .await
-        .forward::<CloneError>("Failed to write current state anchor to repository")?;
-    crate::instance::store_current_anchor(&repository, revision)
-        .await
-        .forward::<CloneError>("Failed to write current state anchor to repository")?;
+    let anchor_result = async {
+        crate::instance::store_current_anchor_branch(&repository, branch_id).await?;
+        crate::instance::store_current_anchor(&repository, revision).await
+    }
+    .await
+    .forward::<CloneError>("Failed to write current state anchor to repository");
 
-    clone_result
+    clone_result.and(anchor_result)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Writes the files of `ctx.state` to the working tree, discovering them in one task and writing
+/// them in another.
+///
+/// A failure to write a file is reported ahead of a failure in discovery. Discovery fails once
+/// writing stops taking files, so its error is then a result of the failure to write.
+#[lore_macro::test_pub]
 async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
     let (file_tx, file_rx) = mpsc::channel(DEFAULT_WORK_CHANNEL_CAPACITY);
 
@@ -1475,8 +1557,10 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
     let consumer = lore_spawn!(async move { clone_execute(file_rx, ctx).await });
 
     let (producer_result, consumer_result) = tokio::join!(producer, consumer);
-    producer_result.internal("Recursion task failed")??;
-    consumer_result.internal("Recursion task failed")??;
+    let producer_result = producer_result.internal("Recursion task failed")?;
+    let consumer_result = consumer_result.internal("Recursion task failed")?;
+    consumer_result?;
+    producer_result?;
 
     Ok(())
 }
@@ -1764,10 +1848,12 @@ async fn ensure_parent_dir(
 
 /// Writes `node` to `repository_path`, or retains the file there when it holds the node.
 ///
-/// Returns the modified time entry of a file written or retained, and `None` for one a dry run
-/// would write or `ignore_existing` leaves in place. Counts the file as in flight, and holds
-/// `permit`, until it is done. Not an `async fn`, which would hold a second copy of its
-/// arguments.
+/// Returns the modified time entry of a file written, or retained with a time older than the
+/// operation's clock floor ([`InstanceOperationImpl::clock_floor`]), which a comparison reads before
+/// reading the file; `None`
+/// for any other retained file, one a dry run would write, or one `ignore_existing` leaves in
+/// place. Counts the file as in flight, and holds `permit`, until it is done. Not an `async fn`,
+/// which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
 fn clone_file(
     ctx: CloneContext,
@@ -1829,11 +1915,14 @@ fn clone_file(
                 lore_trace!("Retain {}", repository_path);
                 stats.complete.file_retain.fetch_add(1, Ordering::Relaxed);
                 stats.complete.file_complete.fetch_add(1, Ordering::Relaxed);
-                return Ok(Some(state::file_modified_time_entry(
-                    &repository,
-                    &repository_path,
-                    file_info.mtime(),
-                )));
+                let floor = operation.clock_floor(&repository).await;
+                return Ok((file_info.mtime() < floor).then(|| {
+                    state::file_modified_time_entry(
+                        &repository,
+                        &repository_path,
+                        file_info.mtime(),
+                    )
+                }));
             }
             if !force {
                 lore_error!(

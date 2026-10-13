@@ -13,7 +13,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::runtime::execution_context;
 use lore_transport::quic::QuicServiceError;
 use lore_transport::quic::chunking::ChunkingMetric;
-use lore_transport::quic::chunking::SerialChunking;
+use lore_transport::quic::chunking::ParallelChunking;
 use lore_transport::quic::command_header::CommandHeader;
 use quinn::ClosedStream;
 use quinn::ReadError;
@@ -509,7 +509,7 @@ where
         let mut stream_metrics = StreamMetricSender::new(self.stream_metrics.clone());
         let (metrics_sender, metrics_receiver) = std::sync::mpsc::channel();
 
-        let mut chunk_resolver = SerialChunking::new(
+        let mut chunk_resolver = ParallelChunking::new(
             self.service.header_size(),
             self.service.max_chunk_size(),
             Some(metrics_sender),

@@ -9,13 +9,17 @@
 mod chunker;
 mod compress;
 mod concurrency;
+mod deduplicated_gc;
 mod defragment;
 mod fragment_engine;
 mod hash;
 mod immutable_store;
 mod local;
 mod maintenance;
+mod packstore;
 mod read;
+mod read_flight;
+mod store_fixture;
 mod write;
 mod write_stats;
 mod write_tracker;

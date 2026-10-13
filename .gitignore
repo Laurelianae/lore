@@ -9,6 +9,7 @@
 # Local files
 lore-server/config/local*.toml
 **/.grafana.local.yaml
+contrib/bazel/.rbe-state/
 
 #################
 ## Visual Studio
@@ -169,3 +170,5 @@ ctrf/
 
 # lychee link checker cache
 .lycheecache
+
+.crowd/

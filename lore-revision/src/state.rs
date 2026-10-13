@@ -30,14 +30,12 @@ pub use diff::GraftOracle;
 use lore_base::error::InvalidPath;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 pub use stream::ChangeSender;
 pub use stream::ChangeStream;
 use stream::emit;
 use tokio::join;
 use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use zerocopy::FromZeros;
 use zerocopy::Immutable;
@@ -89,17 +87,18 @@ use crate::node::*;
 use crate::repository::DOT_LORE;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
+use crate::repository::is_reserved_node_name;
 use crate::revision::RevisionMetadata;
 use crate::stage::stage_delete;
 use crate::store::KeyType;
 use crate::store::StoreMatch;
-use crate::store::query_one;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
+use crate::util::request_tracker::StoreRequestTracker;
 
 /// Data for an event summarizing a dumped repository state.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryStateDumpEventData {
     /// Sequence number of the revision.
@@ -114,7 +113,7 @@ pub struct LoreRepositoryStateDumpEventData {
 
 /// Data for an event describing a single node in a dumped repository state.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryStateDumpNodeEventData {
     /// Name of the node.
@@ -267,11 +266,10 @@ impl StateNodeChildrenWithNameIterator {
             }
 
             let block = self.current_block.as_ref().unwrap();
-            let node_index = Node::index(node_id);
-            let node = block.node(node_index);
+            let (node, name) = block.node_and_name_ref(Node::index(node_id));
             node.walk_step(node_id, self.parent_node_id, &mut self.cycle)?;
             self.current_node_id = node.sibling();
-            match block.node_name_ref(node_index) {
+            match name {
                 Ok(name) => return Ok(Some((node_id, node, name))),
                 Err(err) => {
                     lore_warn!("Skipping node {node_id} with invalid name: {err}");
@@ -546,6 +544,10 @@ pub struct LinkMergeState {
     pub flags: u32,
 }
 const MAX_BLOCK_CACHE: usize = 5000;
+/// How many file metadata blocks a state keeps from checking recycled slots, at 65,568 bytes
+/// each. Adds land in the few blocks with free slots, so a handful is the usual working set.
+#[lore_macro::test_pub]
+const MAX_CHECKED_FILE_METADATA_BLOCKS: usize = 64;
 
 struct StateRuntime {
     /// Signature state was deserialized from
@@ -568,6 +570,11 @@ struct StateRuntime {
     block_file_metadata: Vec<Weak<NodeFileMetadataBlock>>,
     /// Dirty blocks kept in memory
     block_file_metadata_dirty: Vec<(Arc<NodeFileMetadataBlock>, usize)>,
+    /// Blocks read to check a recycled slot, kept in memory so the next check in the same block
+    /// does not read it again
+    block_file_metadata_checked: Vec<Arc<NodeFileMetadataBlock>>,
+    /// Slot the next checked block replaces once the list is full
+    block_file_metadata_checked_next: usize,
     /// Link list
     link_list: Option<Vec<LinkReference>>,
     /// Name table (read only, for old data formats)
@@ -589,9 +596,35 @@ impl StateRuntime {
             block_file_metadata_address: Bytes::default(),
             block_file_metadata: vec![],
             block_file_metadata_dirty: vec![],
+            block_file_metadata_checked: vec![],
+            block_file_metadata_checked_next: 0,
             link_list: None,
             name_table_deprecated: None,
             rehash_node_names,
+        }
+    }
+
+    /// Node blocks the tree has, whether or not any of them is in memory.
+    fn block_count(&self) -> usize {
+        self.tree
+            .as_ref()
+            .map_or(0, |tree| tree.block_count as usize)
+            .max(self.block.len())
+    }
+
+    /// Keeps `block` in memory, in place of the oldest block kept once there are
+    /// [`MAX_CHECKED_FILE_METADATA_BLOCKS`].
+    fn keep_checked_file_metadata(&mut self, block: &Arc<NodeFileMetadataBlock>) {
+        let checked = &mut self.block_file_metadata_checked;
+        if checked.iter().any(|kept| Arc::ptr_eq(kept, block)) {
+            return;
+        }
+        if checked.len() < MAX_CHECKED_FILE_METADATA_BLOCKS {
+            checked.push(block.clone());
+        } else {
+            let slot = self.block_file_metadata_checked_next % MAX_CHECKED_FILE_METADATA_BLOCKS;
+            checked[slot] = block.clone();
+            self.block_file_metadata_checked_next = slot + 1;
         }
     }
 }
@@ -983,12 +1016,11 @@ impl State {
             });
         }
 
-        let mut block_hash_bytes = {
-            let lock = self.runtime.read();
-            // Resize buffer with empty hashes if needed
-            lock.block_address
-                .clone_and_resize_zeroed::<Hash>(block_count)
-        };
+        let hash_node = self.tree_readonly()?.hash_node;
+        let mut block_hash_bytes = self
+            .node_block_addresses(repository, hash_node, block_count)
+            .await?
+            .clone_and_resize_zeroed::<Hash>(block_count);
         {
             let block_hash = block_hash_bytes.as_type_slice_mut();
 
@@ -1297,6 +1329,11 @@ impl State {
         self.data.read().hash_metadata
     }
 
+    /// The hash of the tree record, or zero when the state has no stored tree.
+    pub fn tree_hash(&self) -> Hash {
+        self.data.read().hash_tree
+    }
+
     pub fn set_metadata_hash(&self, metadata: Hash) {
         let mut data = self.data.write();
         data.hash_metadata = metadata;
@@ -1351,15 +1388,9 @@ impl State {
         Ok(None)
     }
 
+    /// Node blocks the tree has, whether or not any of them is in memory.
     pub fn block_count(&self) -> usize {
-        let runtime = self.runtime.read();
-        let mut block_count = runtime.block.len();
-        if let Some(tree) = runtime.tree
-            && tree.block_count > block_count as u32
-        {
-            block_count = tree.block_count as usize;
-        }
-        block_count
+        self.runtime.read().block_count()
     }
 
     pub async fn block(
@@ -1439,7 +1470,7 @@ impl State {
             )));
         }
 
-        let loading_permit = self
+        let _loading_permit = self
             .block_loading_permit(block_index)
             .acquire()
             .await
@@ -1497,29 +1528,9 @@ impl State {
                     return Ok(block);
                 }
 
-                // TODO(mjansson): To support huge trees we might want to selectively
-                // read the block addresses instead of all in one big buffer
-                lore_trace!("Deserialize block address list");
-                let address = Address::zero_context_hash(hash_node);
-                block_hash_bytes = immutable::read(
-                    repository.clone(),
-                    address,
-                    None, /* Read the full array of block hashes */
-                    immutable::read_options_from_repository(&repository)
-                        .with_cache()
-                        .with_priority(),
-                )
-                .await
-                .forward::<StateError>("Failed to deserialize node block list")?;
-                if block_hash_bytes.count::<Hash>() < block_count {
-                    block_hash_bytes = block_hash_bytes
-                        .clone_and_resize_zeroed::<Hash>(block_count)
-                        .freeze();
-                }
-                {
-                    self.runtime.write().block_address = block_hash_bytes.clone();
-                }
-                lore_trace!("Deserialized block address list");
+                block_hash_bytes = self
+                    .read_node_block_addresses(&repository, hash_node, block_count)
+                    .await?;
             }
         }
 
@@ -1561,55 +1572,35 @@ impl State {
 
         lore_trace!("Deserialize state node block {block_index}");
 
-        // Deserialize the node file metadata block as well to force it to be cached in local store
-        let metadata_block_cache = self
-            .block_file_metadata_cache(repository.clone(), block_index)
-            .await;
-
         let address = Address::zero_context_hash(block_hash[block_index]);
-        let result = match NodeBlock::deserialize(repository.clone(), self, address).await {
-            Ok(block) => {
-                let block = Arc::new(block);
-                {
-                    let mut lock = self.runtime.write();
-                    if block_index >= lock.block.len() {
-                        lock.block.resize(block_count, Weak::default());
-                    }
-                    if let Some(prev_block) = lock.block[block_index].upgrade() {
-                        return Ok(prev_block);
-                    }
-
-                    if rehash_node_names {
-                        lock.block_dirty.push((block.clone(), block_index));
-                    }
-
-                    lock.block[block_index] = Arc::downgrade(&block);
-                    if lock.block_cache.len() < MAX_BLOCK_CACHE {
-                        lock.block_cache.push(block.clone());
-                    } else {
-                        let cache_index = lock
-                            .block_cache_counter
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            as usize;
-                        lock.block_cache[cache_index % MAX_BLOCK_CACHE] = block.clone();
-                    }
-                }
-                lore_trace!("Deserialized state node block {block_index}");
-
-                Ok(block)
+        let block = Arc::new(NodeBlock::deserialize(repository, self, address).await?);
+        {
+            let mut lock = self.runtime.write();
+            if block_index >= lock.block.len() {
+                lock.block.resize(block_count, Weak::default());
             }
-            Err(err) => Err(err),
-        };
+            if let Some(prev_block) = lock.block[block_index].upgrade() {
+                return Ok(prev_block);
+            }
 
-        // Waiters have what they came for; the prefetch below is not theirs to
-        // wait on.
-        drop(loading_permit);
+            if rehash_node_names {
+                lock.block_dirty.push((block.clone(), block_index));
+            }
 
-        if let Some(cache_task) = metadata_block_cache {
-            let _ = cache_task.await;
+            lock.block[block_index] = Arc::downgrade(&block);
+            if lock.block_cache.len() < MAX_BLOCK_CACHE {
+                lock.block_cache.push(block.clone());
+            } else {
+                let cache_index = lock
+                    .block_cache_counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    as usize;
+                lock.block_cache[cache_index % MAX_BLOCK_CACHE] = block.clone();
+            }
         }
+        lore_trace!("Deserialized state node block {block_index}");
 
-        result
+        Ok(block)
     }
 
     pub async fn block_with_nametable(
@@ -1624,95 +1615,6 @@ impl State {
         Ok(block)
     }
 
-    #[lore_macro::test_pub]
-    async fn block_file_metadata_cache(
-        &self,
-        repository: Arc<RepositoryContext>,
-        block_index: usize,
-    ) -> Option<JoinHandle<()>> {
-        let (hash_file_metadata, block_count, mut block_hash_bytes) = {
-            let lock = self.runtime.read();
-            if lock.block_file_metadata.len() > block_index
-                && lock.block_file_metadata[block_index].upgrade().is_some()
-            {
-                return None;
-            }
-            let tree = lock.tree.as_ref()?;
-            (
-                tree.hash_file_metadata,
-                tree.block_count as usize,
-                lock.block_file_metadata_address.clone(),
-            )
-        };
-
-        if block_index >= block_hash_bytes.count::<Hash>() {
-            if hash_file_metadata.is_zero() {
-                return None;
-            }
-
-            // One list covers every block, so the tasks prefetching for all the
-            // other blocks want it at the same moment and would each read it.
-            let Ok(_guard) = self.metadata_deserialize.acquire().await else {
-                return None;
-            };
-
-            block_hash_bytes = {
-                let lock = self.runtime.read();
-                lock.block_file_metadata_address.clone()
-            };
-
-            if block_index >= block_hash_bytes.count::<Hash>() {
-                // TODO(mjansson): To support huge trees we might want to selectively
-                // read the block addresses instead of all in one big buffer
-                let address = Address::zero_context_hash(hash_file_metadata);
-                let Ok(hash_bytes) = immutable::read(
-                    repository.clone(),
-                    address,
-                    None, /* Read the full array of block hashes */
-                    immutable::read_options_from_repository(&repository)
-                        .with_cache()
-                        .with_priority(),
-                )
-                .await
-                else {
-                    return None;
-                };
-                block_hash_bytes = hash_bytes;
-                if block_hash_bytes.count::<Hash>() < block_count {
-                    block_hash_bytes = block_hash_bytes
-                        .clone_and_resize_zeroed::<Hash>(block_count)
-                        .freeze();
-                }
-                {
-                    self.runtime.write().block_file_metadata_address = block_hash_bytes.clone();
-                }
-            }
-        }
-
-        let block_hash = block_hash_bytes.as_type_slice::<Hash>();
-        if block_hash[block_index].is_zero() {
-            return None;
-        }
-
-        let address = Address::zero_context_hash(block_hash[block_index]);
-        Some(lore_spawn!(async move {
-            let matched = query_one(&repository.immutable_store(), repository.id, address)
-                .await
-                .map_or(StoreMatch::MatchNone, |result| result.match_made);
-            if matched == StoreMatch::MatchNone {
-                let _ = immutable::read(
-                    repository.clone(),
-                    address,
-                    None,
-                    immutable::read_options_from_repository(&repository)
-                        .with_cache()
-                        .with_priority(),
-                )
-                .await;
-            }
-        }))
-    }
-
     /// The file-metadata block for `block_index`, but only when one exists:
     /// already resident, or recorded in the tree and therefore worth reading.
     ///
@@ -1724,9 +1626,18 @@ impl State {
     /// published only as a `Weak` — so nothing keeps it alive and the next caller
     /// allocates another one.
     ///
+    /// Nothing is stored for a tree with no address list, for a block the list holds
+    /// a zero hash for, or for a block past the end of the list, added since it was
+    /// read. A list not read yet is read by [`Self::block_file_metadata`].
+    ///
     /// A resident block is always returned, whatever the tree has stored: it may
     /// hold metadata from a slot that has since been freed, which a caller
     /// recycling that slot has to clear.
+    ///
+    /// A block this reads from the store stays resident, up to `MAX_CHECKED_FILE_METADATA_BLOCKS`
+    /// of them. [`Self::node_add`] asks for the block on every add into it, and a block held only
+    /// as a `Weak` would be read again for each of them. A block with nothing stored is not kept:
+    /// the address list answers for it once read.
     pub async fn try_block_file_metadata_existing(
         &self,
         repository: Arc<RepositoryContext>,
@@ -1752,28 +1663,28 @@ impl State {
             )));
         }
 
-        // Nothing has ever been written for this tree, so no block of it can
-        // hold anything.
         if hash_file_metadata.is_zero() {
             return Ok(None);
         }
-
-        // The address list records which blocks were written. A zero hash at this
-        // index is a block that never was. If the list has not been read yet,
-        // fall through — `block_file_metadata` reads it, and repeats the same
-        // test against it before deserializing.
         {
-            let block_hash_bytes = self.runtime.read().block_file_metadata_address.clone();
-            if block_index < block_hash_bytes.count::<Hash>()
-                && block_hash_bytes.as_type_slice::<Hash>()[block_index].is_zero()
-            {
+            let runtime = self.runtime.read();
+            let addresses = runtime.block_file_metadata_address.as_type_slice::<Hash>();
+            if !addresses.is_empty() && addresses.get(block_index).is_none_or(Hash::is_zero) {
                 return Ok(None);
             }
         }
 
-        self.block_file_metadata(repository, block_index)
-            .await
-            .map(Some)
+        let block = self.block_file_metadata(repository, block_index).await?;
+        let mut runtime = self.runtime.write();
+        let stored = runtime
+            .block_file_metadata_address
+            .as_type_slice::<Hash>()
+            .get(block_index)
+            .is_some_and(|hash| !hash.is_zero());
+        if stored {
+            runtime.keep_checked_file_metadata(&block);
+        }
+        Ok(Some(block))
     }
 
     /// The file-metadata block for `block_index`, loaded unless it is resident.
@@ -1831,97 +1742,156 @@ impl State {
             }
         }
 
-        let mut block_hash_bytes = {
+        {
             let mut lock = self.runtime.write();
             if block_index >= lock.block_file_metadata.len() {
                 lock.block_file_metadata
                     .resize(block_count as usize, Weak::default());
             }
+        }
 
-            lock.block_file_metadata_address.clone()
-        };
-        // At this point block_index is guaranteed to be < block.len()
-
-        if block_index >= block_hash_bytes.count::<Hash>() {
-            let _guard = self
-                .metadata_deserialize
-                .acquire()
-                .await
-                .internal("Failed to deserialize metadata")?;
-
-            block_hash_bytes = {
-                let lock = self.runtime.read();
-                lock.block_file_metadata_address.clone()
-            };
-
-            if block_index >= block_hash_bytes.count::<Hash>() {
-                if hash_file_metadata.is_zero() {
-                    let block = Arc::new(NodeFileMetadataBlock::default());
-                    {
-                        let mut lock = self.runtime.write();
-                        if let Some(prev_block) = lock.block_file_metadata[block_index].upgrade() {
-                            return Ok(prev_block);
-                        }
-                        lock.block_file_metadata[block_index] = Arc::downgrade(&block);
-                    }
-                    return Ok(block);
-                }
-
-                // TODO(mjansson): To support huge trees we might want to selectively
-                // read the block addresses instead of all in one big buffer
-                let address = Address::zero_context_hash(hash_file_metadata);
-                block_hash_bytes = immutable::read(
+        let stored = self
+            .file_metadata_addresses(&repository, hash_file_metadata, block_count as usize)
+            .await?
+            .as_type_slice::<Hash>()
+            .get(block_index)
+            .copied()
+            .filter(|hash| !hash.is_zero());
+        let block = Arc::new(match stored {
+            Some(hash) => NodeFileMetadataBlock::new(
+                NodeFileMetadataBlockData::read_box_from_immutable_compat(
                     repository.clone(),
-                    address,
-                    None, /* Read the full array of block hashes */
-                    immutable::read_options_from_repository(&repository)
-                        .with_cache()
-                        .with_priority(),
+                    Address::zero_context_hash(hash),
+                    true,
                 )
                 .await
-                .forward::<StateError>("Failed to deserialize node block list")?;
-                if block_hash_bytes.count::<Hash>() < block_count as usize {
-                    block_hash_bytes = block_hash_bytes
-                        .clone_and_resize_zeroed::<Hash>(block_count as usize)
-                        .freeze();
-                }
-                {
-                    self.runtime.write().block_file_metadata_address = block_hash_bytes.clone();
-                }
-            }
-        }
-
-        let block_hash = block_hash_bytes.as_type_slice::<Hash>();
-        if block_hash[block_index].is_zero() {
-            let block = Arc::new(NodeFileMetadataBlock::default());
-            let mut lock = self.runtime.write();
-            if let Some(prev_block) = lock.block_file_metadata[block_index].upgrade() {
-                return Ok(prev_block);
-            }
-            lock.block_file_metadata[block_index] = Arc::downgrade(&block);
-            return Ok(block);
-        }
-
-        let address = Address::zero_context_hash(block_hash[block_index]);
-        let block = Arc::new({
-            let block_data = NodeFileMetadataBlockData::read_box_from_immutable_compat(
-                repository.clone(),
-                address,
-                true,
-            )
-            .await
-            .forward::<StateError>("Failed to deserialize file metadata block")?;
-            NodeFileMetadataBlock::new(block_data)
+                .forward::<StateError>("Failed to deserialize file metadata block")?,
+            ),
+            None => NodeFileMetadataBlock::default(),
         });
 
-        {
-            let mut lock = self.runtime.write();
-            if let Some(prev_block) = lock.block_file_metadata[block_index].upgrade() {
-                return Ok(prev_block);
-            }
-            lock.block_file_metadata[block_index] = Arc::downgrade(&block);
+        let mut lock = self.runtime.write();
+        if let Some(prev_block) = lock.block_file_metadata[block_index].upgrade() {
+            return Ok(prev_block);
         }
+        lock.block_file_metadata[block_index] = Arc::downgrade(&block);
         Ok(block)
+    }
+
+    /// The file metadata block address list, read from the store once.
+    ///
+    /// The list held covers every block the tree had when the list was read or written, so a
+    /// block past its end was added since and has nothing stored. It is empty for a tree with no
+    /// list. Every block's lookup wants the one list, so it is read under `metadata_deserialize`
+    /// rather than once by each. The read is boxed: it runs once per state, and inline it would
+    /// make every lookup's future as large as the read.
+    async fn file_metadata_addresses(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        hash_file_metadata: Hash,
+        block_count: usize,
+    ) -> Result<Bytes, StateError> {
+        {
+            let held = self.runtime.read().block_file_metadata_address.clone();
+            if !held.is_empty() || hash_file_metadata.is_zero() {
+                return Ok(held);
+            }
+        }
+
+        let _guard = self
+            .metadata_deserialize
+            .acquire()
+            .await
+            .internal("Failed to deserialize metadata")?;
+        {
+            let held = self.runtime.read().block_file_metadata_address.clone();
+            if !held.is_empty() {
+                return Ok(held);
+            }
+        }
+
+        // TODO(mjansson): To support huge trees we might want to selectively
+        // read the block addresses instead of all in one big buffer
+        let mut addresses = Box::pin(immutable::read(
+            repository.clone(),
+            Address::zero_context_hash(hash_file_metadata),
+            None, /* Read the full array of block hashes */
+            immutable::read_options_from_repository(repository)
+                .with_cache()
+                .with_priority(),
+        ))
+        .await
+        .forward::<StateError>("Failed to deserialize file metadata block list")?;
+        if addresses.count::<Hash>() < block_count {
+            addresses = addresses
+                .clone_and_resize_zeroed::<Hash>(block_count)
+                .freeze();
+        }
+        self.runtime.write().block_file_metadata_address = addresses.clone();
+        Ok(addresses)
+    }
+
+    /// The node block address list, read from the store once: as
+    /// [`Self::file_metadata_addresses`], for the node blocks, under `block_deserialize`.
+    ///
+    /// Serialize writes the list from this, so a State that loaded no block still writes the
+    /// stored address of every block it did not change.
+    async fn node_block_addresses(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        hash_node: Hash,
+        block_count: usize,
+    ) -> Result<Bytes, StateError> {
+        {
+            let held = self.runtime.read().block_address.clone();
+            if !held.is_empty() || hash_node.is_zero() {
+                return Ok(held);
+            }
+        }
+
+        let _guard = self
+            .block_deserialize
+            .acquire()
+            .await
+            .internal("Failed to deserialize node block")?;
+        {
+            let held = self.runtime.read().block_address.clone();
+            if !held.is_empty() {
+                return Ok(held);
+            }
+        }
+        Box::pin(self.read_node_block_addresses(repository, hash_node, block_count)).await
+    }
+
+    /// Reads the node block address list `hash_node` names, padded with zero addresses to
+    /// `block_count`, and holds it. The caller holds `block_deserialize`.
+    async fn read_node_block_addresses(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        hash_node: Hash,
+        block_count: usize,
+    ) -> Result<Bytes, StateError> {
+        // TODO(mjansson): To support huge trees we might want to selectively
+        // read the block addresses instead of all in one big buffer
+        lore_trace!("Deserialize block address list");
+        let mut addresses = immutable::read(
+            repository.clone(),
+            Address::zero_context_hash(hash_node),
+            None, /* Read the full array of block hashes */
+            immutable::read_options_from_repository(repository)
+                .with_cache()
+                .with_priority(),
+        )
+        .await
+        .forward::<StateError>("Failed to deserialize node block list")?;
+        if addresses.count::<Hash>() < block_count {
+            addresses = addresses
+                .clone_and_resize_zeroed::<Hash>(block_count)
+                .freeze();
+        }
+        self.runtime.write().block_address = addresses.clone();
+        lore_trace!("Deserialized block address list");
+        Ok(addresses)
     }
 
     pub fn parents(&self) -> [Hash; 2] {
@@ -2192,45 +2162,19 @@ impl State {
             sibling
         );
 
-        let metadata_node_id = node::node_to_file_metadata(node_id);
-        let metadata_block_index = NodeFileMetadataBlock::index(metadata_node_id);
-        let metadata_node_index = NodeFileMetadata::index(metadata_node_id);
-
-        // The slot may be recycled, in which case it still carries the metadata of
-        // whatever used to live there and has to be cleared. Where no metadata
-        // block exists there is nothing to carry, so nothing to clear.
-        if let Some(metadata_block) = self
-            .try_block_file_metadata_existing(repository.clone(), metadata_block_index)
-            .await?
-        {
-            let dirtied = {
-                let mut block_lock = metadata_block.write();
-
-                let node_metadata = block_lock.node(metadata_node_index);
-                if !node_metadata.metadata.is_zero() {
-                    node_metadata.metadata.zero();
-
-                    block_lock.mark_dirty()
-                } else {
-                    false
-                }
-            };
-
-            if dirtied {
-                self.block_file_metadata_modified(metadata_block, metadata_block_index);
-            }
-        }
-
         Ok(node_id)
     }
 
-    /// Fill in every field of a freshly grabbed slot except `sibling`, returning
-    /// the block that holds it.
+    /// Fill in every field of a freshly grabbed slot except `sibling`, and clear the file
+    /// metadata a recycled slot still carries from whatever used to live there, returning the
+    /// block that holds it. Where no file metadata block exists there is nothing to carry.
     ///
     /// The slot is initialized fully before it is reachable: `grab_node_unused`
     /// left it zeroed, so a concurrent chain walk that observed it
     /// published-but-uninitialized would read `parent`/`sibling` as 0 and error
-    /// or truncate. `sibling` is set atomically at publish.
+    /// or truncate, and a reader of the published node would read its predecessor's
+    /// metadata. `sibling` is set atomically at publish. The metadata is cleared after every
+    /// step that can fail, so a failed initialization leaves it untouched.
     async fn initialize_node(
         &self,
         repository: Arc<RepositoryContext>,
@@ -2243,6 +2187,12 @@ impl State {
         let block = self
             .block_with_nametable(repository.clone(), block_index)
             .await?;
+        let metadata_node_id = node::node_to_file_metadata(node_id);
+        let metadata_block_index = NodeFileMetadataBlock::index(metadata_node_id);
+        let metadata_block = self
+            .try_block_file_metadata_existing(repository, metadata_block_index)
+            .await?;
+
         let dirtied = {
             let mut block_lock = block.write();
             let (name_offset, name_length) = block_lock
@@ -2257,6 +2207,22 @@ impl State {
         };
         if dirtied {
             self.block_modified(block.clone(), block_index);
+        }
+
+        if let Some(metadata_block) = metadata_block {
+            let dirtied = {
+                let mut block_lock = metadata_block.write();
+                let node_metadata = block_lock.node(NodeFileMetadata::index(metadata_node_id));
+                if node_metadata.metadata.is_zero() {
+                    false
+                } else {
+                    node_metadata.metadata.zero();
+                    block_lock.mark_dirty()
+                }
+            };
+            if dirtied {
+                self.block_file_metadata_modified(metadata_block, metadata_block_index);
+            }
         }
 
         Ok(block)
@@ -2426,29 +2392,30 @@ impl State {
     /// allocation permit nothing else can take a slot from this one. The caller splices it in
     /// with [`Self::push_unused_block_list`] once it has taken its own, as the recycling path
     /// does.
+    ///
+    /// The block goes at [`Self::block_count`], past every block the tree has, whether or not
+    /// any of them is in memory. It is zeroed before the runtime write lock is taken, since every
+    /// reader of the State waits on that lock.
+    #[lore_macro::test_pub]
     fn allocate_fresh_block(&self) -> Result<(usize, Arc<NodeBlock>), StateError> {
+        let block = Arc::new(NodeBlock::new_zeroed());
+        block.write().mark_dirty();
         let mut runtime = self.runtime.write();
-        let block_index = runtime.block.len();
+        let block_index = runtime.block_count();
         if block_index >= MAX_TREE_BLOCK_COUNT as usize {
             return Err(StateError::from(Oversized {
                 context: format!("tree block count limit reached: {MAX_TREE_BLOCK_COUNT}"),
             }));
         }
-        let block = Arc::new(NodeBlock::new_zeroed());
         if block_index == 0 {
-            let mut block_writer = block.write();
-            block_writer.node_block().node_count = 1;
+            block.write().node_block().node_count = 1;
         }
+        runtime.block.resize(block_index, Weak::default());
         runtime.block.push(Arc::downgrade(&block));
 
         if let Some(tree) = runtime.tree.as_mut() {
             tree.block_count = 1 + block_index as u32;
             tree.flags |= TreeFlags::Dirty;
-        }
-        {
-            let mut block_writer = block.write();
-            block_writer.node_block().block_unused_next = INVALID_BLOCK;
-            block_writer.mark_dirty();
         }
         drop(runtime);
         self.block_modified(block.clone(), block_index);
@@ -3227,6 +3194,40 @@ impl State {
             .forward::<StateError>("Node name")
     }
 
+    /// [`Self::node_name_ref`], answering `None` for a node whose name the read path refuses,
+    /// logged as the node being skipped; see [`NodeBlock::node_name_ref_or_skip`].
+    ///
+    /// The returned `NodeNameLock` holds a read lock on the node's block for its lifetime.
+    /// Callers must drop it before calling `write()` on that block, or the write lock
+    /// acquisition will deadlock. Nothing is held when the answer is `None`.
+    pub async fn node_name_ref_or_skip(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<Option<NodeNameLock>, StateError> {
+        let block = self
+            .block_with_nametable(repository, NodeBlock::index(node))
+            .await?;
+        block
+            .node_name_ref_or_skip(Node::index(node), node)
+            .forward::<StateError>("Node name")
+    }
+
+    /// [`Self::node_name_clone`], answering `None` for a node whose name the read path refuses,
+    /// logged as the node being skipped; see [`NodeBlock::node_name_ref_or_skip`].
+    ///
+    /// The name is copied out, so no lock on the block outlives the call.
+    pub async fn node_name_clone_or_skip(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<Option<String>, StateError> {
+        Ok(self
+            .node_name_ref_or_skip(repository, node)
+            .await?
+            .map(|name| name.to_string()))
+    }
+
     pub async fn node_mark(
         &self,
         repository: Arc<RepositoryContext>,
@@ -3564,7 +3565,12 @@ impl State {
                     continue;
                 }
 
-                let name = self.node_name_clone(repository.clone(), child_id).await?;
+                let Some(name) = self
+                    .node_name_clone_or_skip(repository.clone(), child_id)
+                    .await?
+                else {
+                    continue;
+                };
                 let child_path = path.push_into_buf(&name).freeze();
 
                 // Don't carry forward dirty paths the view/ignore filter
@@ -3666,6 +3672,12 @@ impl State {
         Err(NodeNotFound.into())
     }
 
+    /// Resolves `path` below `root`, entering links on the way.
+    ///
+    /// A component naming the repository's own directory resolves to nothing: no node carries
+    /// that name, and a revision holding one anyway is not reached through it, whichever case
+    /// it is spelled in. Resolution is by name hash, which folds case, so this is the one check
+    /// on the path that a listing's skip of such a node does not already cover.
     pub async fn find_relative_node_link(
         &self,
         repository: Arc<RepositoryContext>,
@@ -3677,6 +3689,9 @@ impl State {
         let mut repository = repository;
         while !path.is_empty() {
             let current_name = path.pop_root();
+            if is_reserved_node_name(current_name) {
+                return Err(NodeNotFound.into());
+            }
             let name_hash = hash::hash_string(current_name);
 
             current_node = self
@@ -4099,27 +4114,59 @@ impl State {
         Ok(tree)
     }
 
+    /// Caches the state's own records in the local store, so the state reads without the remote,
+    /// and with `file_metadata` every file metadata block, so staging and committing, which write
+    /// to them, do too. The custom metadata a block names is not cached.
+    ///
+    /// Without `file_metadata` caching is best effort and its failures are disregarded. With it, a
+    /// fragment left uncached fails the call, since an offline commit can need any block.
     pub async fn cache_fragments(
         &self,
         repository: Arc<RepositoryContext>,
+        file_metadata: bool,
     ) -> Result<(), StateError> {
         let tree = self.tree(repository.clone()).await?;
+        let blocks = if file_metadata {
+            self.file_metadata_addresses(
+                &repository,
+                tree.hash_file_metadata,
+                tree.block_count as usize,
+            )
+            .await?
+        } else {
+            Bytes::default()
+        };
+        let blocks = blocks.as_type_slice::<Hash>();
 
-        let mut address = Vec::with_capacity(5);
+        let mut address = Vec::with_capacity(7 + blocks.len());
 
+        // A remote can return the state and tree records without the local cache priority
+        // flag, so a read does not keep them. Cache them to keep the state readable offline.
+        address.push(Address::zero_context_hash(self.revision()));
         address.push(Address::zero_context_hash(tree.hash_node));
 
         {
             let data = self.data.read();
+            address.push(Address::zero_context_hash(data.hash_tree));
             address.push(Address::zero_context_hash(data.hash_metadata));
             address.push(Address::zero_context_hash(data.hash_link));
         }
 
         address.push(Address::zero_context_hash(tree.hash_delta));
         address.push(Address::zero_context_hash(tree.hash_file_metadata));
+        address.extend(
+            blocks
+                .iter()
+                .filter(|hash| !hash.is_zero())
+                .map(|&hash| Address::zero_context_hash(hash)),
+        );
 
-        // Disregard any errors during caching
-        let _ = immutable::cache(repository.clone(), address, true).await;
+        let cached = immutable::cache(repository.clone(), address, true).await;
+        if file_metadata {
+            cached.forward::<StateError>(
+                "Failed to cache the state records and file metadata blocks",
+            )?;
+        }
 
         /* Avoid caching all the blocks, generally it's better to fetch these on demand
            as it parallelizes better with other i/o
@@ -4781,7 +4828,9 @@ impl BlockCursor {
     }
 }
 
-/// Appends the name of `child_id` to `path`, reporting whether anything was added.
+/// Appends the name of `child_id` to `path`, reporting whether anything was added, or
+/// `None` for a node whose name the read path refuses, which appends nothing and is
+/// the caller's to pass over: a dirty flag can predate the rule that refuses the name.
 ///
 /// The name is a read lock on the block holding it, released as this returns and
 /// so before the caller descends. A walk that took a second shared lock on that
@@ -4795,11 +4844,13 @@ async fn push_dirty_child_name(
     repository: Arc<RepositoryContext>,
     path: &mut RelativePathBuf,
     child_id: NodeID,
-) -> Result<bool, StateError> {
-    let child_name = state.node_name_ref(repository, child_id).await?;
+) -> Result<Option<bool>, StateError> {
+    let Some(child_name) = state.node_name_ref_or_skip(repository, child_id).await? else {
+        return Ok(None);
+    };
     let named = !child_name.is_empty();
     path.push(child_name);
-    Ok(named)
+    Ok(Some(named))
 }
 
 /// One directory on the way down, and where the walk left off in its children.
@@ -4912,8 +4963,11 @@ async fn collect_dirty_paths_inner(
             continue;
         }
 
-        let appended =
-            push_dirty_child_name(&state, repository.clone(), parent_path, child_id).await?;
+        let Some(appended) =
+            push_dirty_child_name(&state, repository.clone(), parent_path, child_id).await?
+        else {
+            continue;
+        };
 
         // Don't carry forward dirty paths that the view/ignore filter
         // excludes — they cannot be re-applied against a checkout that
@@ -5099,9 +5153,12 @@ async fn gather_tree_paths_node(
     node.walk_step(node_id, expected_parent, cycle)?;
 
     let node_path = {
-        let node_name = block
-            .node_name_ref(node_index)
-            .forward::<StateError>("Node name")?;
+        let Some(node_name) = block
+            .node_name_ref_or_skip(node_index, node_id)
+            .forward::<StateError>("Node name")?
+        else {
+            return Ok(node.sibling());
+        };
         if parent_path.is_empty() {
             RelativePath::new_from_initial_path(&*node_name).unwrap_or_default()
         } else {
@@ -6198,8 +6255,37 @@ fn walk_filter_mode(filter_mode: FilterMode, intent: FilesystemDiffIntent) -> Fi
 /// into a configured layer. Pass an empty Arc for non-layer-aware callers; the
 /// layer-internal recursion always passes empty, there being no nested layer mounts under
 /// non-overlapping layers.
+///
+/// A marking walk discards what it finds stale once it has drained. A caller running several
+/// walks over one tree uses `diff_filesystem_queuing` instead.
 #[allow(clippy::too_many_arguments)]
-pub async fn diff_filesystem(
+pub fn diff_filesystem<'a>(
+    operation: &'a Arc<InstanceOperationImpl>,
+    from: FilesystemDiffTree,
+    current: FilesystemDiffTree,
+    path: Option<RelativePath>,
+    filter_mode: FilterMode,
+    intent: FilesystemDiffIntent,
+    layer_mounts: Arc<Vec<LayerMountInfo>>,
+) -> impl Future<Output = Result<ChangeStream<FilesystemDiffStats>, StateError>> + Send + 'a {
+    diff_filesystem_queuing(
+        operation,
+        from,
+        current,
+        path,
+        filter_mode,
+        intent,
+        layer_mounts,
+        None,
+    )
+}
+
+/// [`diff_filesystem`], holding what a marking walk finds stale on `discards` where given, for
+/// the caller to discard once every walk over the tree has drained, rather than discarding it
+/// once this walk has drained.
+#[lore_macro::test_pub]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn diff_filesystem_queuing(
     operation: &Arc<InstanceOperationImpl>,
     from: FilesystemDiffTree,
     current: FilesystemDiffTree,
@@ -6207,6 +6293,7 @@ pub async fn diff_filesystem(
     filter_mode: FilterMode,
     intent: FilesystemDiffIntent,
     layer_mounts: Arc<Vec<LayerMountInfo>>,
+    discards: Option<Arc<WalkDiscards>>,
 ) -> Result<ChangeStream<FilesystemDiffStats>, StateError> {
     let FilesystemDiffTree {
         repository: repository_from,
@@ -6268,6 +6355,7 @@ pub async fn diff_filesystem(
                 intent,
                 layer_mounts,
                 link_mounts,
+                discards,
             },
         ));
     };
@@ -6319,6 +6407,7 @@ pub async fn diff_filesystem(
             intent,
             layer_mounts,
             link_mounts,
+            discards,
         },
     ))
 }
@@ -6327,9 +6416,10 @@ pub async fn diff_filesystem(
 /// entry behind a nested-repository boundary, or an entry neither the file system nor any commit
 /// holds — and [clear the propagation](clear_propagation) each leaves stale on its ancestor
 /// chain. A directory node goes with the whole subtree below it, so no slot is left holding an
-/// entry unreachable from the root. Must only be called after the corresponding walk's task set
-/// has drained — discarding mid-walk mutates `parent.child` / sibling chains under walks that
-/// are still reading them and races into `node_discard_patch`'s `"Discard hierarchy broken"`.
+/// entry unreachable from the root. Must only be called after every walk over the tree has
+/// drained — discarding mid-walk mutates `parent.child` / sibling chains under walks that are
+/// still reading them and races into `node_discard_patch`'s `"Discard hierarchy broken"`, and
+/// clears marks other walks are still carrying up.
 pub(crate) async fn apply_pending_discards(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
@@ -6377,6 +6467,55 @@ pub(crate) async fn apply_pending_discards(
     Ok(())
 }
 
+/// Nodes walks over a tree found stale, each with the tree it belongs to, held for
+/// `apply_pending_discards` until every walk that marks the tree has drained.
+///
+/// A walk crosses into linked and layer trees, so what it holds can belong to several.
+#[derive(Default)]
+pub struct WalkDiscards {
+    batches: parking_lot::Mutex<Vec<DiscardBatch>>,
+}
+
+/// Children of one directory of `state` a walk found stale.
+struct DiscardBatch {
+    state: Arc<State>,
+    repository: Arc<RepositoryContext>,
+    nodes: Vec<NodeID>,
+}
+
+impl WalkDiscards {
+    /// Hold `nodes`, children of one directory of `state`, for discarding.
+    pub(crate) fn queue(
+        &self,
+        state: Arc<State>,
+        repository: Arc<RepositoryContext>,
+        nodes: Vec<NodeID>,
+    ) {
+        if !nodes.is_empty() {
+            self.batches.lock().push(DiscardBatch {
+                state,
+                repository,
+                nodes,
+            });
+        }
+    }
+
+    /// Whether no node is held, which leaves nothing to [apply](Self::apply).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.batches.lock().is_empty()
+    }
+
+    /// Discard every node held. Call only once every walk holding nodes here has drained.
+    #[lore_macro::test_pub]
+    pub(crate) async fn apply(&self) -> Result<(), StateError> {
+        let batches = std::mem::take(&mut *self.batches.lock());
+        for batch in batches {
+            apply_pending_discards(batch.state, batch.repository, batch.nodes).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Whether `node` is staged only because something below it is: the bare `Staged` bit
 /// [`State::node_mark`] carries up to the ancestors of the node it marks. An action bit can be the
 /// node's own staged action or its dirty one, so a node carrying one, a merge flag, or a link is
@@ -6391,6 +6530,10 @@ fn is_staged_for_descendants_only(node: &Node) -> bool {
 /// above it, for a node that has since left the tree, in one walk up the chain. `Dirty` is cleared
 /// up to the first node that still has a dirty child, `Staged` up to the first that still has a
 /// staged child or is not [staged for descendants only](is_staged_for_descendants_only).
+///
+/// Must not run while another task marks nodes in the tree. Marking stops at the first ancestor
+/// already carrying the bit, so a node marked between this checking an ancestor's children and
+/// clearing its bit is left below an ancestor without it.
 pub(crate) async fn clear_propagation(
     state: &Arc<State>,
     repository: &Arc<RepositoryContext>,
@@ -6481,6 +6624,7 @@ pub async fn diff_filesystem_subtree(
             intent,
             layer_mounts,
             link_mounts,
+            discards: None,
         },
     ))
 }
@@ -6888,37 +7032,45 @@ pub enum NodeComparison {
 /// caller asking once passes a fresh one.
 ///
 /// Reads no recorded modification time and records none: a recorded time speaks for the current
-/// revision's node, and this answers about any node.
-pub async fn file_matches_node(
+/// revision's node, and this answers about any node. Reads the operation's clock floor
+/// ([`InstanceOperationImpl::clock_floor`]) before reading the file, so a time recorded from what
+/// the read establishes is compared against a clock read before it.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn file_matches_node<'a>(
     repository: Arc<RepositoryContext>,
-    node: &Node,
+    node: &'a Node,
     file_size: u64,
-    file_path: &impl WalkPath,
-    operation: &InstanceOperationImpl,
-    established: &lore_storage::ContentHashes,
-) -> Result<NodeComparison, StateError> {
-    if file_size != node.size {
-        lore_trace!("File {file_path} size differs from node, differs");
-        return Ok(NodeComparison::Differs);
-    }
+    file_path: &'a impl WalkPath,
+    operation: &'a InstanceOperationImpl,
+    established: &'a lore_storage::ContentHashes,
+) -> impl Future<Output = Result<NodeComparison, StateError>> + 'a {
+    async move {
+        if file_size != node.size {
+            lore_trace!("File {file_path} size differs from node, differs");
+            return Ok(NodeComparison::Differs);
+        }
 
-    if let Some(settled) = established.decides(node.address, Some(node.size), file_size) {
-        lore_trace!("File {file_path} settled by an earlier comparison: {settled:?}");
-        return Ok(node_comparison(settled));
-    }
+        if let Some(settled) = established.decides(node.address, Some(node.size), file_size) {
+            lore_trace!("File {file_path} settled by an earlier comparison: {settled:?}");
+            return Ok(node_comparison(settled));
+        }
 
-    let comparison = operation
-        .file_holds_content(
-            repository,
-            &file_path.to_path(),
-            node.address,
-            node.size,
-            established,
-        )
-        .await
-        .forward_any::<StateError>("Failed to compare the file to the node")?;
-    lore_trace!("File {file_path} compared to stored content: {comparison:?}");
-    Ok(comparison)
+        operation.clock_floor(&repository).await;
+        let comparison = operation
+            .file_holds_content(
+                repository,
+                &file_path.to_path(),
+                node.address,
+                node.size,
+                established,
+            )
+            .await
+            .forward_any::<StateError>("Failed to compare the file to the node")?;
+        lore_trace!("File {file_path} compared to stored content: {comparison:?}");
+        Ok(comparison)
+    }
 }
 
 /// How a storage comparison reads as a node comparison.
@@ -7048,35 +7200,44 @@ pub async fn file_modification(
 /// `node_is_current` states that `node` is the one the current revision holds at this path,
 /// and gates both halves: a recorded time speaks for that node alone, so it can neither
 /// answer for any other node nor be written from a match against one. Recording here is what
-/// spares the next scan the hash check this one just paid for.
-#[allow(clippy::too_many_arguments)]
-pub async fn file_modified_against_node(
+/// spares the next scan the hash check this one just paid for. A time not older than the
+/// filesystem clock the operation read before reading the file is not recorded: a write after
+/// the read may share it ([`InstanceOperationImpl::clock_floor`]).
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+pub fn file_modified_against_node<'a>(
     repository: Arc<RepositoryContext>,
-    node: &Node,
+    node: &'a Node,
     file_mtime: u64,
     file_size: u64,
-    file_path: &impl WalkPath,
+    file_path: &'a impl WalkPath,
     node_is_current: bool,
-    operation: &InstanceOperationImpl,
-    established: &lore_storage::ContentHashes,
-) -> Result<FileModification, StateError> {
-    let modification = file_modification(
-        repository.clone(),
-        node,
-        file_mtime,
-        file_size,
-        file_path,
-        !node_is_current,
-        operation,
-        established,
-    )
-    .await?;
+    operation: &'a InstanceOperationImpl,
+    established: &'a lore_storage::ContentHashes,
+) -> impl Future<Output = Result<FileModification, StateError>> + 'a {
+    async move {
+        let modification = file_modification(
+            repository.clone(),
+            node,
+            file_mtime,
+            file_size,
+            file_path,
+            !node_is_current,
+            operation,
+            established,
+        )
+        .await?;
 
-    if node_is_current && matches!(modification, FileModification::UnmodifiedByHash) {
-        file_modified_time_store(repository, file_path, file_mtime).await;
+        if node_is_current
+            && matches!(modification, FileModification::UnmodifiedByHash)
+            && file_mtime < operation.clock_floor(&repository).await
+        {
+            file_modified_time_store(repository, file_path, file_mtime).await;
+        }
+
+        Ok(modification)
     }
-
-    Ok(modification)
 }
 
 /// Modified times collected by an operation, to be recorded once it has completed.
@@ -7086,16 +7247,44 @@ pub async fn file_modified_against_node(
 /// a time the next write can still share, so entries are collected and written at the end by
 /// [`store`](Self::store). An operation that leaves the current revision elsewhere calls
 /// [`discard`](Self::discard).
+///
+/// A collector made by [`below`](Self::below) collects no time it cannot tell apart from a later
+/// write: none not older than the filesystem clock read before reading any file whose time it
+/// collects.
 #[must_use]
-#[derive(Default)]
-pub struct RecordedModifiedTimes(Box<crossbeam::queue::SegQueue<(Hash, u64)>>);
+#[lore_macro::test_pub]
+pub struct RecordedModifiedTimes {
+    entries: Box<crossbeam::queue::SegQueue<(Hash, u64)>>,
+    /// Times at or after this are not collected.
+    floor: u64,
+}
+
+impl Default for RecordedModifiedTimes {
+    fn default() -> Self {
+        Self {
+            entries: Box::default(),
+            floor: u64::MAX,
+        }
+    }
+}
 
 impl RecordedModifiedTimes {
+    /// A collector of the times older than `floor`, the filesystem clock read before reading any
+    /// file whose time it collects ([`read_clock_floor`]).
+    pub fn below(floor: u64) -> Self {
+        Self {
+            entries: Box::default(),
+            floor,
+        }
+    }
+
     /// Collects the entry recording that `path` held `repository`'s current content at
-    /// `mtime`.
+    /// `mtime`, where the time is older than the collector's floor.
     pub fn record(&self, repository: &RepositoryContext, path: &RelativePath, mtime: u64) {
-        self.0
-            .push(file_modified_time_entry(repository, path, mtime));
+        if mtime < self.floor {
+            self.entries
+                .push(file_modified_time_entry(repository, path, mtime));
+        }
     }
 
     /// Writes the collected times into `repository`'s mutable store, one task per store group.
@@ -7104,14 +7293,15 @@ impl RecordedModifiedTimes {
     /// splitting the times by that byte lets every task run without ever contending with
     /// another.
     ///
-    /// Waits for the filesystem to stamp later than every time written, so that none of them
-    /// can be shared by a write that follows — bounded, so a filesystem that does not appear to
-    /// move on is left with times a following write can still share rather than being waited on
-    /// forever. See [`wait_until_settled`].
+    /// Without a floor, waits for the filesystem to stamp later than every time written, so that
+    /// none of them can be shared by a write that follows — bounded, so a filesystem that does not
+    /// appear to move on is left with times a following write can still share rather than being
+    /// waited on forever. See [`wait_until_settled`]. A collector with a floor holds only times
+    /// older than a stamp the filesystem has already given, so it has nothing to wait for.
     pub async fn store(&self, repository: Arc<RepositoryContext>) {
-        let mut times = Vec::with_capacity(self.0.len());
+        let mut times = Vec::with_capacity(self.entries.len());
         let mut mtime_max = 0;
-        while let Some((key, mtime)) = self.0.pop() {
+        while let Some((key, mtime)) = self.entries.pop() {
             mtime_max = mtime_max.max(mtime);
             times.push((key, mtime));
         }
@@ -7142,34 +7332,39 @@ impl RecordedModifiedTimes {
         }
         while tasks.join_next().await.is_some() {}
 
-        wait_until_settled(&repository, mtime_max).await;
+        if self.floor == u64::MAX {
+            wait_until_settled(&repository, mtime_max).await;
+        }
     }
 
     /// Collects an entry built by [`file_modified_time_entry`], for a caller that computed
-    /// the key where it had the path rather than where it records.
+    /// the key where it had the path rather than where it records, where its time is older than
+    /// the collector's floor.
     pub fn push(&self, entry: (Hash, u64)) {
-        self.0.push(entry);
+        if entry.1 < self.floor {
+            self.entries.push(entry);
+        }
     }
 
     /// Moves the times collected by `other` into this collector.
     pub fn absorb(&self, other: Self) {
-        while let Some(entry) = other.0.pop() {
-            self.0.push(entry);
+        while let Some(entry) = other.entries.pop() {
+            self.push(entry);
         }
     }
 
     /// Removes the times collected so far, leaving the collector empty.
     pub fn take(&self) -> Self {
         let taken = Self::default();
-        while let Some(entry) = self.0.pop() {
-            taken.0.push(entry);
+        while let Some(entry) = self.entries.pop() {
+            taken.entries.push(entry);
         }
         taken
     }
 
     /// Drops the times, for an operation that leaves the current revision elsewhere.
     pub fn discard(&self) {
-        while self.0.pop().is_some() {}
+        while self.entries.pop().is_some() {}
     }
 }
 
@@ -7187,6 +7382,7 @@ const MODIFIED_TIME_SETTLE_LIMIT: std::time::Duration = std::time::Duration::fro
 
 /// The path of the file stamped to read the working copy's clock, `None` when the working copy
 /// has no path to stamp.
+#[lore_macro::test_pub]
 fn modified_time_probe_path(repository: &RepositoryContext) -> Option<std::path::PathBuf> {
     Some(repository.dot_dir_path().ok()?.join(MODIFIED_TIME_PROBE))
 }
@@ -7210,6 +7406,17 @@ async fn stamp_probe(path: &std::path::Path) -> Option<u64> {
     Some(crate::util::fs::file_mtime(&metadata))
 }
 
+/// [`filesystem_stamp_now`], as the floor below which an operation records times: a file
+/// written from now on carries a time no older. 0 where the working copy cannot be stamped, and
+/// in a dry run, which records nothing: no time is older, so none is recorded.
+#[lore_macro::test_pub]
+pub(crate) async fn read_clock_floor(repository: &RepositoryContext) -> u64 {
+    if crate::runtime::try_execution_context().is_some_and(|context| context.globals().dry_run()) {
+        return 0;
+    }
+    filesystem_stamp_now(repository).await.unwrap_or(0)
+}
+
 /// The time the working copy's filesystem is currently stamping writes with.
 ///
 /// A file's modified time comes from a clock the filesystem advances on its own schedule and
@@ -7218,10 +7425,15 @@ async fn stamp_probe(path: &std::path::Path) -> Option<u64> {
 /// the file was written. Stamping a file and reading it back asks the filesystem instead, so
 /// the answer is on the scale the comparison needs.
 ///
+/// The probe is removed once read, so a stamp file is not left behind in the dot directory.
+///
 /// `None` when the working copy cannot be stamped, which leaves a caller no way to tell a
 /// settled time from one a further write can still share.
 pub async fn filesystem_stamp_now(repository: &RepositoryContext) -> Option<u64> {
-    stamp_probe(&modified_time_probe_path(repository)?).await
+    let path = modified_time_probe_path(repository)?;
+    let stamp = stamp_probe(&path).await;
+    let _ = lore_io::IoDriver::global().remove_file(&path).await;
+    stamp
 }
 
 /// Waits until the working copy's filesystem stamps later than `mtime_max`.
@@ -7700,20 +7912,61 @@ fn collect_diff_addresses(from: Vec<Address>, to: Vec<Address>) -> Vec<Address> 
     new
 }
 
-/// Returns sorted and deduplicated addresses
-pub async fn collect_new_fragments(
+/// Which addresses a collection of the fragments a state adds keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Collection {
+    /// Every address, durable or not, as for the state a diff starts from.
+    All,
+    /// The addresses the local store holds no durable full match for, which a push sends.
+    New,
+    /// As [`Collection::New`], and an address the local store holds no entry for, as after
+    /// eviction removed it, is asked of the remote, and when the remote holds it as a list the
+    /// fragments it names are collected too. For a push the remote refused for a missing
+    /// fragment: one that stopped part way can leave a list on the remote without every fragment
+    /// it names.
+    Recovery,
+}
+
+/// As [`collect_fragments`], keeping the addresses the local store holds no durable full match
+/// for with `ignore_durably_stored`, and every address without it.
+///
+/// Not an `async fn`, which would hold the collection's future in a state of its own.
+pub fn collect_new_fragments(
     repository: Arc<RepositoryContext>,
     state_from: Arc<State>,
     state_to: Arc<State>,
     ignore_durably_stored: bool,
+    tracker: Arc<StoreRequestTracker>,
+) -> impl Future<Output = Result<Vec<Address>, StateError>> {
+    let collection = if ignore_durably_stored {
+        Collection::New
+    } else {
+        Collection::All
+    };
+    collect_fragments(repository, state_from, state_to, collection, tracker)
+}
+
+/// The addresses of the fragments `state_to` holds that `state_from` does not, that
+/// `collection` keeps, sorted and deduplicated.
+///
+/// `tracker` counts the store reads of the per-address tasks the collection spawns to look up
+/// each candidate fragment.
+pub async fn collect_fragments(
+    repository: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    state_to: Arc<State>,
+    collection: Collection,
+    tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
     let from_state_address = lore_spawn!({
         let repository = repository.clone();
         let state = state_from.clone();
+        let tracker = tracker.clone();
         async move {
             let addresses = collect_state_fragments(repository.clone(), state).await?;
             // Collect all from block addresses, even uploaded, as we want to diff against these
-            let mut addresses = collect_new_addresses(repository, &addresses, false).await?;
+            let mut addresses =
+                collect_new_addresses(repository, &addresses, Collection::All, tracker).await?;
             addresses.sort_unstable();
             Ok(addresses)
         }
@@ -7722,10 +7975,11 @@ pub async fn collect_new_fragments(
     let to_new_state_address = lore_spawn!({
         let repository = repository.clone();
         let state = state_to.clone();
+        let tracker = tracker.clone();
         async move {
             let addresses = collect_state_fragments(repository.clone(), state).await?;
             let mut addresses =
-                collect_new_addresses(repository, &addresses, ignore_durably_stored).await?;
+                collect_new_addresses(repository, &addresses, collection, tracker).await?;
             addresses.sort_unstable();
             Ok(addresses)
         }
@@ -7777,16 +8031,12 @@ pub async fn collect_new_fragments(
         let repository = repository.clone();
         let state_from = state_from.clone();
         let state_to = state_to.clone();
+        let tracker = tracker.clone();
         async move {
             // Safe to filter these directly to only contain not uploaded fragments, we don't
             // use it as input to any other collection
             collect_new_file_fragments(
-                repository,
-                state_from,
-                state_to,
-                ROOT_NODE,
-                ROOT_NODE,
-                ignore_durably_stored,
+                repository, state_from, state_to, ROOT_NODE, ROOT_NODE, collection, tracker,
             )
             .await
         }
@@ -7795,13 +8045,10 @@ pub async fn collect_new_fragments(
     let new_revision_metadata_address = lore_spawn!({
         let repository = repository.clone();
         let metadata_hash = state_to.metadata_hash();
+        let tracker = tracker.clone();
         async move {
-            collect_new_revision_metadata_fragments(
-                repository,
-                metadata_hash,
-                ignore_durably_stored,
-            )
-            .await
+            collect_new_revision_metadata_fragments(repository, metadata_hash, collection, tracker)
+                .await
         }
     });
 
@@ -7848,10 +8095,11 @@ pub async fn collect_new_fragments(
     let new_name_address = lore_spawn!({
         let repository = repository.clone();
         let blocks = diff_block_address.clone();
+        let tracker = tracker.clone();
         async move {
             let addresses = collect_name_fragments(repository.clone(), blocks).await?;
             let mut addresses =
-                collect_new_addresses(repository, &addresses, ignore_durably_stored).await?;
+                collect_new_addresses(repository, &addresses, collection, tracker).await?;
             addresses.sort_unstable();
             Ok(addresses)
         }
@@ -7861,10 +8109,10 @@ pub async fn collect_new_fragments(
     // collected the name block addresses from the diff list
     let new_block_address = lore_spawn!({
         let repository = repository.clone();
+        let tracker = tracker.clone();
         async move {
             let mut addresses =
-                collect_new_addresses(repository, &diff_block_address, ignore_durably_stored)
-                    .await?;
+                collect_new_addresses(repository, &diff_block_address, collection, tracker).await?;
             addresses.sort_unstable();
             Ok(addresses)
         }
@@ -7958,7 +8206,8 @@ pub async fn collect_new_fragments(
                         from_block_address,
                         *to_block_address,
                         block_index,
-                        ignore_durably_stored,
+                        collection,
+                        tracker.clone(),
                     )
                 );
             }
@@ -8049,13 +8298,14 @@ pub async fn collect_new_fragments(
         let metadata_fragments = collect_new_addresses(
             repository.clone(),
             &[Address::zero_context_hash(metadata_hash)],
-            ignore_durably_stored,
+            collection,
+            tracker,
         )
         .await;
         if let Ok(mut metadata_fragments) = metadata_fragments {
-            lore_trace!(
+            lore_debug!(
                 "Collected {} new addresses from branch metadata",
-                fragments.len()
+                metadata_fragments.len()
             );
             fragments.append(&mut metadata_fragments);
         } else {
@@ -8109,6 +8359,7 @@ pub async fn collect_new_fragments(
 
     fragments.sort_unstable();
     fragments.dedup();
+    lore_debug!("Collected {} new addresses in total", fragments.len());
 
     Ok(fragments)
 }
@@ -8124,7 +8375,8 @@ async fn collect_new_file_fragments(
     state_to: Arc<State>,
     node_from: NodeID,
     node_to: NodeID,
-    ignore_durably_stored: bool,
+    collection: Collection,
+    tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
     let (from, to) = join!(
         state_from.collect_children_unsorted(
@@ -8180,13 +8432,15 @@ async fn collect_new_file_fragments(
             if to_node.is_file() {
                 let repository = to.repository.clone();
                 let address = [to_node.address];
+                let tracker = tracker.clone();
                 lore_spawn!(tasks, async move {
-                    collect_new_addresses(repository, &address, ignore_durably_stored).await
+                    collect_new_addresses(repository, &address, collection, tracker).await
                 });
             } else {
                 let repository = to.repository.clone();
                 let state_from = from.state.clone();
                 let state_to = to.state.clone();
+                let tracker = tracker.clone();
                 lore_spawn!(tasks, async move {
                     collect_new_file_fragments_recurse(
                         repository,
@@ -8194,7 +8448,8 @@ async fn collect_new_file_fragments(
                         state_to,
                         from_node_id,
                         to_node_id,
-                        ignore_durably_stored,
+                        collection,
+                        tracker,
                     )
                     .await
                 });
@@ -8231,15 +8486,11 @@ fn collect_new_file_fragments_recurse(
     state_to: Arc<State>,
     node_from: NodeID,
     node_to: NodeID,
-    ignore_durably_stored: bool,
+    collection: Collection,
+    tracker: Arc<StoreRequestTracker>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Address>, StateError>> + Send + 'static>> {
     Box::pin(collect_new_file_fragments(
-        repository,
-        state_from,
-        state_to,
-        node_from,
-        node_to,
-        ignore_durably_stored,
+        repository, state_from, state_to, node_from, node_to, collection, tracker,
     ))
 }
 
@@ -8281,7 +8532,8 @@ async fn collect_new_node_metadata_fragments(
     block_address_from: Option<Address>,
     block_address_to: Address,
     block_index: usize,
-    ignore_durably_stored: bool,
+    collection: Collection,
+    tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
     let metadata_block_from = if let Some(address) = block_address_from {
         NodeFileMetadataBlockData::read_box_from_immutable_compat(repository.clone(), address, true)
@@ -8328,10 +8580,15 @@ async fn collect_new_node_metadata_fragments(
         collect_metadata_address_refs(&metadata, &mut metadata_refs)?;
     }
 
-    let mut addresses =
-        collect_new_addresses(repository.clone(), &metadata_blobs, ignore_durably_stored).await?;
+    let mut addresses = collect_new_addresses(
+        repository.clone(),
+        &metadata_blobs,
+        collection,
+        tracker.clone(),
+    )
+    .await?;
     let mut more_addresses =
-        collect_new_addresses(repository, &metadata_refs, ignore_durably_stored).await?;
+        collect_new_addresses(repository, &metadata_refs, collection, tracker).await?;
     addresses.append(&mut more_addresses);
 
     addresses.sort_unstable();
@@ -8347,7 +8604,8 @@ async fn collect_new_node_metadata_fragments(
 async fn collect_new_revision_metadata_fragments(
     repository: Arc<RepositoryContext>,
     metadata_hash: Hash,
-    ignore_durably_stored: bool,
+    collection: Collection,
+    tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
     if metadata_hash.is_zero() {
         return Ok(vec![]);
@@ -8361,7 +8619,7 @@ async fn collect_new_revision_metadata_fragments(
     collect_metadata_address_refs(&metadata, &mut metadata_refs)?;
 
     let mut addresses =
-        collect_new_addresses(repository, &metadata_refs, ignore_durably_stored).await?;
+        collect_new_addresses(repository, &metadata_refs, collection, tracker).await?;
 
     addresses.sort_unstable();
     addresses.dedup();
@@ -8369,10 +8627,14 @@ async fn collect_new_revision_metadata_fragments(
     Ok(addresses)
 }
 
+/// The addresses among `addresses`, and among the fragments the lists of them name, that
+/// `collection` keeps. An address the local store holds no entry for is collected alone, unless
+/// [`Collection::Recovery`] finds the remote holds it as a list.
 async fn collect_new_addresses(
     repository: Arc<RepositoryContext>,
     addresses: &[Address],
-    ignore_durably_stored: bool,
+    collection: Collection,
+    tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
     let mut new_addresses = Vec::with_capacity(addresses.len());
 
@@ -8385,57 +8647,67 @@ async fn collect_new_addresses(
 
         let address = *address;
         let repository = repository.clone();
+        let tracker = tracker.clone();
         lore_spawn!(task, {
             async move {
-                if let Ok(query) = repository
-                    .immutable_store()
-                    .get_metadata(repository.id, address)
-                    .await
-                {
-                    let mut addresses = vec![];
-                    if query.fragment.flags & FragmentFlags::PayloadFragmented != 0
-                        && let Ok((_fragment, buffer)) = immutable::load_raw(
+                let query = {
+                    let _request = tracker.track();
+                    repository
+                        .immutable_store()
+                        .get_metadata(repository.id, address)
+                        .await
+                };
+                let query = query
+                    .ok()
+                    .filter(|query| query.match_made != StoreMatch::MatchNone);
+                let (fragmented, new) = match &query {
+                    Some(query) => (
+                        query.fragment.flags & FragmentFlags::PayloadFragmented != 0,
+                        collection == Collection::All
+                            || query.match_made != StoreMatch::MatchFull
+                            || (query.fragment.flags & FragmentFlags::PayloadStoredDurable) == 0,
+                    ),
+                    None => (
+                        collection == Collection::Recovery
+                            && remote_lists_fragments(&repository, address, &tracker).await,
+                        true,
+                    ),
+                };
+                let mut addresses = vec![];
+                if fragmented
+                    && let Ok((_fragment, buffer)) = {
+                        let _request = tracker.track();
+                        immutable::load_raw(
                             repository.clone(),
                             address,
                             immutable::read_options_from_repository(&repository),
                         )
                         .await
+                    }
+                {
+                    let buffer = buffer.to_aligned::<FragmentReference>();
+                    let mut subaddress = Vec::with_capacity(buffer.count::<FragmentReference>());
+                    for reference in buffer.as_type_slice::<FragmentReference>().iter() {
+                        subaddress.push(Address {
+                            context: address.context,
+                            hash: reference.hash,
+                        });
+                    }
+                    if let Ok(mut subaddress) = collect_new_addresses_recurse(
+                        repository.clone(),
+                        subaddress.as_slice(),
+                        collection,
+                        tracker.clone(),
+                    )
+                    .await
                     {
-                        let buffer = buffer.to_aligned::<FragmentReference>();
-                        let mut subaddress =
-                            Vec::with_capacity(buffer.count::<FragmentReference>());
-                        for reference in buffer.as_type_slice::<FragmentReference>().iter() {
-                            subaddress.push(Address {
-                                context: address.context,
-                                hash: reference.hash,
-                            });
-                        }
-                        if let Ok(mut subaddress) = collect_new_addresses_recurse(
-                            repository.clone(),
-                            subaddress.as_slice(),
-                            ignore_durably_stored,
-                        )
-                        .await
-                        {
-                            addresses.append(&mut subaddress);
-                        }
+                        addresses.append(&mut subaddress);
                     }
-
-                    if !ignore_durably_stored
-                        || query.match_made != StoreMatch::MatchFull
-                        || (query.fragment.flags & FragmentFlags::PayloadStoredDurable) == 0
-                    {
-                        addresses.push(address);
-                    }
-
-                    if !addresses.is_empty() {
-                        Some(addresses)
-                    } else {
-                        None
-                    }
-                } else {
-                    Some(vec![address])
                 }
+                if new {
+                    addresses.push(address);
+                }
+                (!addresses.is_empty()).then_some(addresses)
             }
         });
 
@@ -8457,15 +8729,31 @@ async fn collect_new_addresses(
     Ok(new_addresses)
 }
 
+/// Whether the remote holds `address` as a list of fragments. `false` without a remote, or when
+/// the remote cannot answer. The remote read counts as a request of `tracker`.
+async fn remote_lists_fragments(
+    repository: &Arc<RepositoryContext>,
+    address: Address,
+    tracker: &StoreRequestTracker,
+) -> bool {
+    let Some(session) = immutable::resolve_session(repository) else {
+        return false;
+    };
+    let _request = tracker.track();
+    session
+        .get_metadata(&address)
+        .await
+        .is_ok_and(|fragment| fragment.flags & FragmentFlags::PayloadFragmented != 0)
+}
+
 fn collect_new_addresses_recurse(
     repository: Arc<RepositoryContext>,
     addresses: &[Address],
-    ignore_durably_stored: bool,
+    collection: Collection,
+    tracker: Arc<StoreRequestTracker>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Address>, StateError>> + Send + '_>> {
     Box::pin(collect_new_addresses(
-        repository,
-        addresses,
-        ignore_durably_stored,
+        repository, addresses, collection, tracker,
     ))
 }
 

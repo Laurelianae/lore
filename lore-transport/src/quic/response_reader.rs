@@ -22,7 +22,7 @@ use super::QuicErrorStatus;
 use super::QuicServiceError;
 use super::command_header::COMMAND_HEADER_SIZE;
 use super::command_header::COMMAND_HEADER_SIZE_V4;
-use crate::quic::chunking::SerialChunking;
+use crate::quic::chunking::ParallelChunking;
 
 type PendingResultSender = oneshot::Sender<Result<Bytes, QuicClientError>>;
 type PendingCommandMap = DashMap<u32, PendingResultSender>;
@@ -104,7 +104,7 @@ async fn read_response(
     };
 
     let mut chunk_resolver =
-        SerialChunking::new(header_size, max_chunk_size, None /* no metrics */);
+        ParallelChunking::new(header_size, max_chunk_size, None /* no metrics */);
     // Kept across the loop so a chunk carrying several responses costs no allocation.
     let mut responses = Vec::new();
 

@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::sync::Arc;
+use std::time::Duration;
+
 use lore_base::error::*;
 use lore_base::types::*;
 use lore_error_set::ext::ResultExt;
 use lore_transport::connection::*;
 use lore_transport::error::ProtocolError;
+use lore_transport::session::StorageSession;
 use lore_transport::types::*;
 
 /// A long-lived process rotates the credentials it supplies. The connection
@@ -20,26 +24,57 @@ use lore_transport::types::*;
 #[test]
 fn the_no_identity_fallback_does_not_cross_credential_modes() {
     let remote = "lores://mode-isolation.test.invalid";
-    let stored = (remote.to_string(), "alice".to_string(), false);
-    let supplied = (remote.to_string(), "alice".to_string(), true);
+    let stored = (
+        remote.to_string(),
+        "alice".to_string(),
+        false,
+        String::new(),
+    );
+    let supplied = (remote.to_string(), "alice".to_string(), true, String::new());
 
-    assert!(matches_url_and_mode(&stored, remote, false));
-    assert!(matches_url_and_mode(&supplied, remote, true));
+    assert!(matches_url_mode_and_store(&stored, remote, false, ""));
+    assert!(matches_url_mode_and_store(&supplied, remote, true, ""));
 
     assert!(
-        !matches_url_and_mode(&supplied, remote, false),
+        !matches_url_mode_and_store(&supplied, remote, false, ""),
         "a store-mode call must not be given a supplied-credential connection"
     );
     assert!(
-        !matches_url_and_mode(&stored, remote, true),
+        !matches_url_mode_and_store(&stored, remote, true, ""),
         "a supplied-credential call must not be given a store-mode connection"
     );
 
-    assert!(!matches_url_and_mode(
+    assert!(!matches_url_mode_and_store(
         &stored,
         "lores://elsewhere.invalid",
-        false
+        false,
+        ""
     ));
+}
+
+/// Nor does it cross token stores: a process carrying out calls for other processes reads the
+/// store each caller names, and the identity a call resolves is fixed by the URL and its own store,
+/// not by whichever store opened the connection cached under the URL.
+#[test]
+fn the_no_identity_fallback_does_not_cross_token_stores() {
+    let remote = "lores://store-isolation.test.invalid";
+    let alices = (
+        remote.to_string(),
+        "alice".to_string(),
+        false,
+        "/home/alice/tokens".to_string(),
+    );
+
+    assert!(matches_url_mode_and_store(
+        &alices,
+        remote,
+        false,
+        "/home/alice/tokens"
+    ));
+    assert!(
+        !matches_url_mode_and_store(&alices, remote, false, "/home/bob/tokens"),
+        "a call reading another store must not be given the connection alice's opened"
+    );
 }
 
 /// A call that supplied its own credentials must never be matched on URL
@@ -252,6 +287,126 @@ fn a_refusal_lasts_until_a_session_start_succeeds() {
     assert!(connector.is_partition_authorized(partition));
 }
 
+/// A command's session takes turns over every storage connection, so bulk reads through it,
+/// such as a cache fill, are not held to the rate of the connection a single pick lands on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_spreads_requests_over_every_storage_connection() {
+    use crate::quic::storage_service::test_server::TestStorageServer;
+    use crate::quic::storage_service::test_server::test_address;
+    use crate::quic::storage_service::test_server::test_partition;
+
+    let server = TestStorageServer::start();
+    let connection = Connection::detached(server.connect(4).await);
+    let session = connection
+        .session(test_partition(), "correlation")
+        .await
+        .expect("session over the detached storage");
+
+    for index in 0..400 {
+        session.get(&test_address(index)).await.expect("fetch");
+    }
+
+    assert_eq!(server.gets_per_connection(), vec![100, 100, 100, 100]);
+}
+
+/// A reconnect numbers the server's sessions from 1 again, so the ids a stale pool holds may name
+/// the sessions its replacement starts. Replacing it stops none of them, and the replacement serves
+/// on every connection while the stale pool is still held.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_pool_replaced_after_a_reconnect_leaves_its_replacement_serving() {
+    use crate::quic::storage_service::test_server::TestStorageServer;
+    use crate::quic::storage_service::test_server::test_address;
+    use crate::quic::storage_service::test_server::test_partition;
+
+    let server = TestStorageServer::start();
+    let connection = Connection::detached(server.connect(2).await);
+    let stale = connection
+        .session(test_partition(), "correlation")
+        .await
+        .expect("session over the detached storage");
+    stale.get(&test_address(0)).await.expect("fetch");
+
+    server.restart_sessions();
+    stale.invalidate().await;
+    let fresh = connection
+        .session(test_partition(), "correlation")
+        .await
+        .expect("a fresh session");
+
+    for index in 1..3 {
+        fresh
+            .get(&test_address(index))
+            .await
+            .expect("the fresh pool serves");
+    }
+    let gets = server.gets_per_connection();
+    assert!(
+        gets.iter().all(|&served| served > 0),
+        "a connection served nothing: {gets:?}"
+    );
+    drop(stale);
+}
+
+/// Invalidating a lazy session marks the pool it resolved to stale, so the next resolution starts
+/// a new pool even while another holder keeps the old one and its session ids.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalidated_pool_is_not_handed_out_again() {
+    use crate::quic::storage_service::test_server::TestStorageServer;
+    use crate::quic::storage_service::test_server::test_address;
+    use crate::quic::storage_service::test_server::test_partition;
+
+    let server = TestStorageServer::start();
+    let connection = Connection::detached(server.connect(2).await);
+    let resolving = connection.clone();
+    let lazy = StorageSession::pending(move || {
+        let connection = resolving.clone();
+        async move { connection.session(test_partition(), "correlation").await }
+    });
+    lazy.get(&test_address(0)).await.expect("fetch");
+    let held = connection
+        .session_pool(test_partition(), "correlation")
+        .await
+        .expect("the pool the lazy session resolved to");
+
+    lazy.invalidate().await;
+    let after = connection
+        .session_pool(test_partition(), "correlation")
+        .await
+        .expect("a pool after the invalidation");
+
+    assert!(held.is_stale());
+    assert!(!Arc::ptr_eq(&held, &after), "a fresh pool");
+}
+
+/// A cache get cap above what a semaphore holds is clamped to it, and a cap of zero sets
+/// none.
+#[test]
+fn cache_get_permits_clamp_to_what_a_semaphore_holds() {
+    let permits = Connection::detached(Vec::new())
+        .cache_get_permits(usize::MAX)
+        .expect("a cap");
+    assert_eq!(
+        permits.available_permits(),
+        tokio::sync::Semaphore::MAX_PERMITS
+    );
+    assert!(
+        Connection::detached(Vec::new())
+            .cache_get_permits(0)
+            .is_none()
+    );
+}
+
+/// The first call fixes a connection's cache get permits; a later call with another cap
+/// answers the same ones.
+#[test]
+fn cache_get_permits_are_fixed_by_the_first_call() {
+    let connection = Connection::detached(Vec::new());
+    let first = connection.cache_get_permits(4).expect("a cap");
+    let later = connection.cache_get_permits(8).expect("a cap");
+    assert!(Arc::ptr_eq(&first, &later));
+    assert_eq!(later.available_permits(), 4);
+}
+
 #[test]
 fn not_supported_to_tonic_status() {
     let err = ProtocolError::from(NotSupported {
@@ -295,9 +450,15 @@ fn auth_session_fields() {
     let session = AuthSession {
         session_code: "sess-123".into(),
         login_url: "https://auth.example.com/login?code=abc".into(),
+        user_code: "ABCD-EFGH".into(),
+        interval: Duration::from_secs(5),
+        expires_in: Duration::from_secs(600),
     };
     assert_eq!(session.session_code, "sess-123");
     assert_eq!(session.login_url, "https://auth.example.com/login?code=abc");
+    assert_eq!(session.user_code, "ABCD-EFGH");
+    assert_eq!(session.interval, Duration::from_secs(5));
+    assert_eq!(session.expires_in, Duration::from_secs(600));
 }
 
 #[test]
@@ -309,6 +470,7 @@ fn authentication_token_with_refresh() {
         expires_ms: 1700000000000,
         acceptable_root_domains: vec!["example.com".into()],
         refresh_token: Some("refresh-abc".into()),
+        scope: Some("openid offline_access".into()),
     };
     assert_eq!(token.token, "jwt-token");
     assert_eq!(token.user_id, "user-1");
@@ -316,6 +478,7 @@ fn authentication_token_with_refresh() {
     assert_eq!(token.expires_ms, 1700000000000);
     assert_eq!(token.acceptable_root_domains, vec!["example.com"]);
     assert_eq!(token.refresh_token.as_deref(), Some("refresh-abc"));
+    assert_eq!(token.scope.as_deref(), Some("openid offline_access"));
 }
 
 #[test]
@@ -327,6 +490,7 @@ fn authentication_token_without_refresh() {
         expires_ms: 1700000000000,
         acceptable_root_domains: vec![],
         refresh_token: None,
+        scope: None,
     };
     assert!(token.refresh_token.is_none());
 }

@@ -1268,6 +1268,7 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 0,
+                                fragments: 0,
                             }]),
                         },
                         callback,
@@ -1473,6 +1474,353 @@ mod storage_remote_tests {
                     );
 
                     close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// A repository context for `repository_id` over `stores`, reaching the remote through
+    /// `remote`.
+    fn cache_test_context(
+        repository_id: lore_revision::lore::RepositoryId,
+        (immutable_store, mutable_store): (
+            Arc<dyn lore_storage::ImmutableStore>,
+            Arc<dyn lore_storage::MutableStore>,
+        ),
+        remote: Result<Arc<lore_transport::Connection>, lore_transport::ProtocolError>,
+    ) -> Arc<lore_revision::repository::RepositoryContext> {
+        Arc::new(lore_revision::repository::RepositoryContext::new(
+            lore_revision::repository::RepositoryContextCreationArgs {
+                paths: None,
+                immutable_store,
+                mutable_store,
+                id: repository_id,
+                instance_id: lore_revision::instance::InstanceId::default(),
+                remote,
+                filter: Arc::new(lore_revision::filter::Filter::default()),
+                filesystem_provider: None,
+            },
+        ))
+    }
+
+    /// A server and the repositories a `State::cache_fragments` test works through: one over the
+    /// server's own stores, with no remote, where the test builds its state, and a client over
+    /// in-memory stores connected to the server, which caches nothing it reads by itself.
+    struct CacheTest {
+        server: TestServer,
+        repository_id: lore_revision::lore::RepositoryId,
+        server_repository: Arc<lore_revision::repository::RepositoryContext>,
+        client_stores: (
+            Arc<dyn lore_storage::ImmutableStore>,
+            Arc<dyn lore_storage::MutableStore>,
+        ),
+        client_repository: Arc<lore_revision::repository::RepositoryContext>,
+    }
+
+    impl CacheTest {
+        async fn start(
+            transport: Transport,
+            repository_id: lore_revision::lore::RepositoryId,
+        ) -> Result<Self, Box<dyn Error>> {
+            let server = start_server(transport).await;
+            let server_repository = cache_test_context(
+                repository_id,
+                (
+                    server.backend_immutable.clone(),
+                    server.backend_mutable.clone(),
+                ),
+                Err(lore_transport::ProtocolError::from(
+                    lore_base::error::NoRemote,
+                )),
+            );
+            let client_stores = lore_revision::repository::create_client_memory_stores().await?;
+            let remote = lore_transport::connection::connect(
+                server.url.as_str(),
+                "cache-test",
+                repository_id,
+                1,
+                "",
+                "",
+            )
+            .await?;
+            let client_repository =
+                cache_test_context(repository_id, client_stores.clone(), Ok(remote));
+            client_repository.set_disable_cache(true);
+            Ok(Self {
+                server,
+                repository_id,
+                server_repository,
+                client_stores,
+                client_repository,
+            })
+        }
+
+        /// A repository over the client's stores, with no remote.
+        fn offline(&self) -> Arc<lore_revision::repository::RepositoryContext> {
+            cache_test_context(
+                self.repository_id,
+                self.client_stores.clone(),
+                Err(lore_transport::ProtocolError::from(
+                    lore_base::error::NoRemote,
+                )),
+            )
+        }
+    }
+
+    /// `State::cache_fragments` retains the state and tree records even when their fragments
+    /// lack `PayloadLocalCachePriority`, so both can be read without a remote.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn state_fragment_cache_makes_historical_state_available_offline() -> TestResult {
+        use lore_base::types::Address;
+        use lore_base::types::fragment_flags::FragmentFlags;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::node::Node;
+        use lore_revision::node::ROOT_NODE;
+        use lore_revision::repository::RepositoryWriteToken;
+        use lore_revision::state::State;
+        use lore_storage::hash::hash_string;
+
+        let execution = setup_execution("storage-remote-historical-state-cache".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let repository_id = RepositoryId::from([0xd2u8; 16]);
+                    let test = CacheTest::start(transport, repository_id).await?;
+                    let write_token = RepositoryWriteToken::acquire(std::path::Path::new(
+                        "historical-state-cache-test",
+                    ))
+                    .await;
+                    let state = State::new();
+                    let node = Node {
+                        name_hash: hash_string("held"),
+                        ..Default::default()
+                    };
+                    state
+                        .node_add(test.server_repository.clone(), ROOT_NODE, node, "held")
+                        .await?;
+                    let revision = state
+                        .serialize(test.server_repository.clone(), &write_token)
+                        .await?;
+
+                    for hash in [revision, state.tree_hash()] {
+                        let address = Address::zero_context_hash(hash);
+                        let (mut fragment, payload) = test
+                            .server
+                            .backend_immutable
+                            .clone()
+                            .get(repository_id, address)
+                            .await?
+                            .into_payload()?;
+                        fragment.flags &= !FragmentFlags::PayloadLocalCachePriority;
+                        test.server
+                            .backend_immutable
+                            .clone()
+                            .put(repository_id, address, fragment, Some(payload), true)
+                            .await?;
+                    }
+
+                    State::deserialize(test.client_repository.clone(), revision)
+                        .await?
+                        .cache_fragments(test.client_repository.clone(), false)
+                        .await?;
+
+                    let offline = test.offline();
+                    State::deserialize(offline.clone(), revision)
+                        .await?
+                        .tree(offline)
+                        .await?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// With `file_metadata`, `State::cache_fragments` caches every file metadata block, so each
+    /// reads without a remote. The custom metadata the slots name is left alone: the remote lacks
+    /// it, and caching succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_metadata_cache_makes_file_metadata_blocks_available_offline() -> TestResult {
+        use lore_base::types::Hash;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::node::Node;
+        use lore_revision::node::NodeFileMetadata;
+        use lore_revision::node::NodeFileMetadataBlock;
+        use lore_revision::node::ROOT_NODE;
+        use lore_revision::node::node_to_file_metadata;
+        use lore_revision::repository::RepositoryWriteToken;
+        use lore_revision::state::State;
+        use lore_storage::hash::hash_string;
+
+        let execution = setup_execution("storage-remote-file-metadata-cache".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let test =
+                        CacheTest::start(transport, RepositoryId::from([0xd3u8; 16])).await?;
+                    let write_token = RepositoryWriteToken::acquire(std::path::Path::new(
+                        "file-metadata-cache-test",
+                    ))
+                    .await;
+                    let state = State::new();
+                    let mut described = Vec::new();
+                    for index in 0..1200 {
+                        let name = format!("file{index}");
+                        let node = Node {
+                            name_hash: hash_string(&name),
+                            ..Default::default()
+                        };
+                        let node = state
+                            .node_add(test.server_repository.clone(), ROOT_NODE, node, &name)
+                            .await?;
+                        if [0, 600, 1100].contains(&index) {
+                            described.push(node);
+                        }
+                    }
+
+                    let mut expected = Vec::new();
+                    for (index, &node) in described.iter().enumerate() {
+                        let history = Hash::from_u64(index as u64 + 1);
+                        let metadata_node = node_to_file_metadata(node);
+                        let block_index = NodeFileMetadataBlock::index(metadata_node);
+                        let block = state
+                            .block_file_metadata(test.server_repository.clone(), block_index)
+                            .await?;
+                        {
+                            let mut writer = block.write();
+                            let slot = writer.node(NodeFileMetadata::index(metadata_node));
+                            slot.revision[0] = history;
+                            slot.metadata = Hash::from_u64(9);
+                            writer.mark_dirty();
+                        }
+                        state.block_file_metadata_modified(block, block_index);
+                        expected.push((
+                            block_index,
+                            NodeFileMetadata::index(metadata_node),
+                            history,
+                        ));
+                    }
+                    assert_eq!(
+                        expected[0].0 + 2,
+                        expected[2].0,
+                        "the slots span three blocks"
+                    );
+                    state.mark_dirty();
+                    let revision = state
+                        .serialize(test.server_repository.clone(), &write_token)
+                        .await?;
+
+                    State::deserialize(test.client_repository.clone(), revision)
+                        .await?
+                        .cache_fragments(test.client_repository.clone(), true)
+                        .await?;
+
+                    let offline = test.offline();
+                    let offline_state = State::deserialize(offline.clone(), revision).await?;
+                    for (block_index, node_index, history) in expected {
+                        let block = offline_state
+                            .block_file_metadata(offline.clone(), block_index)
+                            .await?;
+                        assert_eq!(
+                            block.read().node_block().node[node_index].revision[0],
+                            history
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// With `file_metadata`, `State::cache_fragments` fails when the remote lacks a file metadata
+    /// block. Without it, caching disregards the failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_metadata_cache_fails_on_a_block_the_remote_lacks() -> TestResult {
+        use lore_base::types::Address;
+        use lore_base::types::Hash;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::node::Node;
+        use lore_revision::node::NodeFileMetadata;
+        use lore_revision::node::NodeFileMetadataBlock;
+        use lore_revision::node::ROOT_NODE;
+        use lore_revision::node::node_to_file_metadata;
+        use lore_revision::repository::RepositoryWriteToken;
+        use lore_revision::state::State;
+        use lore_storage::StoreObliterateStats;
+        use lore_storage::TypedBytes;
+        use lore_storage::hash::hash_string;
+
+        let execution = setup_execution("storage-remote-file-metadata-cache-failure".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let test =
+                        CacheTest::start(transport, RepositoryId::from([0xd4u8; 16])).await?;
+                    let write_token = RepositoryWriteToken::acquire(std::path::Path::new(
+                        "file-metadata-cache-failure-test",
+                    ))
+                    .await;
+                    let state = State::new();
+                    let node = Node {
+                        name_hash: hash_string("described"),
+                        ..Default::default()
+                    };
+                    let node = state
+                        .node_add(test.server_repository.clone(), ROOT_NODE, node, "described")
+                        .await?;
+                    let metadata_node = node_to_file_metadata(node);
+                    let block_index = NodeFileMetadataBlock::index(metadata_node);
+                    let block = state
+                        .block_file_metadata(test.server_repository.clone(), block_index)
+                        .await?;
+                    {
+                        let mut writer = block.write();
+                        writer.node(NodeFileMetadata::index(metadata_node)).revision[0] =
+                            Hash::from_u64(1);
+                        writer.mark_dirty();
+                    }
+                    state.block_file_metadata_modified(block, block_index);
+                    state.mark_dirty();
+                    let revision = state
+                        .serialize(test.server_repository.clone(), &write_token)
+                        .await?;
+
+                    let tree = state.tree(test.server_repository.clone()).await?;
+                    let blocks = lore_revision::immutable::read(
+                        test.server_repository.clone(),
+                        Address::zero_context_hash(tree.hash_file_metadata),
+                        None,
+                        lore_revision::immutable::read_options_from_repository(
+                            &test.server_repository,
+                        ),
+                    )
+                    .await?;
+                    for &hash in blocks.as_type_slice::<Hash>() {
+                        if !hash.is_zero() {
+                            test.server
+                                .backend_immutable
+                                .clone()
+                                .obliterate(
+                                    test.repository_id,
+                                    Address::zero_context_hash(hash),
+                                    Arc::new(StoreObliterateStats::default()),
+                                )
+                                .await?;
+                        }
+                    }
+
+                    let client_state =
+                        State::deserialize(test.client_repository.clone(), revision).await?;
+                    client_state
+                        .cache_fragments(test.client_repository.clone(), false)
+                        .await?;
+                    assert!(
+                        client_state
+                            .cache_fragments(test.client_repository.clone(), true)
+                            .await
+                            .is_err(),
+                        "a block the remote lacks fails the file metadata cache"
+                    );
                 }
                 Ok(())
             })
@@ -2345,6 +2693,97 @@ mod storage_remote_tests {
                 );
 
                 close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Copies of one source to several target contexts, in one call, each reach the server, over
+    /// both transports. Push copies an association from the zero-context source this way. A copy
+    /// response names only its source, so a client that merged the copies by source answered all
+    /// of them with the first one's result, and the server held only one target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copies_of_one_source_to_many_contexts_each_reach_the_server() -> TestResult {
+        use lore::storage::copy;
+        use lore::storage::copy::LoreStorageCopyArgs;
+        use lore::storage::copy::LoreStorageCopyItem;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+        use lore_revision::interface::LoreArray;
+        use lore_storage::immutable_store::query_one;
+        use lore_storage::store_types::StoreMatch;
+
+        const TARGETS: u8 = 8;
+
+        let execution = setup_execution("storage-remote-copy-many-contexts".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xc5u8; 16]);
+                    let handle_id = open_remote_handle(&server).await;
+                    let source = put_local_and_remote_via_handle(
+                        handle_id,
+                        partition,
+                        b"copied to many contexts",
+                    )
+                    .await;
+                    let targets: Vec<Address> = (1..=TARGETS)
+                        .map(|index| Address {
+                            hash: source.hash,
+                            context: Context::from([index; 16]),
+                        })
+                        .collect();
+
+                    let completed: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+                    let completed_for_cb = completed.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                        if let LoreEvent::StorageCopyItemComplete(data) = event {
+                            completed_for_cb.lock().unwrap().push(data.error.error_code);
+                        }
+                    }));
+                    let items = targets
+                        .iter()
+                        .zip(0u64..)
+                        .map(|(target, id)| LoreStorageCopyItem {
+                            id,
+                            source_partition: partition,
+                            target_partition: partition,
+                            source_address: source,
+                            target_context: target.context,
+                        })
+                        .collect();
+                    let status = copy::copy(
+                        LoreGlobalArgs::default(),
+                        LoreStorageCopyArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id },
+                            items: LoreArray::from_vec(items),
+                        },
+                        callback,
+                    )
+                    .await;
+
+                    assert_eq!(status, 0, "{transport:?}");
+                    assert_eq!(
+                        *completed.lock().unwrap(),
+                        vec![0; TARGETS as usize],
+                        "{transport:?}"
+                    );
+                    for target in targets {
+                        let on_server =
+                            query_one(&server.backend_immutable.clone(), partition, target)
+                                .await
+                                .unwrap();
+                        assert_eq!(
+                            on_server.match_made,
+                            StoreMatch::MatchFull,
+                            "{transport:?}: the server must hold {target}",
+                        );
+                    }
+
+                    close_handle(handle_id).await;
+                }
                 Ok(())
             })
             .await
@@ -3541,7 +3980,7 @@ mod storage_remote_tests {
     use lore_base::types::Hash;
     use lore_base::types::KeyType;
 
-    const REMOTE_KEY_TYPE: KeyType = KeyType::BranchLatestPointer;
+    const REMOTE_KEY_TYPE: KeyType = KeyType::Untyped;
 
     fn remote_globals() -> LoreGlobalArgs {
         LoreGlobalArgs {
@@ -4012,6 +4451,7 @@ mod storage_remote_tests {
                         context: Context::default(),
                         local_cache: 0,
                         streaming: 0,
+                        fragments: 0,
                     },
                     LoreStorageGetResolvedItem {
                         data_out: Default::default(),
@@ -4021,6 +4461,7 @@ mod storage_remote_tests {
                         context: Context::default(),
                         local_cache: 0,
                         streaming: 0,
+                        fragments: 0,
                     },
                 ];
                 get_resolved::get_resolved(
@@ -4080,6 +4521,7 @@ mod storage_remote_tests {
                             context: Context::default(),
                             local_cache: 0,
                             streaming: 0,
+                            fragments: 0,
                         }]),
                     },
                     callback,
@@ -4234,6 +4676,7 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 0,
+                                fragments: 0,
                             }]),
                         },
                         callback,
@@ -4342,6 +4785,7 @@ mod storage_remote_tests {
                                     context: Context::default(),
                                     local_cache: 0,
                                     streaming: 0,
+                                    fragments: 0,
                                 }]),
                             },
                             callback,
@@ -4527,6 +4971,7 @@ mod storage_remote_tests {
                             context: Context::default(),
                             local_cache: 1,
                             streaming: 0,
+                            fragments: 0,
                         },
                         LoreStorageGetResolvedItem {
                             data_out: Default::default(),
@@ -4536,6 +4981,7 @@ mod storage_remote_tests {
                             context: Context::default(),
                             local_cache: 0,
                             streaming: 0,
+                            fragments: 0,
                         },
                     ];
                     get_resolved::get_resolved(
@@ -4688,6 +5134,7 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 0,
+                                fragments: 0,
                             }]),
                         },
                         callback,
@@ -5007,6 +5454,7 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 0,
+                                fragments: 0,
                             }]),
                         },
                         callback,
@@ -5123,6 +5571,7 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 1,
+                                fragments: 0,
                             }]),
                         },
                         callback,
@@ -5153,6 +5602,206 @@ mod storage_remote_tests {
                         assembled, payload,
                         "streamed bytes must match what was published"
                     );
+
+                    close_handle(reader).await;
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// What one get-resolved item with `fragments` set delivered: the header's content
+    /// size, the item's error code, each `GET_FRAGMENT` as offset, fragment and payload, and how
+    /// many `GET_DATA` events arrived beside them.
+    #[derive(Default)]
+    struct FragmentRead {
+        size_content: Vec<u64>,
+        codes: Vec<i32>,
+        leaves: Vec<(u64, lore_base::types::Fragment, Vec<u8>)>,
+        data_events: usize,
+    }
+
+    async fn put_resolved_content(
+        handle_id: u64,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        content: &[u8],
+    ) {
+        use lore::storage::put_resolved;
+        use lore::storage::put_resolved::LoreStoragePutResolvedArgs;
+        use lore::storage::put_resolved::LoreStoragePutResolvedItem;
+        use lore_base::types::Context;
+        use lore_revision::event::LoreBytes;
+        use lore_revision::interface::LoreArray;
+
+        let codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+        let codes_cb = codes.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+            if let LoreEvent::StoragePutItemComplete(d) = e {
+                codes_cb.lock().unwrap().push(d.error.error_code);
+            }
+        }));
+        put_resolved::put_resolved(
+            LoreGlobalArgs::default(),
+            LoreStoragePutResolvedArgs {
+                handle: lore::storage::handle::LoreStore { handle_id },
+                items: LoreArray::from_vec(vec![LoreStoragePutResolvedItem {
+                    id: 1,
+                    partition,
+                    key,
+                    context: Context::default(),
+                    data: LoreBytes {
+                        ptr: content.as_ptr().cast(),
+                        len: content.len(),
+                    },
+                    remote_write: 1,
+                    local_cache: 0,
+                    fixed_size_chunk: 64 * 1024,
+                }]),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(codes.lock().unwrap().clone(), vec![0]);
+    }
+
+    async fn read_fragments(
+        handle_id: u64,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        data_out: lore_revision::event::LoreBytesMut,
+    ) -> FragmentRead {
+        use lore::storage::get_resolved;
+        use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
+        use lore::storage::get_resolved::LoreStorageGetResolvedItem;
+        use lore_base::types::Context;
+        use lore_revision::interface::LoreArray;
+
+        let read: Arc<Mutex<FragmentRead>> = Arc::default();
+        let read_cb = read.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+            let mut read = read_cb.lock().unwrap();
+            match e {
+                LoreEvent::StorageGetHeader(d) => read.size_content.push(d.size_content),
+                LoreEvent::StorageGetData(_) => read.data_events += 1,
+                LoreEvent::StorageGetFragment(d) => {
+                    // Safety: the view is valid for the length given during the callback.
+                    let payload = unsafe {
+                        std::slice::from_raw_parts(d.bytes.ptr.cast::<u8>(), d.bytes.len)
+                    };
+                    read.leaves.push((d.offset, d.fragment, payload.to_vec()));
+                }
+                LoreEvent::StorageGetItemComplete(d) => read.codes.push(d.error.error_code),
+                _ => {}
+            }
+        }));
+        get_resolved::get_resolved(
+            LoreGlobalArgs::default(),
+            LoreStorageGetResolvedArgs {
+                handle: lore::storage::handle::LoreStore { handle_id },
+                items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                    data_out,
+                    id: 2,
+                    partition,
+                    key,
+                    context: Context::default(),
+                    local_cache: 0,
+                    streaming: 0,
+                    fragments: 1,
+                }]),
+            },
+            callback,
+        )
+        .await;
+        std::mem::take(&mut *read.lock().unwrap())
+    }
+
+    /// Bytes nothing compresses: splitmix64 over a counter leaves no repetition for an encoder to
+    /// find.
+    fn incompressible(length: u64) -> Vec<u8> {
+        (0..length)
+            .map(|i| {
+                let mut v = i.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                v = (v ^ (v >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                v = (v ^ (v >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                (v ^ (v >> 31)) as u8
+            })
+            .collect()
+    }
+
+    /// `fragments` delivers each leaf in content order with its fragment and its payload as stored:
+    /// zstd leaves compressed, a leaf stored uncompressed as it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_resolved_fragments_arrive_as_stored() -> TestResult {
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_storage::FragmentFlags;
+
+        let execution = setup_execution("storage-remote-resolve-fragments".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xdau8; 16]);
+                    let fragmented = Hash::hash_buffer(b"fragmented-key");
+                    let single = Hash::hash_buffer(b"single-leaf-key");
+                    let compressible: Vec<u8> =
+                        (0..(512 * 1024u32)).map(|i| (i % 251) as u8).collect();
+                    let incompressible = incompressible(48 * 1024);
+                    let handle_id = open_remote_handle(&server).await;
+                    put_resolved_content(handle_id, partition, fragmented, &compressible).await;
+                    put_resolved_content(handle_id, partition, single, &incompressible).await;
+                    let reader = open_remote_handle(&server).await;
+
+                    let read =
+                        read_fragments(reader, partition, fragmented, Default::default()).await;
+                    assert_eq!(read.codes, vec![0]);
+                    assert_eq!(read.size_content, vec![compressible.len() as u64]);
+                    assert_eq!(read.data_events, 0, "fragments replace GET_DATA");
+                    assert_eq!(read.leaves.len(), 8, "one fragment per 64 KiB leaf");
+                    let mut expected_offset = 0u64;
+                    for (offset, fragment, payload) in &read.leaves {
+                        assert_eq!(*offset, expected_offset, "offsets count content");
+                        assert_eq!(
+                            fragment.flags & FragmentFlags::PayloadCompressed,
+                            FragmentFlags::PayloadCompressedZstd.bits(),
+                            "a leaf stored with zstd arrives as stored"
+                        );
+                        assert_eq!(payload.len(), fragment.size_payload as usize);
+                        assert!(payload.len() < fragment.size_content as usize);
+                        let (_, content) = lore_storage::decompress(*fragment, payload).unwrap();
+                        let start = *offset as usize;
+                        let end = start + fragment.size_content as usize;
+                        assert_eq!(content.as_ref(), &compressible[start..end]);
+                        expected_offset += fragment.size_content;
+                    }
+                    assert_eq!(expected_offset, compressible.len() as u64);
+
+                    let read = read_fragments(reader, partition, single, Default::default()).await;
+                    assert_eq!(read.codes, vec![0]);
+                    assert_eq!(read.leaves.len(), 1);
+                    let (offset, fragment, payload) = &read.leaves[0];
+                    assert_eq!(*offset, 0);
+                    assert_eq!(
+                        fragment.flags & FragmentFlags::PayloadCompressed,
+                        0,
+                        "a leaf stored uncompressed arrives as stored"
+                    );
+                    assert_eq!(payload, &incompressible);
+
+                    let mut buffer = vec![0u8; incompressible.len()];
+                    let data_out = lore_revision::event::LoreBytesMut {
+                        ptr: buffer.as_mut_ptr().cast(),
+                        len: buffer.len(),
+                    };
+                    let read = read_fragments(reader, partition, single, data_out).await;
+                    assert_eq!(
+                        read.codes,
+                        vec![lore_base::error::InvalidArguments::FFI_CODE],
+                        "fragment delivery has no caller-buffer form"
+                    );
+                    assert!(read.leaves.is_empty());
 
                     close_handle(reader).await;
                     close_handle(handle_id).await;

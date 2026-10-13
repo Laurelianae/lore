@@ -12,11 +12,11 @@ use bytes::BytesMut;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_storage::FragmentWriteCounts;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDropHandle;
 use zerocopy::FromBytes;
@@ -35,8 +35,8 @@ use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
+use crate::fs::hold;
 use crate::immutable;
-use crate::infer;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreMetadataType;
@@ -92,7 +92,7 @@ use crate::util::serde::u8_as_bool;
 
 /// Event data reported at the start of a commit.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitBeginEventData {
     /// Unused placeholder field.
@@ -101,7 +101,7 @@ pub struct LoreRevisionCommitBeginEventData {
 
 /// Progress counters describing how far a commit has advanced.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitCountData {
     /// Number of directories processed so far.
@@ -128,11 +128,17 @@ pub struct LoreRevisionCommitCountData {
 }
 
 impl LoreRevisionCommitCountData {
+    /// The counters as they stand. A count is incremented with `Release` once its total holds what
+    /// it counts, and loaded here with `Acquire` ahead of its total, so no count reads ahead of its
+    /// total.
+    #[lore_macro::test_pub]
     fn new(stats: Arc<CommitStats>) -> Self {
+        let directory_count = stats.complete.directory_count.load(Ordering::Acquire);
+        let file_count = stats.complete.file_count.load(Ordering::Acquire);
         Self {
-            directory_count: stats.complete.directory_count.load(Ordering::Relaxed),
+            directory_count,
             directory_total: stats.complete.directory_total.load(Ordering::Relaxed),
-            file_count: stats.complete.file_count.load(Ordering::Relaxed),
+            file_count,
             file_total: stats.complete.file_total.load(Ordering::Relaxed),
             directory_delete_count: stats
                 .complete
@@ -149,7 +155,7 @@ impl LoreRevisionCommitCountData {
 
 /// Event data reporting commit progress.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitProgressEventData {
     /// Current progress counters.
@@ -158,7 +164,7 @@ pub struct LoreRevisionCommitProgressEventData {
 
 /// Event data reported at the end of a commit.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitEndEventData {
     /// Final progress counters.
@@ -170,7 +176,9 @@ pub struct LoreRevisionCommitEndEventData {
 /// The actions are exclusive: a file is counted once, under the action its staged
 /// node flags name.
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, bitcode::Encode, bitcode::Decode,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCommitFileStatsData {
     /// Files staged as new additions.
@@ -211,7 +219,7 @@ pub struct LoreCommitFileStatsData {
 /// statistics level one and above. A commit that failed reports what it had done
 /// by then.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitStatsEventData {
     /// Files committed, by action.
@@ -222,7 +230,7 @@ pub struct LoreRevisionCommitStatsEventData {
 
 /// Event data describing a revision produced by a commit.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitRevisionEventData {
     /// Identifier of the repository the revision belongs to.
@@ -365,6 +373,26 @@ impl CommitStats {
             statistics: crate::runtime::try_execution_context()
                 .is_some_and(|context| context.globals().stats()),
         })
+    }
+
+    /// Counts one directory in the total and as done, the total first, as
+    /// [`LoreRevisionCommitCountData::new`] reads them.
+    #[lore_macro::test_pub]
+    fn count_directory(&self) {
+        self.complete
+            .directory_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.complete
+            .directory_count
+            .fetch_add(1, Ordering::Release);
+    }
+
+    /// Counts one file in the total and as done, the total first, as
+    /// [`LoreRevisionCommitCountData::new`] reads them.
+    #[lore_macro::test_pub]
+    fn count_file(&self) {
+        self.complete.file_total.fetch_add(1, Ordering::Relaxed);
+        self.complete.file_count.fetch_add(1, Ordering::Release);
     }
 
     /// One file was read off disk and fragmented. The byte total is what a
@@ -548,6 +576,10 @@ pub fn commit_boxed(
 ///
 /// The working tree is written to only where a commit resolves a staged merge conflict, which
 /// removes the copies that merge left beside the file.
+///
+/// A provider that holds its state is handed each revision the instance's repository commits
+/// ([`InstanceOperation::committed`]), and is refused a commit of a link alone or of a layer,
+/// which would make a revision current that it is not handed.
 #[lore_macro::test_pub]
 pub(crate) async fn commit_with_metadata(
     repository: Arc<RepositoryContext>,
@@ -576,6 +608,15 @@ async fn commit_with_metadata_in_operation(
     values: LoreArray<LoreString>,
     formats: LoreArray<LoreMetadataType>,
 ) -> Result<Hash, CommitError> {
+    if operation.holds_state() {
+        if options.link.is_some() {
+            return Err(hold::refused("commit a link alone").into());
+        }
+        if options.layer.is_some() {
+            return Err(hold::refused("commit a layer").into());
+        }
+    }
+
     let reporting = CommitReporting::from_globals();
     let _stats_report = reporting.report();
 
@@ -646,6 +687,13 @@ async fn commit_staged_with_layers(
         if !layer.staged.is_zero() && layer.staged != layer.current {
             layer_staged = true;
         }
+    }
+    if operation.holds_state()
+        && layers.iter().any(|layer| {
+            !layer.staged.is_zero() && (globals.force() || layer.staged != layer.current)
+        })
+    {
+        return Err(hold::refused("commit a layer").into());
     }
 
     let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
@@ -766,6 +814,7 @@ async fn commit_staged_with_layers(
             signature,
             current_branch,
             token,
+            Some(operation),
         )
         .await?;
 
@@ -1261,6 +1310,7 @@ async fn commit_link_only(
         link_signature,
         link_branch,
         &token,
+        None,
     )
     .await?;
 
@@ -1367,6 +1417,7 @@ async fn commit_link_only(
             child_signature,
             level.branch,
             &token,
+            None,
         )
         .await?;
 
@@ -1452,13 +1503,19 @@ async fn build_commit_metadata(
     .await
 }
 
-/// Stores branch latest, deletes staged anchor, updates last sync if merge,
-/// and emits the revision commit event.
+/// Stores branch latest, deletes staged anchor, updates last sync if merge, and emits the revision
+/// commit event.
 ///
 /// `branch_previous` is what the pointer write compares against, so it must be
 /// the tip observed for `branch`, not the revision the caller built on: a prior
 /// link commit can advance the branch without committing the parent, which
 /// leaves that pin stale.
+///
+/// `reconciling` is the operation the commit read its files through, `None` for a link's own
+/// commit, which makes no revision of the instance current. Outside a dry run, where its provider
+/// holds its state, it is handed `state_staged` as stored once the revision is current
+/// ([`hand_over_committed`]), before it is reused as the staged anchor.
+#[allow(clippy::too_many_arguments)]
 async fn finalize_commit(
     repository: Arc<RepositoryContext>,
     state_current: &Arc<State>,
@@ -1467,6 +1524,7 @@ async fn finalize_commit(
     signature: Hash,
     branch: BranchId,
     token: &RepositoryWriteToken,
+    reconciling: Option<&InstanceOperationImpl>,
 ) -> Result<(), CommitError> {
     let dry_run = execution_context().globals().dry_run();
 
@@ -1478,6 +1536,14 @@ async fn finalize_commit(
             branch,
         )
         .await?;
+        if let Some(operation) = reconciling
+            && operation.holds_state()
+            && let Err(error) = hand_over_committed(&repository, operation, state_staged).await
+        {
+            lore_warn!(
+                "The filesystem provider did not take revision {signature} as committed: {error}"
+            );
+        }
 
         // Check if any dirty-only nodes remain in the staged state.
         // If so, preserve them in a new staged anchor re-parented to the new revision.
@@ -1522,6 +1588,24 @@ async fn finalize_commit(
     .send();
 
     Ok(())
+}
+
+/// Hands `committed` to `operation`, whose provider holds its state, once the stores are flushed
+/// ([`InstanceOperation::committed`]). The provider may then drop the copies it kept of the files
+/// the commit read, which only a revision on disk replaces after a crash.
+async fn hand_over_committed(
+    repository: &Arc<RepositoryContext>,
+    operation: &InstanceOperationImpl,
+    committed: &Arc<State>,
+) -> Result<(), CommitError> {
+    repository
+        .flush(execution_context().globals().sync_data())
+        .await
+        .forward_any::<CommitError>("flushing the commit")?;
+    operation
+        .committed(repository.clone(), committed.clone())
+        .await
+        .forward::<CommitError>("handing the provider the committed revision")
 }
 
 /// Where a layer's commit starts: the node its configured source path names in the state being
@@ -1604,10 +1688,11 @@ async fn commit_staged_revision(
     let tracker = immutable::commit_write_tracker(reporting.per_fragment);
 
     let work_tracker = tracker.clone();
-    let modified_times = Arc::new(RecordedModifiedTimes::default());
-    let collected = modified_times.clone();
     let operation = operation.clone();
     let work_result: Result<(Hash, Arc<RecordedModifiedTimes>), CommitError> = async move {
+        let collected = Arc::new(RecordedModifiedTimes::below(
+            operation.clock_floor(&repository).await,
+        ));
         // For each file in repository, create fragments if they don't already
         // exist. Also rehash directories affected by change and generate new
         // root hash.
@@ -1830,13 +1915,7 @@ pub(crate) async fn commit_files_and_rehash(
         })
     };
 
-    let (producer_result, consumer_result) = tokio::join!(producer, consumer);
-    producer_result
-        .internal("Recursion task failed")
-        .map_err(CommitError::from)??;
-    consumer_result
-        .internal("Recursion task failed")
-        .map_err(CommitError::from)??;
+    join_commit_tasks(producer, consumer).await?;
 
     commit_discard_subnodes(
         repository.clone(),
@@ -1893,7 +1972,9 @@ pub(crate) async fn rehash_tree_in_operation(
     branch: BranchId,
 ) -> Result<Arc<RecordedModifiedTimes>, CommitError> {
     let tracker = Arc::new(lore_storage::write_tracker::WriteTracker::new());
-    let modified_times = Arc::new(RecordedModifiedTimes::default());
+    let modified_times = Arc::new(RecordedModifiedTimes::below(
+        crate::state::read_clock_floor(&repository).await,
+    ));
     let rehashed = with_operation(repository.file_system(), async |operation| {
         commit_files_and_rehash(
             operation,
@@ -2073,14 +2154,7 @@ impl CommitFrame {
     /// Leaves the directory, counting it when a child of it was committed or discarded.
     fn leave(self, stats: &CommitStats) {
         if self.updated {
-            stats
-                .complete
-                .directory_count
-                .fetch_add(1, Ordering::Relaxed);
-            stats
-                .complete
-                .directory_total
-                .fetch_add(1, Ordering::Relaxed);
+            stats.count_directory();
         }
     }
 }
@@ -2313,7 +2387,7 @@ async fn commit_discard_subnodes(
                     true,
                     move |_discarded_node_id, flags| {
                         if flags & NodeFlags::File != 0 {
-                            stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
+                            stats.complete.file_count.fetch_add(1, Ordering::Release);
                             stats
                                 .complete
                                 .file_delete_count
@@ -2322,7 +2396,7 @@ async fn commit_discard_subnodes(
                             stats
                                 .complete
                                 .directory_count
-                                .fetch_add(1, Ordering::Relaxed);
+                                .fetch_add(1, Ordering::Release);
                             stats
                                 .complete
                                 .directory_delete_count
@@ -2382,7 +2456,7 @@ async fn commit_discard(
             move |discarded_node_id, flags| {
                 delta_add(delta.clone(), discarded_node_id, flags);
                 if flags & NodeFlags::File != 0 {
-                    stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
+                    stats.complete.file_count.fetch_add(1, Ordering::Release);
                     stats
                         .complete
                         .file_delete_count
@@ -2391,7 +2465,7 @@ async fn commit_discard(
                     stats
                         .complete
                         .directory_count
-                        .fetch_add(1, Ordering::Relaxed);
+                        .fetch_add(1, Ordering::Release);
                     stats
                         .complete
                         .directory_delete_count
@@ -2444,6 +2518,25 @@ fn collect_commit_task(
     {
         *failure = Some(err);
     }
+}
+
+/// Waits for a commit's discovery task and the task fragmenting the files it finds, and reports a
+/// failure to fragment a file ahead of a failure in discovery. Discovery fails once fragmenting
+/// stops taking files, so its error is then a result of the failure to fragment.
+#[lore_macro::test_pub]
+async fn join_commit_tasks(
+    discovery: JoinHandle<Result<(), CommitError>>,
+    fragmenting: JoinHandle<Result<(), CommitError>>,
+) -> Result<(), CommitError> {
+    let (discovery, fragmenting) = tokio::join!(discovery, fragmenting);
+    let discovery = discovery
+        .internal("Recursion task failed")
+        .map_err(CommitError::from)?;
+    let fragmenting = fragmenting
+        .internal("Recursion task failed")
+        .map_err(CommitError::from)?;
+    fragmenting?;
+    discovery
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2525,8 +2618,9 @@ async fn info_before_fragmenting(
     Ok(info)
 }
 
-/// Commits one file node, recording the modified time it read the file at. A view-excluded
-/// path records nothing: its content is taken from the staged node rather than disk.
+/// Commits one file node, recording the modified time it read the file at and telling the
+/// operation what it stored ([`InstanceOperation::stored`]). A view-excluded path records and
+/// tells nothing: its content is taken from the staged node rather than disk.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -2552,19 +2646,32 @@ fn commit_file(
 
         debug_assert!(node.is_file());
 
+        // A sparse checkout has no working-tree file for a view-excluded path, so
+        // the staged content hash is the only source and no markers are read.
+        // Re-fragmenting would read a file that is absent or stale.
+        //
+        // This test must stay identical to the one realize gates disk writes on
+        // (`fs/realize.rs`), because that is what decided whether the file was
+        // written.
+        let excluded = repository
+            .filter
+            .excludes_tree(&relative_path, false, FilterMode::View);
+
         if node.is_staged_merge_conflict() {
             reject_unresolved_conflict(&node, relative_path.as_str())?;
-            // Check if file has conflict markers remaining
-            if infer::infer_is_conflicted(&operation.content_source(&relative_path))
-                .await
-                .internal_with(|| format!("Failed reading file {}", relative_path.as_str()))?
+            if !excluded
+                && operation
+                    .infer_is_conflicted(&relative_path)
+                    .await
+                    .forward_with::<CommitError, _>(|| {
+                        format!("checking {relative_path} for conflict markers")
+                    })?
             {
                 return Err(Conflict {
                     path: relative_path.as_str().to_string(),
                 }
                 .into());
             }
-            // Clean up theirs/base files
             if !execution_context().globals().dry_run() {
                 sync::unlink_merge_artifacts(&operation, &relative_path).await;
             }
@@ -2577,56 +2684,48 @@ fn commit_file(
             node.flags
         );
 
-        // A sparse checkout has no working-tree file for a view-excluded path, so
-        // the staged content hash is the only source. Re-fragmenting would read a
-        // file that is absent or stale.
-        //
-        // This test must stay identical to the one realize gates disk writes on
-        // (`fs/realize.rs`), because that is what decided whether the file was
-        // written.
-        let (address, content_size, mode, modified_time) =
-            if repository
-                .filter
-                .excludes_tree(&relative_path, false, FilterMode::View)
-            {
-                (node.address, node.size, node.mode, None)
-            } else {
-                if node.address.context.is_zero() {
-                    // TODO(mjansson): Optionally find previous identical file content and deduplicate by using same context
-                    node.address.context = uuid::Uuid::now_v7().into();
-                    lore_trace!(
-                        "Generate file ID for file: {} {}",
-                        relative_path.as_str(),
-                        node.address.context
-                    );
-                }
+        let (address, content_size, mode, modified_time) = if excluded {
+            (node.address, node.size, node.mode, None)
+        } else {
+            if node.address.context.is_zero() {
+                // TODO(mjansson): Optionally find previous identical file content and deduplicate by using same context
+                node.address.context = uuid::Uuid::now_v7().into();
+                lore_trace!(
+                    "Generate file ID for file: {} {}",
+                    relative_path.as_str(),
+                    node.address.context
+                );
+            }
 
-                let info = info_before_fragmenting(&operation, &relative_path).await?;
+            let info = info_before_fragmenting(&operation, &relative_path).await?;
 
-                let (address, size_content) = immutable::write_from_file_with_tracker(
-                    repository.clone(),
-                    &operation.content_source(&relative_path),
-                    node.address.context,
-                    immutable::write_options_from_repository(repository.clone()),
-                    Some(tracker),
-                )
+            let source = operation
+                .content_source(&relative_path)
                 .await
                 .forward_with::<CommitError, _>(|| {
-                    format!(
-                        "Failed writing file {} to immutable store",
-                        relative_path.as_str()
-                    )
+                    format!("naming the content of {relative_path}")
                 })?;
-
-                stats.file_read(size_content);
-
-                (
-                    address,
-                    size_content,
-                    info.mode(node.mode),
-                    Some(info.mtime()),
+            let (address, size_content) = immutable::write_from_file_with_tracker(
+                repository.clone(),
+                &source,
+                node.address.context,
+                immutable::write_options_from_repository(repository.clone()),
+                Some(tracker),
+            )
+            .await
+            .forward_with::<CommitError, _>(|| {
+                format!(
+                    "Failed writing file {} to immutable store",
+                    relative_path.as_str()
                 )
-            };
+            })?;
+
+            stats.file_read(size_content);
+            let mode = info.mode(node.mode);
+            operation.stored(&relative_path, address, size_content, mode);
+
+            (address, size_content, mode, Some(info.mtime()))
+        };
 
         let modified = util::fs::mode_changed(node.mode, mode)
             || node.size != content_size
@@ -2694,7 +2793,7 @@ fn commit_file(
             modified_times.record(&repository, &relative_path, modified_time);
         }
 
-        stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
+        stats.complete.file_count.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -2865,6 +2964,9 @@ async fn commit_link(
     lore_debug!("Committing link node {node_id} at {relative_path}");
 
     prune_dirty_for_commit(state.clone(), repository.clone()).await?;
+    let link_modified_times = Arc::new(RecordedModifiedTimes::below(
+        operation.clock_floor(&repository).await,
+    ));
 
     // Observed before any write, so the pointer write below compares against the
     // tip this commit was built on rather than one a racing committer published.
@@ -2878,7 +2980,6 @@ async fn commit_link(
     // success do we emit the event. `Ok(None)` signals the "unchanged link"
     // case — no new revision, no event.
     let work_tracker = link_tracker.clone();
-    let link_modified_times = Arc::new(RecordedModifiedTimes::default());
     let work_result: Result<Option<Hash>, CommitError> = {
         let repository = repository.clone();
         let state = state.clone();
@@ -2945,13 +3046,7 @@ async fn commit_link(
                 })
             };
 
-            let (producer_result, consumer_result) = tokio::join!(producer, consumer);
-            producer_result
-                .internal("Recursion task failed")
-                .map_err(CommitError::from)??;
-            consumer_result
-                .internal("Recursion task failed")
-                .map_err(CommitError::from)??;
+            join_commit_tasks(producer, consumer).await?;
 
             commit_discard_subnodes(
                 repository.clone(),
@@ -4381,8 +4476,7 @@ async fn freeze_directory(
 
             delta_add(delta.clone(), child_node_id, child_node.flags);
             freeze_node(repository.clone(), state.clone(), child_node_id).await?;
-            stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
-            stats.complete.file_total.fetch_add(1, Ordering::Relaxed);
+            stats.count_file();
             stats
                 .complete
                 .file_modify_count
@@ -4393,14 +4487,7 @@ async fn freeze_directory(
         pending[first_subdirectory..].reverse();
 
         if updated {
-            stats
-                .complete
-                .directory_count
-                .fetch_add(1, Ordering::Relaxed);
-            stats
-                .complete
-                .directory_total
-                .fetch_add(1, Ordering::Relaxed);
+            stats.count_directory();
         }
     }
 

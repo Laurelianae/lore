@@ -13,11 +13,11 @@ use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::branch;
 use crate::change;
 use crate::errors::*;
@@ -31,7 +31,6 @@ use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::hash;
-use crate::infer::infer_is_conflicted;
 use crate::interface::LoreArray;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
@@ -43,6 +42,7 @@ use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_error;
+use crate::lore_limit_drain_tasks;
 use crate::lore_trace;
 use crate::node::INVALID_NODE;
 use crate::node::Node;
@@ -55,12 +55,11 @@ use crate::node::ROOT_NODE;
 use crate::path::emit_path_ignore;
 use crate::progress::max_concurrent_stage_directory_tasks;
 use crate::repository::BASE_SUFFIX;
-use crate::repository::DOT_LORE;
-use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::TEMP_FILE_EXTENSION;
 use crate::repository::THEIRS_SUFFIX;
+use crate::repository::is_reserved_node_name;
 use crate::revision::sync;
 use crate::revision::sync::SyncRealizeStats;
 use crate::state;
@@ -75,7 +74,7 @@ use crate::util::path::RelativePathBuf;
 
 /// Data for the event emitted when a stage operation begins.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileStageBeginEventData {
     /// Number of paths requested for staging.
@@ -84,7 +83,7 @@ pub struct LoreFileStageBeginEventData {
 
 /// Running counts of items processed during a stage operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileStageCountData {
     /// Number of directories staged as modified.
@@ -140,7 +139,7 @@ impl LoreFileStageCountData {
 
 /// Data for the progress event emitted periodically during a stage operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileStageProgressEventData {
     /// Current counts of items processed.
@@ -149,7 +148,7 @@ pub struct LoreFileStageProgressEventData {
 
 /// Data for the event emitted when a stage operation completes.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileStageEndEventData {
     /// Final counts of items processed.
@@ -158,7 +157,7 @@ pub struct LoreFileStageEndEventData {
 
 /// Data for the event identifying the repository and revision involved in a stage operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileStageRevisionEventData {
     /// Identifier of the repository.
@@ -169,7 +168,7 @@ pub struct LoreFileStageRevisionEventData {
 
 /// Data for the event emitted for each file affected by a stage operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileStageFileEventData {
     /// Previous path of the file, when it was moved, relative to the root of the working tree.
@@ -1175,9 +1174,14 @@ pub(crate) async fn stage_merge_path(
         let mut merge_flags = NodeFlags::StagedMerge;
 
         if sync::exist_merge_artifacts(&operation, change.path()).await
-            || infer_is_conflicted(&operation.content_source(change.path()))
-                .await
-                .unwrap_or_default()
+            || (change.action != change::FileAction::Delete
+                && change.to.flags.contains(NodeFlags::File)
+                && operation
+                    .infer_is_conflicted(change.path())
+                    .await
+                    .forward_with::<StageError, _>(|| {
+                        format!("checking {} for conflict markers", change.path())
+                    })?)
         {
             lore_debug!(
                 "Merge change filesystem state is conflicted: {}",
@@ -1803,7 +1807,13 @@ pub(crate) async fn stage_directory(
     // result depending on iteration order.
     let mut items: Vec<DirectoryEntry> = Vec::new();
     while let Some(item) = file_list.next().await {
-        items.push(item.forward_any::<StageError>("Unusable directory entry")?);
+        let item = item.forward_any::<StageError>("Unusable directory entry")?;
+        // The repository's own directory is not content, so it takes no part in the case
+        // resolution below, which moves what the losers of a collision hold on disk.
+        if is_reserved_node_name(&item.name) {
+            continue;
+        }
+        items.push(item);
     }
 
     resolve_case_variant_collisions(
@@ -2057,11 +2067,12 @@ pub(crate) async fn stage_directory(
             break;
         }
         let node_name = match state
-            .node_name_ref(repository.clone(), child)
+            .node_name_ref_or_skip(repository.clone(), child)
             .await
             .forward::<StageError>("Failed to resolve node name")
         {
-            Ok(node_name) => node_name,
+            Ok(Some(node_name)) => node_name,
+            Ok(None) => continue,
             Err(err) => {
                 failure = Some(err);
                 break;
@@ -2388,7 +2399,7 @@ pub(crate) async fn stage_node_from_metadata(
         });
     }
 
-    if name == DOT_URC || name == DOT_LORE {
+    if is_reserved_node_name(&name) {
         lore_trace!("Ignore dot directory {name}");
         return Ok(StagedChild::invalid());
     }
@@ -2986,6 +2997,15 @@ pub(crate) async fn stage_from_parent_revision(
     .await
 }
 
+/// Stages `paths` from the revision `merge_parent` names: a file is restored and staged here,
+/// and a directory's changes are found and staged by [`stage_from_parent_state`], in a task per
+/// directory.
+///
+/// The directory tasks and the change tasks below them draw on one budget of
+/// [`MAX_CONCURRENT_TREE_TASKS`] permits, so that many tasks are live at most whatever the shape
+/// of the resolved tree. A directory waits for a permit here, where nothing waited on needs one;
+/// a change below a directory runs inline when none is free, since the directory's task holds
+/// one itself.
 async fn stage_from_parent_revision_in_operation(
     operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
@@ -3165,6 +3185,11 @@ async fn stage_from_parent_revision_in_operation(
     }
 
     let stats = Arc::new(StageStats::default());
+    #[cfg(not(feature = "test-util"))]
+    let permits = MAX_CONCURRENT_TREE_TASKS;
+    #[cfg(feature = "test-util")]
+    let permits = resolve_tasks::budget();
+    let budget = Arc::new(Semaphore::new(permits));
     let mut tasks = JoinSet::new();
     let dispatch_result: Result<(), StageError> = async {
         for relative_path in resolved_paths {
@@ -3443,13 +3468,22 @@ async fn stage_from_parent_revision_in_operation(
                     sync::unlink_merge_artifacts(&operation, &relative_path).await;
                 }
             } else {
+                let permit = budget.clone().acquire_owned().await.map_err(|err| {
+                    StageError::internal_with_context(err, "The task budget is closed")
+                })?;
+                #[cfg(feature = "test-util")]
+                let live = resolve_tasks::Live::enter();
                 lore_spawn!(tasks, {
                     let operation = operation.clone();
                     let repository = repository.clone();
                     let state = state.clone();
                     let state_target = state_target.clone();
                     let stats = stats.clone();
+                    let budget = budget.clone();
                     async move {
+                        let _permit = permit;
+                        #[cfg(feature = "test-util")]
+                        let _live = live;
                         stage_from_parent_state(
                             operation,
                             repository.clone(),
@@ -3460,10 +3494,18 @@ async fn stage_from_parent_revision_in_operation(
                             target_node_link.node,
                             options,
                             stats,
+                            budget,
                         )
                         .await
                     }
                 });
+                // Reaps the tasks that have finished and stops dispatch at the first failure;
+                // the budget is what bounds the tasks live.
+                lore_limit_drain_tasks!(
+                    tasks,
+                    MAX_CONCURRENT_TREE_TASKS,
+                    StageError::internal("Failed to join task")
+                )?;
             }
         }
         Ok::<(), StageError>(())
@@ -3897,6 +3939,11 @@ async fn stage_realized_delete(
     .await
 }
 
+/// Finds the changes between the working tree and `state_target` below `relative_path`, restores
+/// the target's content, and stages each change in a task drawn from `budget`, the budget shared
+/// with the directory tasks of [`stage_from_parent_revision_in_operation`]. A change runs inline
+/// when no permit is free, never waiting for one: this task holds a permit itself, and directory
+/// tasks each waiting for a permit a change needs would wait on each other.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stage_from_parent_state(
     operation: Arc<InstanceOperationImpl>,
@@ -3908,6 +3955,7 @@ pub(crate) async fn stage_from_parent_state(
     node_id_target: NodeID,
     options: StageOptions,
     stats: Arc<StageStats>,
+    budget: Arc<Semaphore>,
 ) -> Result<(), StageError> {
     let block_index = NodeBlock::index(node_id_target);
     let node_index = Node::index(node_id_target);
@@ -4031,7 +4079,9 @@ pub(crate) async fn stage_from_parent_state(
             let stats = stats.clone();
             let file_path = change.path().clone();
             let operation = operation.clone();
-            lore_spawn!(tasks, async move {
+            let stage_change = async move {
+                #[cfg(feature = "test-util")]
+                resolve_tasks::wait_if_held().await;
                 let info = operation
                     .file_info(&file_path)
                     .await
@@ -4061,7 +4111,26 @@ pub(crate) async fn stage_from_parent_state(
                 )
                 .await
                 .map(|_| ())
-            });
+            };
+            if let Ok(permit) = budget.clone().try_acquire_owned() {
+                #[cfg(feature = "test-util")]
+                let live = resolve_tasks::Live::enter();
+                lore_spawn!(tasks, async move {
+                    let _permit = permit;
+                    #[cfg(feature = "test-util")]
+                    let _live = live;
+                    stage_change.await
+                });
+            } else {
+                stage_change.await?;
+            }
+            // Reaps the tasks that have finished and stops dispatch at the first failure; the
+            // budget is what bounds the tasks live.
+            lore_limit_drain_tasks!(
+                tasks,
+                MAX_CONCURRENT_TREE_TASKS,
+                StageError::internal("Failed to join task")
+            )?;
         }
         Ok::<(), StageError>(())
     }
@@ -4078,4 +4147,100 @@ pub(crate) async fn stage_from_parent_state(
         };
     }
     final_result
+}
+
+/// Counts the tasks one-side resolutions have live, for a test to read the peak, and holds
+/// every change they stage until released, so a test can see the tasks pile up. Per process,
+/// so a test using this runs alone in its binary.
+#[cfg(feature = "test-util")]
+pub mod resolve_tasks {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use tokio::sync::Notify;
+
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+    static SPAWNED: AtomicUsize = AtomicUsize::new(0);
+    static HELD: AtomicBool = AtomicBool::new(false);
+    static RELEASED: Notify = Notify::const_new();
+    static BUDGET: AtomicUsize = AtomicUsize::new(crate::MAX_CONCURRENT_TREE_TASKS);
+
+    /// Zeroes the counts and restores the budget.
+    pub fn reset() {
+        LIVE.store(0, Ordering::Relaxed);
+        PEAK.store(0, Ordering::Relaxed);
+        SPAWNED.store(0, Ordering::Relaxed);
+        BUDGET.store(crate::MAX_CONCURRENT_TREE_TASKS, Ordering::Relaxed);
+    }
+
+    /// Sizes the budget the next resolution runs under, so a test can exceed it with a small
+    /// tree. [`crate::MAX_CONCURRENT_TREE_TASKS`] until set.
+    pub fn set_budget(permits: usize) {
+        BUDGET.store(permits, Ordering::Relaxed);
+    }
+
+    /// The permits a resolution's budget holds.
+    pub(crate) fn budget() -> usize {
+        BUDGET.load(Ordering::Relaxed)
+    }
+
+    /// Stops every change about to be staged until [`release`] is called.
+    pub fn hold() {
+        HELD.store(true, Ordering::Release);
+    }
+
+    /// Lets the changes [`hold`] stopped go on.
+    pub fn release() {
+        HELD.store(false, Ordering::Release);
+        RELEASED.notify_waiters();
+    }
+
+    /// Waits while a hold is on. The wakeup is registered before the flag is read, so a
+    /// release between the two is not missed.
+    pub(crate) async fn wait_if_held() {
+        loop {
+            let released = RELEASED.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if !HELD.load(Ordering::Acquire) {
+                return;
+            }
+            released.await;
+        }
+    }
+
+    /// The tasks live now.
+    pub fn live() -> usize {
+        LIVE.load(Ordering::Relaxed)
+    }
+
+    /// The most tasks live at once since the last reset.
+    pub fn peak() -> usize {
+        PEAK.load(Ordering::Relaxed)
+    }
+
+    /// The tasks spawned since the last reset.
+    pub fn spawned() -> usize {
+        SPAWNED.load(Ordering::Relaxed)
+    }
+
+    /// A task counted as live from its spawn until this is dropped.
+    pub(crate) struct Live;
+
+    impl Live {
+        pub(crate) fn enter() -> Self {
+            SPAWNED.fetch_add(1, Ordering::Relaxed);
+            let live = LIVE.fetch_add(1, Ordering::AcqRel) + 1;
+            PEAK.fetch_max(live, Ordering::AcqRel);
+            Live
+        }
+    }
+
+    impl Drop for Live {
+        fn drop(&mut self) {
+            LIVE.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
