@@ -157,6 +157,7 @@ class FakeOidcIdp:
         self.grant_hits: collections.Counter[str] = collections.Counter()
         self.exchange_requests: list[dict[str, str]] = []
         self.device_requests: list[dict[str, str]] = []
+        self.revocation_requests: list[dict[str, str]] = []
 
     # -- lifecycle -------------------------------------------------------
 
@@ -207,6 +208,7 @@ class FakeOidcIdp:
             self.grant_hits.clear()
             self.exchange_requests.clear()
             self.device_requests.clear()
+            self.revocation_requests.clear()
 
     def set_claims(self, claims: dict) -> None:
         """Replaces the claims merged into every minted access token."""
@@ -289,7 +291,7 @@ class FakeOidcIdp:
 
     # -- request handling (called from the HTTP thread) ------------------
 
-    def handle(self, path: str, params: dict[str, str]) -> tuple[int, dict]:
+    def handle(self, path: str, params: dict[str, str]) -> tuple[int, dict | None]:
         with self._lock:
             self.path_hits[path] += 1
             if path == "/.well-known/openid-configuration":
@@ -298,11 +300,17 @@ class FakeOidcIdp:
                     "token_endpoint": f"{self.issuer}/token",
                     "jwks_uri": self.jwks_url,
                     "device_authorization_endpoint": f"{self.issuer}/device",
+                    "revocation_endpoint": f"{self.issuer}/revoke",
                 }
             if path == "/jwks":
                 return 200, self.jwks()
             if path == "/device":
                 return self._handle_device(params)
+            if path == "/revoke":
+                # RFC 7009 §2.2: a bare 200 with an empty body, even for an
+                # unknown token.
+                self.revocation_requests.append(dict(params))
+                return 200, None
             if path == "/token":
                 return self._handle_token(params)
             return 404, {"error": "not_found"}
@@ -392,8 +400,8 @@ class _IdpRequestHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b""
         return _form_params(body) if body else {}
 
-    def _answer(self, status: int, payload: dict) -> None:
-        body = json.dumps(payload).encode("utf-8")
+    def _answer(self, status: int, payload: dict | None) -> None:
+        body = json.dumps(payload).encode("utf-8") if payload is not None else b""
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -638,6 +646,38 @@ def test_expired_token_is_renewed_by_the_refresh_grant(oidc_env, oidc_actor):
         "an expired token must be renewed through the refresh grant"
     )
     assert idp.last_refresh_token is not None
+
+
+@pytest.mark.smoke
+def test_logout_revokes_tokens_at_the_provider(oidc_env, oidc_actor):
+    """`auth logout` posts the stored access and refresh tokens to the
+    advertised revocation endpoint and still clears the local store."""
+    idp = oidc_env.idp
+    actor = oidc_actor("logout")
+    # The Tier 1 global-grants authorizer reads `groups` from the token;
+    # repository creation below needs the grant.
+    idp.set_claims({"groups": ["admin"]})
+    scratch = actor.make_repo()
+    login_interactive(scratch, oidc_env.remote_url)
+    refresh = idp.last_refresh_token
+
+    # `auth logout` resolves the endpoint from the repository's remote
+    # environment, so the repository is created here — after the login
+    # that authenticates its creation — against the same actor's token
+    # store.
+    repo = actor.make_repo(
+        repo_id=f"oidc-logout-{uuid.uuid4().hex[:8]}", create_repo=True
+    )
+
+    output = repo.run(urc_args=["auth", "logout"])
+    assert "Logged out" in output
+    assert idp.hits("/revoke") == 2, "both the access and the refresh token are revoked"
+    revoked = {r["token_type_hint"]: r["token"] for r in idp.revocation_requests}
+    assert revoked["refresh_token"] == refresh
+    assert revoked["access_token"], "the authentication token is revoked too"
+
+    listing = repo.run(urc_args=["auth", "list"])
+    assert USER_ID not in listing, "logout clears the local store"
 
 
 @pytest.fixture(scope="function")

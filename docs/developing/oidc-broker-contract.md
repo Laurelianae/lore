@@ -5,7 +5,7 @@ description: The exact HTTP behavior the Aidonia broker must serve so Lore clien
 
 # OIDC broker contract
 
-This is the synchronization artifact for the Aidonia broker: the HTTP surface it must serve to act as the issuer a Lore server advertises under `[server.auth]` + `[server.auth.oidc]`. The client side of every requirement below is implemented in the fork ([`lore-transport/src/auth/oidc/backend.rs`](../../lore-transport/src/auth/oidc/backend.rs)) and exercised against a fake provider with the same contract in [`lore-transport/tests/support/oidc_provider.rs`](../../lore-transport/tests/support/oidc_provider.rs) and `scripts/test/test_auth_oidc.py`. The design is the approved LEP, [OIDC/OAuth2 authentication](../proposals/2026-08-20-oidc-oauth2-authentication.md); the fork patches are LP-011 (device grant, refresh, dispatch) and LP-012 (RFC 8693 exchange) in the [upstream patch register](upstream-patches.md).
+This is the synchronization artifact for the Aidonia broker: the HTTP surface it must serve to act as the issuer a Lore server advertises under `[server.auth]` + `[server.auth.oidc]`. The client side of every requirement below is implemented in the fork ([`lore-transport/src/auth/oidc/backend.rs`](../../lore-transport/src/auth/oidc/backend.rs)) and exercised against a fake provider with the same contract in [`lore-transport/tests/support/oidc_provider.rs`](../../lore-transport/tests/support/oidc_provider.rs) and `scripts/test/test_auth_oidc.py`. The design is the approved LEP, [OIDC/OAuth2 authentication](../proposals/2026-08-20-oidc-oauth2-authentication.md); the fork patches are LP-011 (device grant, refresh, dispatch), LP-012 (RFC 8693 exchange), and LP-013 (RFC 7009 revocation on logout) in the [upstream patch register](upstream-patches.md).
 
 Until the broker serves this contract, the fake provider is the reference behavior: `scripts/test/test_auth_oidc.py` is the executable form of everything below, and the manual broker checklist at the end replays the same scenarios against the real broker.
 
@@ -18,12 +18,13 @@ Serving `GET <issuer>/.well-known/openid-configuration` with `Content-Type: appl
   "issuer": "<issuer>",
   "token_endpoint": "<issuer>/token",
   "jwks_uri": "<issuer>/jwks",
-  "device_authorization_endpoint": "<issuer>/device"
+  "device_authorization_endpoint": "<issuer>/device",
+  "revocation_endpoint": "<issuer>/revoke"
 }
 ```
 
 - `issuer` MUST equal the URL the document was fetched from, exactly (scheme, host, port, path). A mismatch fails the login with an issuer-mismatch error.
-- `token_endpoint` and `device_authorization_endpoint` MUST be present. `revocation_endpoint` and `end_session_endpoint` are optional (the client does not call them yet).
+- `token_endpoint` and `device_authorization_endpoint` MUST be present. `revocation_endpoint` SHOULD be present: without it `lore auth logout` cannot revoke anything and stays local-only (§6). `end_session_endpoint` is optional and currently unused — RP-initiated logout is a browser flow the CLI never starts.
 - Every URL in the document MUST be `https`, or plain `http` to a loopback host (this is what permits the local test broker).
 - The client caches the document per issuer; the broker MAY serve it statically. Redirects are followed only within the issuer's origin.
 
@@ -114,7 +115,27 @@ The broker MUST:
 
 The client runs its own domain check on the minted token against the remote it is talking to, so a minted token that lacks the deployment domain is rejected client-side even if the broker accepted the exchange.
 
-## 6. Checklist for the broker sync
+## 6. Revocation (RFC 7009)
+
+When discovery advertises `revocation_endpoint`, `lore auth logout` posts each removed identity's tokens to it, so credentials die at the broker instead of only disappearing from the client's store. Without the field, logout stays local-only — nothing is called, nothing is reported.
+
+`POST <revocation_endpoint>`, form-encoded:
+
+| Parameter | Value |
+| --- | --- |
+| `token` | The token to invalidate |
+| `token_type_hint` | `refresh_token` (sent first) or `access_token` |
+| `client_id` | The server-advertised client ID; the client is public and sends no secret |
+
+The broker MUST:
+
+- answer `200` with an empty body even for a token it does not recognize or has already invalidated (RFC 7009 §2.2). The client reads only the status; anything outside 2xx is reported to the user as a non-fatal logout error.
+- treat `token_type_hint` as advisory (RFC 7009 §2.1): the token is inspected regardless of the hint.
+- invalidate the access tokens minted from a grant whose refresh token is revoked (RFC 7009 §2.1). The client revokes both tokens anyway, so the grant dies even where this is not implemented.
+
+Revocation is best-effort end to end: a failing or unreachable endpoint never blocks logout, never changes the exit code, and the local store is cleared regardless.
+
+## 7. Checklist for the broker sync
 
 Run once the broker is ready, with the broker advertised from a `[server.auth]`-configured lore-server and `LORE_AUTH_MODE=oidc` (or `--auth-mode oidc`):
 
@@ -124,5 +145,6 @@ Run once the broker is ready, with the broker advertised from a `[server.auth]`-
 4. A token minted with a short `exp` is renewed by the next operation; the broker saw the `refresh_token` grant, and the presented refresh token is not re-presentable.
 5. `lore login --token-type api-key --no-browser` exchanges the API key for an authentication token.
 6. A token minted without any root-domain source fails the login or the exchange (fail-closed check).
+7. `lore auth logout` sends exactly two revocation posts per identity (hints `refresh_token` then `access_token`), still prints `Logged out` even when the endpoint answers an error, and `lore auth list` no longer shows the identity.
 
-Scenarios 1–4 and 6 are automated against the fake provider in `scripts/test/test_auth_oidc.py`; run the same script with the broker's issuer to use it as the harness for the real sync.
+Scenarios 1–4, 6, and 7 are automated against the fake provider in `scripts/test/test_auth_oidc.py`; run the same script with the broker's issuer to use it as the harness for the real sync.

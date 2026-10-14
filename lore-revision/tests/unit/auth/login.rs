@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lore_base::error::NotAuthenticated;
+use lore_base::error::NotSupported;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::RepositoryId;
 use lore_revision::auth::LoreAuthPendingEventData;
@@ -142,6 +143,18 @@ impl Authentication for ScriptedAuth {
         _correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError> {
         Err(ProtocolError::internal("the stub only serves polls"))
+    }
+
+    async fn revoke_token(
+        &self,
+        _auth_url: &str,
+        _token: &str,
+        _token_type_hint: &str,
+        _correlation_id: &str,
+    ) -> Result<(), ProtocolError> {
+        Err(ProtocolError::from(NotSupported {
+            operation: "revoke_token".into(),
+        }))
     }
 
     async fn exchange_for_repository(

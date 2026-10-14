@@ -555,3 +555,54 @@ async fn the_external_token_exchange_maps_the_token_type() {
         "{error}"
     );
 }
+
+#[tokio::test]
+async fn the_revocation_endpoint_receives_the_token_and_hint() {
+    let idp = spawn_token_provider().await;
+    let backend = OidcAuthentication::new(oidc(idp.issuer()));
+
+    backend
+        .revoke_token(idp.issuer(), "refresh-1", "refresh_token", "")
+        .await
+        .expect("the advertised revocation endpoint answers 200");
+    assert_eq!(idp.hits("/revoke"), 1);
+    let revocation = idp.last_revocation();
+    assert_eq!(
+        revocation.get("token").map(String::as_str),
+        Some("refresh-1"),
+    );
+    assert_eq!(
+        revocation.get("token_type_hint").map(String::as_str),
+        Some("refresh_token"),
+    );
+    assert_eq!(
+        revocation.get("client_id").map(String::as_str),
+        Some("lore-client"),
+    );
+}
+
+#[tokio::test]
+async fn a_provider_without_a_revocation_endpoint_makes_revocation_a_no_op() {
+    let idp = spawn_token_provider().await;
+    idp.omit_revocation_endpoint();
+    let backend = OidcAuthentication::new(oidc(idp.issuer()));
+
+    backend
+        .revoke_token(idp.issuer(), "refresh-1", "refresh_token", "")
+        .await
+        .expect("nothing advertised, nothing to call");
+    assert_eq!(idp.hits("/revoke"), 0);
+}
+
+#[tokio::test]
+async fn a_failing_revocation_answer_is_an_error() {
+    let idp = spawn_token_provider().await;
+    idp.fail_revocation();
+    let backend = OidcAuthentication::new(oidc(idp.issuer()));
+
+    let error = backend
+        .revoke_token(idp.issuer(), "refresh-1", "refresh_token", "")
+        .await
+        .expect_err("a failing revocation is a reportable failure");
+    assert!(error.to_string().contains("HTTP 503"), "{error}");
+}

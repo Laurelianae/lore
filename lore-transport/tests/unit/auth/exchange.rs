@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use lore_base::error::NotSupported;
 use lore_base::types::RepositoryId;
 use lore_transport::auth::authentication;
 use lore_transport::auth::exchange::*;
@@ -243,6 +244,18 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
             ))
         }
 
+        async fn revoke_token(
+            &self,
+            _auth_url: &str,
+            _token: &str,
+            _token_type_hint: &str,
+            _correlation_id: &str,
+        ) -> Result<(), ProtocolError> {
+            Err(ProtocolError::from(NotSupported {
+                operation: "revoke_token".into(),
+            }))
+        }
+
         async fn exchange_for_custom_resource(
             &self,
             _auth_url: &str,
@@ -349,6 +362,18 @@ async fn an_expired_stored_token_is_renewed_through_its_refresh_token() {
                 refresh_token: Some(format!("rotated-{count}")),
                 scope: None,
             })
+        }
+
+        async fn revoke_token(
+            &self,
+            _auth_url: &str,
+            _token: &str,
+            _token_type_hint: &str,
+            _correlation_id: &str,
+        ) -> Result<(), ProtocolError> {
+            Err(ProtocolError::from(NotSupported {
+                operation: "revoke_token".into(),
+            }))
         }
 
         async fn exchange_for_repository(

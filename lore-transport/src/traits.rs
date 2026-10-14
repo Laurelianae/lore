@@ -436,6 +436,17 @@ pub trait Authentication: Send + Sync {
         correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError>;
 
+    /// Revokes a token at the provider (RFC 7009 §2.1), where the backend
+    /// supports it. `token_type_hint` is `access_token` or `refresh_token`.
+    /// A backend without a revocation surface answers `NotSupported`.
+    async fn revoke_token(
+        &self,
+        auth_url: &str,
+        token: &str,
+        token_type_hint: &str,
+        correlation_id: &str,
+    ) -> Result<(), ProtocolError>;
+
     /// Exchanges an authentication token for an authorization token scoped
     /// to the given repository.
     async fn exchange_for_repository(

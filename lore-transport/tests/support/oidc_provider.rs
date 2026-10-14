@@ -166,7 +166,6 @@ struct DeviceSession {
 }
 
 /// The state the fake token provider carries between requests.
-#[derive(Default)]
 pub struct FakeIdpState {
     device: DeviceSession,
     device_counter: u32,
@@ -181,8 +180,34 @@ pub struct FakeIdpState {
     opaque_access_token: bool,
     /// Request params of the last token-exchange grant, for assertions.
     last_exchange: BTreeMap<String, String>,
+    /// Request params of the last revocation request, for assertions.
+    last_revocation: BTreeMap<String, String>,
+    /// Whether discovery advertises the revocation endpoint.
+    advertise_revocation: bool,
+    /// Whether the revocation endpoint answers with a failure.
+    fail_revocation: bool,
     /// Hits per endpoint path.
     hits: BTreeMap<String, usize>,
+}
+
+impl Default for FakeIdpState {
+    fn default() -> Self {
+        Self {
+            device: DeviceSession::default(),
+            device_counter: 0,
+            refresh_tokens: HashSet::new(),
+            refresh_counter: 0,
+            last_refresh: None,
+            claims: serde_json::Value::Null,
+            opaque_access_token: false,
+            last_exchange: BTreeMap::new(),
+            last_revocation: BTreeMap::new(),
+            // The conforming default: discovery advertises revocation.
+            advertise_revocation: true,
+            fail_revocation: false,
+            hits: BTreeMap::new(),
+        }
+    }
 }
 
 impl FakeIdpState {
@@ -255,6 +280,21 @@ impl TokenProvider {
     pub fn last_exchange(&self) -> BTreeMap<String, String> {
         self.state.lock().expect("state").last_exchange.clone()
     }
+
+    /// The form parameters of the last revocation request.
+    pub fn last_revocation(&self) -> BTreeMap<String, String> {
+        self.state.lock().expect("state").last_revocation.clone()
+    }
+
+    /// Stops advertising `revocation_endpoint` in discovery.
+    pub fn omit_revocation_endpoint(&self) {
+        self.state.lock().expect("state").advertise_revocation = false;
+    }
+
+    /// Makes the revocation endpoint answer with a server failure.
+    pub fn fail_revocation(&self) {
+        self.state.lock().expect("state").fail_revocation = true;
+    }
 }
 
 /// Spawns the stateful fake. Its discovery document is the conforming one:
@@ -314,7 +354,16 @@ fn handle_token_request(
 ) -> Response {
     let mut state = state.lock().expect("state");
     match path {
-        "/.well-known/openid-configuration" => json(&document(issuer, issuer)),
+        "/.well-known/openid-configuration" => {
+            let mut document = document(issuer, issuer);
+            if !state.advertise_revocation {
+                document
+                    .as_object_mut()
+                    .expect("a discovery document is an object")
+                    .remove("revocation_endpoint");
+            }
+            json(&document)
+        }
         "/device" => {
             state.device.device_code = format!("dev-{}", state.device_counter);
             state.device_counter += 1;
@@ -377,6 +426,19 @@ fn handle_token_request(
                 }
                 _ => error_response(StatusCode::BAD_REQUEST, "unsupported_grant_type", ""),
             }
+        }
+        "/revoke" => {
+            state.hit(path);
+            if state.fail_revocation {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            // RFC 7009 §2.2: the answer is a bare 200 even for an unknown
+            // token; the body is empty.
+            let params: HashMap<String, String> = url::form_urlencoded::parse(body)
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect();
+            state.last_revocation = params.into_iter().collect();
+            StatusCode::OK.into_response()
         }
         _ => StatusCode::NOT_FOUND.into_response(),
     }

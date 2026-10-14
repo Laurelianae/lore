@@ -108,6 +108,18 @@ mod tests {
             }))
         }
 
+        async fn revoke_token(
+            &self,
+            _auth_url: &str,
+            _token: &str,
+            _token_type_hint: &str,
+            _correlation_id: &str,
+        ) -> Result<(), ProtocolError> {
+            Err(ProtocolError::from(NotSupported {
+                operation: "revoke_token".into(),
+            }))
+        }
+
         async fn exchange_for_repository(
             &self,
             _auth_url: &str,

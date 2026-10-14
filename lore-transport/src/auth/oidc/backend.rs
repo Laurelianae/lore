@@ -510,6 +510,39 @@ impl Authentication for OidcAuthentication {
         self.authentication_token(&granted, auth_url)
     }
 
+    async fn revoke_token(
+        &self,
+        auth_url: &str,
+        token: &str,
+        token_type_hint: &str,
+        _correlation_id: &str,
+    ) -> Result<(), ProtocolError> {
+        let document = discover(auth_url)
+            .await
+            .map_err(|err| ProtocolError::internal_with_context(err, "discovering the issuer"))?;
+        // RFC 7009 is optional per the discovery spec: nothing advertised,
+        // nothing to call.
+        let Some(endpoint) = document.revocation_endpoint.as_deref() else {
+            return Ok(());
+        };
+        let body = form_encoded(&[
+            ("token", token),
+            ("token_type_hint", token_type_hint),
+            ("client_id", self.advertisement.client_id.as_str()),
+        ]);
+        let response = post_form(endpoint.to_string(), body).await?;
+        // RFC 7009 §2.2: a 200 is answered even for an unknown token; the
+        // body is ignored. Anything else is a reportable failure.
+        if (200..300).contains(&response.status) {
+            return Ok(());
+        }
+        Err(ProtocolError::internal(format!(
+            "the revocation endpoint {endpoint} answered HTTP {}: {}",
+            response.status,
+            body_excerpt(&response.body)
+        )))
+    }
+
     async fn exchange_for_repository(
         &self,
         _auth_url: &str,

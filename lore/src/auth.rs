@@ -526,6 +526,70 @@ async fn logout_local(
                     resolve_auth_endpoint(args.auth_url.as_str(), &repository_path, &identity)
                         .await?;
 
+                // Revoke at the provider where a backend is registered for
+                // this URL (the OIDC path; connect() registers it from the
+                // server's advertisement). The gRPC path answers
+                // NotSupported and stays local-only, exactly as before. A
+                // failure is reported as a non-fatal error; local state is
+                // cleared either way (the proposal's logout contract).
+                // Resource-scoped tokens (`--resource`) are not revoked:
+                // they are minted at the exchange issuer and bounded by
+                // their own expiry.
+                if args.resource.is_empty() {
+                    let backend = lore_transport::auth::authentication::find(&auth_url).ok();
+                    if let Some(backend) = backend {
+                        let identities = if args.user_id.is_empty() {
+                            lore_credential::token_store::load_identities(&auth_url)
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            vec![args.user_id.as_str().to_string()]
+                        };
+                        for identity in identities {
+                            let candidates = [
+                                (
+                                    "refresh_token",
+                                    lore_credential::token_store::load_refresh_token(
+                                        &auth_url,
+                                        &identity,
+                                    )
+                                    .await
+                                    .ok(),
+                                ),
+                                (
+                                    "access_token",
+                                    lore_credential::token_store::load_user_token_from_store(
+                                        &auth_url,
+                                        &identity,
+                                        lore_credential::token_store::vulnerable_all_tokens(),
+                                    )
+                                    .await
+                                    .ok(),
+                                ),
+                            ];
+                            for (hint, token) in candidates.into_iter().filter_map(
+                                |(hint, token)| token.map(|token| (hint, token)),
+                            ) {
+                                if let Err(err) =
+                                    backend.revoke_token(&auth_url, &token, hint, "").await
+                                {
+                                    if err.is_not_supported() {
+                                        continue;
+                                    }
+                                    LoreEvent::Error(crate::interface::LoreErrorEventData {
+                                        error_type: 0,
+                                        error_inner: format!(
+                                            "revoking the {hint} for {identity} at {auth_url} failed: {err}"
+                                        )
+                                        .into(),
+                                    })
+                                    .send();
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if args.user_id.is_empty() {
                     lore_credential::token_store::remove_all_tokens_for_auth_url(&auth_url)
                         .await
