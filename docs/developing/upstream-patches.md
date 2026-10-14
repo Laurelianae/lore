@@ -62,6 +62,7 @@ IDs remain stable through rebases, splits, and retirement. The table is in repla
 | LP-010 | [eabb070](https://github.com/Laurelianae/lore/commit/eabb0702aa04b08861e60008b4cd8dc1921df1cc) | Portable Docker builds and fork release delivery | Reuses the portable ARM baseline, version stamping, and notices generation | Active |
 | LP-011 | [1526c6c](https://github.com/Laurelianae/lore/commit/1526c6c24f63e0d3081578626dfe2f777e041f07) | Client OIDC device grant, refresh, and auth-path dispatch | Builds on the D5 claim reading also recorded by LP-012; adds the `AuthMode` plumbing the connect bridge forwards | Active |
 | LP-012 | [1526c6c](https://github.com/Laurelianae/lore/commit/1526c6c24f63e0d3081578626dfe2f777e041f07) | RFC 8693 token exchange and external-token login | Layers onto LP-011's backend and D5 derivation | Active |
+| LP-013 | [5534934](https://github.com/Laurelianae/lore/commit/5534934c564d37341ff8e244a31ce6293937517e) | RFC 7009 token revocation on `lore auth logout` | Extends LP-011's backend and per-URL registry | Active |
 
 ## Patch details and acceptance contracts
 
@@ -244,6 +245,18 @@ The transport maps wire status `AuthorizationExpired = 6` to `NotAuthenticated`.
 **Compatibility:** A deployment that sets no exchange configuration stays on Tier 1 indefinitely (D2). The exchange grant goes to `token_exchange_issuer` when configured, else to the advertised issuer's token endpoint, so an external-token login works on Tier 1 issuers that implement RFC 8693 at their token endpoint. `exchange()` classifies backend errors through the existing `NotAuthorized`/internal mapping, so permission denials are still not retried.
 
 **Retire when:** Upstream implements the RFC 8693 client exchange with the same template rule (exactly one carrier, verbatim custom resources, one resource per request) and the API-key `subject_token_type` mapping, verified against the broker contract's checklist; retire per the register's reconciliation procedure.
+
+### LP-013: RFC 7009 token revocation on `lore auth logout`
+
+**Purpose:** Complete the proposal's phase-3 client list: `lore auth logout` revokes the removed identities' refresh token and authentication token at the provider's advertised `revocation_endpoint` (RFC 7009), so credentials die at the issuer instead of only disappearing locally. The provider-facing contract is the [OIDC broker contract](oidc-broker-contract.md).
+
+**Before:** Logout was local-only: it deleted entries from the token store and never contacted the provider. Discovery already parsed and https-validated `revocation_endpoint`, but nothing consumed it.
+
+**Current:** The `Authentication` trait gains `revoke_token(auth_url, token, token_type_hint, correlation_id)`. The OIDC backend implements it by discovering the issuer, answering a no-op when discovery advertises no `revocation_endpoint` (RFC 7009 is optional), and otherwise posting `token`/`token_type_hint`/`client_id` form-encoded to the advertised endpoint — any 2xx is success per RFC 7009 §2.2 (the body is ignored), anything else is a reportable failure. The gRPC path answers `NotSupported`. `logout_local` looks the backend up by the resolved auth URL, revokes the refresh token (hint `refresh_token`) and then the stored authentication token (hint `access_token`) per removed identity, and treats every failure — including a missing backend — as a non-fatal `LoreEvent::Error` while local state is always cleared; exit code and "Logged out" output are unchanged. Resource-scoped tokens (`--resource`) are not revoked: they are minted at the exchange issuer and bounded by their own expiry, and RFC 7009 §2.1 has conforming providers invalidate the grant's access tokens when the refresh token is revoked. Logout with an explicit `--auth-url` but no connection stays local-only (no registered backend means no discovery endpoints), preserving the offline use case.
+
+**Code and regressions:** [trait](../../lore-transport/src/traits.rs), [backend](../../lore-transport/src/auth/oidc/backend.rs), [gRPC stub](../../lore-transport/src/auth/ucs_auth.rs), [logout wiring](../../lore/src/auth.rs). Acceptance includes `the_revocation_endpoint_receives_the_token_and_hint`, `a_provider_without_a_revocation_endpoint_makes_revocation_a_no_op`, and `a_failing_revocation_answer_is_an_error` in `lore-transport/tests/unit/auth/oidc/backend.rs`, backed by the fake provider's `/revoke` route (`lore-transport/tests/support/oidc_provider.rs`), and end to end `scripts/test/test_auth_oidc.py::test_logout_revokes_tokens_at_the_provider`.
+
+**Retire when:** Upstream lands equivalent client-side revocation on logout; verify the failure contract (reported, non-fatal, local state always cleared) and the no-endpoint no-op against the same test surface, then retire per the register's reconciliation procedure.
 
 ## Inspect and export the recorded series
 
