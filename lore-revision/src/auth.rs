@@ -1,16 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub use lore_transport::auth::mode::AuthMode;
+pub use lore_transport::auth::mode::AuthPath;
+pub use lore_transport::auth::mode::UnknownAuthMode;
 use serde::Serialize;
 
 use crate::interface::LoreString;
 
 pub mod login;
-pub mod mode;
 pub mod userinfo;
-
-pub use mode::AuthMode;
-pub use mode::AuthPath;
-pub use mode::UnknownAuthMode;
 
 /////////////////////////////////
 // General Notes for Auth token handling

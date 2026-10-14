@@ -71,6 +71,25 @@ impl AuthMode {
             }
         }
     }
+
+    /// Resolves the mode against what the server advertises: its gRPC auth
+    /// URL, if any, and its OIDC advertisement, if any. Availability is not
+    /// enforced here -- a caller that cannot take the resolved path (an
+    /// unauthenticated server, a login against a server that advertises
+    /// neither) reports that itself.
+    pub fn resolve(self, auth_url: Option<&str>, oidc: Option<&crate::types::Oidc>) -> AuthPath {
+        match self {
+            AuthMode::Grpc => AuthPath::Grpc,
+            AuthMode::Oidc => AuthPath::Oidc,
+            AuthMode::Auto => match oidc {
+                None => AuthPath::Grpc,
+                Some(oidc) => match auth_url {
+                    Some(auth_url) if !auth_url.is_empty() => self.path(oidc.preferred),
+                    _ => AuthPath::Oidc,
+                },
+            },
+        }
+    }
 }
 
 impl FromStr for AuthMode {

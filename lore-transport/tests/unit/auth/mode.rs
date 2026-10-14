@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use lore_revision::auth::AuthMode;
-use lore_revision::auth::AuthPath;
+use lore_transport::auth::AuthMode;
+use lore_transport::auth::AuthPath;
+use lore_transport::types::Oidc;
 
 #[test]
 fn the_default_is_auto_and_is_zero() {
@@ -62,4 +63,55 @@ fn auto_follows_the_servers_preference_and_an_explicit_mode_does_not() {
 
     assert_eq!(AuthMode::Oidc.path(false), AuthPath::Oidc);
     assert_eq!(AuthMode::Oidc.path(true), AuthPath::Oidc);
+}
+
+fn oidc(preferred: bool) -> Oidc {
+    Oidc {
+        preferred,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn resolve_sends_auto_where_the_advertisement_points() {
+    // Nothing advertised: the gRPC path, with or without an auth URL.
+    assert_eq!(
+        AuthMode::Auto.resolve(Some("ucs-auth://auth"), None),
+        AuthPath::Grpc
+    );
+    assert_eq!(AuthMode::Auto.resolve(None, None), AuthPath::Grpc);
+
+    // OIDC advertised and the gRPC path not: OIDC, preference irrelevant.
+    assert_eq!(
+        AuthMode::Auto.resolve(Some(""), Some(&oidc(false))),
+        AuthPath::Oidc
+    );
+    assert_eq!(
+        AuthMode::Auto.resolve(None, Some(&oidc(false))),
+        AuthPath::Oidc
+    );
+
+    // Both advertised: the server's preference decides.
+    assert_eq!(
+        AuthMode::Auto.resolve(Some("ucs-auth://auth"), Some(&oidc(false))),
+        AuthPath::Grpc
+    );
+    assert_eq!(
+        AuthMode::Auto.resolve(Some("ucs-auth://auth"), Some(&oidc(true))),
+        AuthPath::Oidc
+    );
+}
+
+#[test]
+fn an_explicit_mode_resolves_itself_without_the_advertisement() {
+    assert_eq!(
+        AuthMode::Grpc.resolve(None, Some(&oidc(true))),
+        AuthPath::Grpc
+    );
+    assert_eq!(AuthMode::Grpc.resolve(None, None), AuthPath::Grpc);
+    assert_eq!(
+        AuthMode::Oidc.resolve(Some("ucs-auth://auth"), None),
+        AuthPath::Oidc
+    );
+    assert_eq!(AuthMode::Oidc.resolve(None, None), AuthPath::Oidc);
 }

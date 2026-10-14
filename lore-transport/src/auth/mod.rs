@@ -1,14 +1,19 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 pub mod exchange;
+pub mod mode;
 pub mod oidc;
 pub mod token_only;
 pub mod ucs_auth;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Once;
 
+pub use mode::AuthMode;
+pub use mode::AuthPath;
+pub use mode::UnknownAuthMode;
 use parking_lot::Mutex;
 
 use crate::error::ProtocolError;
@@ -64,13 +69,39 @@ pub mod authentication {
     static AUTHENTICATION_MAP: Mutex<Option<HashMap<String, Arc<dyn Authentication>>>> =
         Mutex::new(None);
 
+    /// `Authentication` instances keyed by the exact URL they serve, checked
+    /// before [`AUTHENTICATION_MAP`]. Per-endpoint instances (an OIDC backend
+    /// carrying the server's advertisement) register here; a refreshed
+    /// advertisement overwrites its predecessor.
+    static AUTHENTICATION_INSTANCES: LazyLock<Mutex<HashMap<String, Arc<dyn Authentication>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Registers an `Authentication` implementation for one exact URL,
+    /// replacing any instance previously registered for it. The full URL
+    /// must match `find`'s argument exactly, so register the URL as the
+    /// server advertises it (the OIDC issuer, verbatim).
+    pub fn add_for_url(auth_url: &str, auth: Arc<dyn Authentication>) {
+        AUTHENTICATION_INSTANCES
+            .lock()
+            .insert(auth_url.to_string(), auth);
+    }
+
     /// Finds the `Authentication` implementation for the given auth URL by
     /// parsing its scheme. Registers builtin implementations on first call.
+    ///
+    /// A per-URL instance registered with [`add_for_url`] wins over any
+    /// scheme-registered implementation: it carries state for exactly this
+    /// endpoint (an OIDC backend holding the server's advertisement) that a
+    /// scheme-wide implementation cannot.
     ///
     /// The full auth URL (including scheme) is passed to trait methods as-is --
     /// the implementation decides how to interpret it.
     pub fn find(auth_url: &str) -> Result<Arc<dyn Authentication>, ProtocolError> {
         register_builtin();
+
+        if let Some(auth) = AUTHENTICATION_INSTANCES.lock().get(auth_url).cloned() {
+            return Ok(auth);
+        }
 
         let scheme = parse_scheme(auth_url)?;
         // The lookup and the scheme list the error reports share one lock

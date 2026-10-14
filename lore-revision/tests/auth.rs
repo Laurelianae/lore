@@ -52,6 +52,8 @@ mod tests {
                 is_service_account: None,
                 expires: 1,
                 audience,
+                root_domains: None,
+                namespaced_root_domains: None,
             }
         }
 
@@ -63,12 +65,48 @@ mod tests {
             ]);
             let acceptable_domains = token.acceptable_root_domains();
 
+            // D5: a domain-shaped `aud` entry contributes a suffix; the
+            // issuer itself is no longer part of the list.
             assert_eq!(
                 acceptable_domains,
                 vec![
-                    "my_test_issuer.example.com".to_string(),
-                    "lore-1.example.com".to_string(),
-                    "lore-2.example.com".to_string(),
+                    ".lore-1.example.com".to_string(),
+                    ".lore-2.example.com".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn root_domains_claim_takes_precedence_over_aud() {
+            let mut token = make_jwt_with_audience(vec!["aud.example.com".to_string()]);
+            token.root_domains = Some(vec!["claimed.example.com".to_string()]);
+            assert_eq!(token.acceptable_root_domains(), vec!["claimed.example.com"]);
+
+            // The namespaced alias works too, and the fixed name wins when
+            // both are set.
+            token.namespaced_root_domains = Some(vec!["aliased.example.com".to_string()]);
+            assert_eq!(token.acceptable_root_domains(), vec!["claimed.example.com"]);
+            token.root_domains = None;
+            assert_eq!(token.acceptable_root_domains(), vec!["aliased.example.com"]);
+        }
+
+        #[test]
+        fn https_aud_entry_contributes_its_host_and_opaque_ones_contribute_nothing() {
+            let token = make_jwt_with_audience(vec![
+                "https://lore.example.com".to_string(),
+                "https://lore.example.com:8443/path".to_string(),
+                "http://insecure.example.com".to_string(),
+                "lore-api".to_string(),
+                "localhost:8080".to_string(),
+                "lore.example.com/path".to_string(),
+            ]);
+
+            assert_eq!(
+                token.acceptable_root_domains(),
+                // Both https entries name the same host; each contributes it.
+                vec![
+                    "lore.example.com".to_string(),
+                    "lore.example.com".to_string()
                 ]
             );
         }

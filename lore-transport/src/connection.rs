@@ -19,7 +19,10 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 use crate::auth;
+use crate::auth::AuthMode;
+use crate::auth::AuthPath;
 use crate::auth::exchange::auth_exchange;
+use crate::auth::oidc::backend::OidcAuthentication;
 use crate::error::ProtocolError;
 use crate::grpc;
 use crate::quic;
@@ -300,6 +303,7 @@ pub async fn connect(
     max_connections: usize,
     identity_token: &str,
     access_token: &str,
+    auth_mode: AuthMode,
 ) -> Result<Arc<Connection>, ProtocolError> {
     let (remote_url, protocol) = parse(remote_url)?;
 
@@ -332,6 +336,7 @@ pub async fn connect(
             max_connections,
             identity_token,
             access_token,
+            auth_mode,
         )
         .await
     })
@@ -347,6 +352,7 @@ async fn connect_impl(
     max_connections: usize,
     identity_token: String,
     access_token: String,
+    auth_mode: AuthMode,
 ) -> Result<Arc<Connection>, ProtocolError> {
     let remote_domain = lore_credential::domain_from_url_or_url(&remote_url);
 
@@ -367,6 +373,31 @@ async fn connect_impl(
         .as_ref()
         .and_then(|endpoint| endpoint.auth_url.clone())
         .unwrap_or_default();
+    let supplied_credentials = !identity_token.is_empty() || !access_token.is_empty();
+    let auth_url = if supplied_credentials {
+        auth_url
+    } else {
+        match auth_mode.resolve(Some(auth_url.as_str()), environment.oidc.as_ref()) {
+            AuthPath::Grpc => {
+                if auth_url.is_empty() && auth_mode == AuthMode::Grpc {
+                    return Err(ProtocolError::internal(
+                        "server does not advertise the gRPC auth path",
+                    ));
+                }
+                auth_url
+            }
+            AuthPath::Oidc => {
+                let oidc = environment.oidc.as_ref().ok_or_else(|| {
+                    ProtocolError::internal("server does not advertise the OIDC auth path")
+                })?;
+                auth::authentication::add_for_url(
+                    &oidc.issuer,
+                    Arc::new(OidcAuthentication::new(oidc.clone())),
+                );
+                oidc.issuer.clone()
+            }
+        }
+    };
 
     let mut identity = identity;
     if !auth_url.is_empty() {
@@ -423,7 +454,7 @@ async fn connect_impl(
         }
     }
 
-    let from_supplied_credentials = !identity_token.is_empty() || !access_token.is_empty();
+    let from_supplied_credentials = supplied_credentials;
     if let Some(connection) = find_connection(
         remote_url.as_str(),
         identity.as_str(),
@@ -444,6 +475,7 @@ async fn connect_impl(
     let connection = Arc::new(Connection::unconnected(
         remote_url.clone(),
         auth_url.clone(),
+        auth_mode,
         identity.clone(),
         credentials.clone(),
         environment,
@@ -852,6 +884,10 @@ struct Connector {
 pub struct Connection {
     pub remote_url: Url,
     pub auth_url: String,
+    /// The auth path this connection was opened under (D2). A reconnect
+    /// through `connect_module` resolves it against the same advertisement
+    /// kind again.
+    auth_mode: AuthMode,
     pub identity: String,
     /// The credentials supplied for the call in progress, shared with every
     /// service this connection built so a later call's fresher ones take effect
@@ -912,6 +948,7 @@ impl Connection {
     fn unconnected(
         remote_url: Url,
         auth_url: String,
+        auth_mode: AuthMode,
         identity: String,
         credentials: Arc<SuppliedCredentials>,
         environment: EnvironmentConfig,
@@ -920,6 +957,7 @@ impl Connection {
         Connection {
             remote_url,
             auth_url,
+            auth_mode,
             identity,
             credentials,
             protocol,
@@ -948,6 +986,7 @@ impl Connection {
         let connection = Arc::new(Connection::unconnected(
             Url::parse("lore://detached.invalid").expect("valid URL"),
             String::new(),
+            AuthMode::default(),
             String::new(),
             Arc::default(),
             EnvironmentConfig::default(),
@@ -1310,6 +1349,7 @@ impl Connection {
             MAX_STORAGE_CONNECTIONS,
             &identity_token,
             &access_token,
+            self.auth_mode,
         )
         .await
     }

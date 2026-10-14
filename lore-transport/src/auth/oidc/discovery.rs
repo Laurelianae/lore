@@ -326,7 +326,7 @@ async fn fetch(
 ///
 /// `Content-Length` is a claim, not a fact: it can be absent, understated, or the response
 /// chunked. It refuses a body early, and the accumulating read enforces the cap.
-async fn read_capped_body(
+pub(crate) async fn read_capped_body(
     response: &mut reqwest::Response,
 ) -> Result<Option<Vec<u8>>, reqwest::Error> {
     if response

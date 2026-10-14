@@ -4,6 +4,35 @@ use lore_base::types::RepositoryId;
 use lore_transport::auth::authentication;
 use lore_transport::auth::exchange::*;
 
+use super::provider;
+
+/// Serializes the tests that point the process-global token store at a temp
+/// directory.
+static STORE_MUTEX: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+/// Points the process's token store at a fresh temp directory and the file
+/// fallback (no keychain), returning the directory. Call under
+/// [`STORE_MUTEX`]: `LORE_AUTH_PATH` is process-global, and the tests in
+/// this binary that never touch the store must not observe the switch.
+fn isolate_auth_store(label: &str) -> std::path::PathBuf {
+    let store_dir = std::env::temp_dir().join(format!(
+        "lore-exchange-test-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_nanos()
+    ));
+    // SAFETY: the test owns the store path for its process; no other test in
+    // this binary reads the token store, and the mutex serializes the ones
+    // that set the variable.
+    unsafe {
+        std::env::set_var("LORE_AUTH_PATH", store_dir.display().to_string());
+        std::env::set_var("LORE_AUTH_STORE", "fallback");
+    }
+    store_dir
+}
+
 /// A supplied access token is the authorization token, so the exchange is
 /// skipped entirely -- including the checks that would otherwise reject a
 /// call with no auth URL and no identity.
@@ -270,5 +299,186 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
         stub.exchanges.load(std::sync::atomic::Ordering::Acquire),
         2,
         "the second credential must not be served the first one's entry"
+    );
+}
+
+/// An expired token that came from the store is renewed in place when the
+/// store holds a refresh token for it and a backend is registered: the
+/// refreshed token is handed out, the rotation is persisted, and the
+/// exchange proceeds with it. The store writes are isolated to a temp
+/// directory via `LORE_AUTH_PATH` and the file fallback store, so the test
+/// never touches a real keychain.
+#[tokio::test]
+async fn an_expired_stored_token_is_renewed_through_its_refresh_token() {
+    use lore_credential::token_store;
+    use lore_transport::error::ProtocolError;
+    use lore_transport::traits::Authentication;
+    use lore_transport::types::AuthenticationToken;
+    use lore_transport::types::AuthorizationToken;
+
+    /// `sub` alice, `aud` example.com, `exp` back in 2001.
+    const EXPIRED_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjEwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
+    /// A fresh authorization the stub hands out for the renewed token.
+    const AUTHZ: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJhdXRoeiI6InllcyJ9.signature";
+    const AUTH_URL: &str = "https://refresh-wiring.test.invalid";
+
+    struct RefreshStub {
+        refreshes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Authentication for RefreshStub {
+        async fn refresh_authentication(
+            &self,
+            _auth_url: &str,
+            _refresh_token: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            let count = self
+                .refreshes
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            Ok(AuthenticationToken {
+                token: provider::mint_access_token(
+                    AUTH_URL,
+                    &serde_json::json!({ "sub": "alice", "aud": ["example.com"] }),
+                ),
+                user_id: "alice".to_string(),
+                user_name: "Alice".to_string(),
+                expires_ms: 0,
+                acceptable_root_domains: vec!["example.com".to_string()],
+                refresh_token: Some(format!("rotated-{count}")),
+                scope: None,
+            })
+        }
+
+        async fn exchange_for_repository(
+            &self,
+            _auth_url: &str,
+            _authn_token: &str,
+            _repository: RepositoryId,
+            _correlation_id: &str,
+        ) -> Result<AuthorizationToken, ProtocolError> {
+            Ok(AuthorizationToken {
+                token: AUTHZ.to_string(),
+                expires_ms: 2000000000 * 1000,
+                acceptable_root_domains: vec!["example.com".to_string()],
+            })
+        }
+
+        async fn start_auth_session(
+            &self,
+            _auth_url: &str,
+            _client_state: &str,
+            _correlation_id: &str,
+        ) -> Result<lore_transport::types::AuthSession, ProtocolError> {
+            Err(ProtocolError::internal("the stub only refreshes"))
+        }
+
+        async fn poll_auth_session(
+            &self,
+            _auth_url: &str,
+            _client_state: &str,
+            _session_code: &str,
+            _correlation_id: &str,
+        ) -> Result<lore_transport::types::AuthSessionPoll, ProtocolError> {
+            Err(ProtocolError::internal("the stub only refreshes"))
+        }
+
+        async fn exchange_external_token(
+            &self,
+            _auth_url: &str,
+            _token: &str,
+            _token_type: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            Err(ProtocolError::internal("the stub only refreshes"))
+        }
+
+        async fn exchange_for_custom_resource(
+            &self,
+            _auth_url: &str,
+            _authn_token: &str,
+            _resource_id: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthorizationToken, ProtocolError> {
+            Err(ProtocolError::internal("the stub only refreshes"))
+        }
+    }
+
+    let _lock = STORE_MUTEX
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
+    isolate_auth_store("renewed");
+
+    let stub = std::sync::Arc::new(RefreshStub {
+        refreshes: std::sync::atomic::AtomicUsize::new(0),
+    });
+    authentication::add_for_url(AUTH_URL, stub.clone());
+
+    // An expired token and a refresh token for it, as a completed OIDC login
+    // would have left them.
+    token_store::store_user_token(AUTH_URL, "alice", EXPIRED_TOKEN, vec!["example.com".into()])
+        .await
+        .expect("the expired token is stored");
+    token_store::store_refresh_token(AUTH_URL, "alice", "refresh-0")
+        .await
+        .expect("the refresh token is stored");
+
+    let repository: RepositoryId = "00112233445566778899aabbccddeeff"
+        .parse()
+        .expect("a valid repository id");
+    let (authentication_token, authorization_token, identity) =
+        auth_exchange(AUTH_URL, "example.com", "alice", repository, "", "").await;
+
+    assert_eq!(
+        stub.refreshes.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "exactly one refresh grant is spent on the expired token"
+    );
+    assert_ne!(
+        authentication_token, EXPIRED_TOKEN,
+        "the expired token is not handed on"
+    );
+    assert_eq!(identity, "alice");
+    assert_eq!(authorization_token, AUTHZ);
+
+    // The rotation is persisted: the spent token is gone from the store.
+    let stored = token_store::load_refresh_token(AUTH_URL, "alice")
+        .await
+        .expect("the rotation is in the store");
+    assert_eq!(stored, "rotated-0");
+}
+
+/// Without a refresh token in the store, an expired stored identity is
+/// skipped exactly as before the refresh wiring existed.
+#[tokio::test]
+async fn an_expired_stored_identity_without_a_refresh_token_is_skipped() {
+    use lore_credential::token_store;
+
+    /// `sub` alice, `aud` example.com, `exp` back in 2001.
+    const EXPIRED_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjEwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
+    const AUTH_URL: &str = "https://refresh-absent.test.invalid";
+
+    let _lock = STORE_MUTEX
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    isolate_auth_store("skipped");
+
+    token_store::store_user_token(AUTH_URL, "alice", EXPIRED_TOKEN, vec!["example.com".into()])
+        .await
+        .expect("the expired token is stored");
+
+    let repository: RepositoryId = "00112233445566778899aabbccddeeff"
+        .parse()
+        .expect("a valid repository id");
+    let (authentication_token, _authorization_token, _identity) =
+        auth_exchange(AUTH_URL, "example.com", "alice", repository, "", "").await;
+
+    assert!(
+        authentication_token.is_empty(),
+        "no backend is registered for the URL, so the identity is skipped"
     );
 }

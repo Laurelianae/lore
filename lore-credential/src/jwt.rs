@@ -36,20 +36,72 @@ pub struct JWTUserInfo {
     #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(rename = "aud")]
     pub audience: Vec<String>,
+    /// The root domains the issuer granted, tried before `aud` (D5).
+    #[serde(default)]
+    pub root_domains: Option<Vec<String>>,
+    /// The namespaced alias of `root_domains`, for providers that require
+    /// namespaced custom claims (D5).
+    #[serde(rename = "https://lore.org/claims/root_domains", default)]
+    pub namespaced_root_domains: Option<Vec<String>>,
 }
 
 impl JWTUserInfo {
-    /// All the root domains this token are intended for
+    /// All the root domains this token is intended for, derived per the OIDC
+    /// LEP's D5: the issuer's `root_domains` claim under its fixed name or
+    /// its namespaced alias when either is present, else the `aud` entries
+    /// that have a usable shape. The issuer's own URL is deliberately not
+    /// part of the list; `store_user_token` appends the auth endpoint's
+    /// domain, which keeps the fail-closed case (no usable source) working
+    /// by sending the token back to the endpoint it came from only.
     pub fn acceptable_root_domains(&self) -> Vec<String> {
-        [
-            // Whoever issued it already knows about the token and thus
-            // the token can be given back to that endpoint.
-            std::slice::from_ref(&self.issuer),
-            // The Auth Service defines audienes as a list of root domains
-            self.audience.as_slice(),
-        ]
-        .concat()
+        for claim in [
+            self.root_domains.as_ref(),
+            self.namespaced_root_domains.as_ref(),
+        ] {
+            if let Some(domains) = claim
+                && !domains.is_empty()
+            {
+                return domains.clone();
+            }
+        }
+        self.audience
+            .iter()
+            .filter_map(|entry| audience_entry_root_domain(entry))
+            .collect()
     }
+}
+
+/// The claim the issuer sets to name the root domains its tokens may be
+/// sent to (D5). Fixed, so nothing in an attacker-controlled environment
+/// response can point the client at a different claim.
+pub const ROOT_DOMAINS_CLAIM: &str = "root_domains";
+
+/// The namespaced alias of [`ROOT_DOMAINS_CLAIM`], for providers that
+/// require namespaced custom claims (D5).
+pub const NAMESPACED_ROOT_DOMAINS_CLAIM: &str = "https://lore.org/claims/root_domains";
+
+/// One `aud` entry's contribution to the root-domain list (D5): the host of
+/// an `https` URI, or a domain-shaped entry as a suffix. An opaque
+/// identifier such as `lore-api` contributes nothing.
+pub fn audience_entry_root_domain(entry: &str) -> Option<String> {
+    if let Ok(url) = url::Url::parse(entry) {
+        return if url.scheme() == "https" {
+            url.host_str().map(str::to_string)
+        } else {
+            None
+        };
+    }
+    let entry = entry.strip_prefix('.').unwrap_or(entry);
+    if entry.is_empty() || !entry.contains('.') {
+        return None;
+    }
+    let label_shaped = entry.split('.').all(|label| {
+        !label.is_empty()
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    });
+    label_shaped.then(|| format!(".{entry}"))
 }
 
 pub async fn user_info<P>(

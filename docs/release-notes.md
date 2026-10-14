@@ -14,6 +14,15 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- `lore`: OIDC login on the client, completing the LEP's client side: `lore login --auth-mode oidc` (or `LORE_AUTH_MODE`, or the
+  server's preference under the default `auto`) runs the RFC 8628 device grant against the issuer advertised in
+  `[server.auth.oidc]`, so a server with no `auth_url` can be logged into; refresh tokens are stored rotated and renew an expired
+  token at the next operation; and a deployment advertising `token_exchange_issuer` with exactly one of `resource_template` /
+  `scope_template` gets RFC 8693 partition-scoped tokens, with `lore login --token-type api-key` mapping to
+  `urn:lore:params:oauth:token-type:api-key`. A caller supplying `--identity-token`/`--access-token` consults no auth path, as
+  before. Root domains are read from the token's `root_domains` claim (or its
+  `https://lore.org/claims/root_domains` alias, or shaped `aud` entries) instead of `iss` + `aud`, so standard-provider tokens
+  pass the domain check. See `docs/developing/oidc-broker-contract.md` for the provider contract
 - `lore-io`: `IoFile::from_std` wraps a `std::fs::File` the caller already holds, so an `IoDriver` runs positional
   reads, writes and syncs on that handle without reopening it by path. On Windows the file must be opened with
   `FILE_FLAG_OVERLAPPED`, and the `iocp` backend binds it to the driver's completion port. The call is `unsafe`: on

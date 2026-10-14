@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 //! Authentication against an `OpenID` Connect provider.
 
+pub mod backend;
 pub mod discovery;
 
 use std::sync::OnceLock;

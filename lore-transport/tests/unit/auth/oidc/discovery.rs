@@ -13,10 +13,9 @@ use tokio::sync::watch;
 
 const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
 
-#[path = "../../../support/oidc_provider.rs"]
-mod provider;
-
-use provider::*;
+// The provider support module is included once for this binary, by
+// `super`'s parent (`tests/unit/auth.rs`).
+use crate::auth::provider::*;
 
 #[tokio::test]
 async fn reads_the_endpoints_from_the_document() {

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::sync::Arc;
 use std::sync::Weak;
 use std::time::Duration;
 
@@ -9,18 +10,22 @@ use lore_credential::insecure_decode_token;
 use lore_credential::token_store;
 use lore_credential::token_store::vulnerable_all_tokens;
 use lore_credential::verify_jwt_usage_for_remote;
+use lore_error_set::internal::SupportsInternalError;
 use lore_error_set::prelude::*;
 use lore_transport::AuthSession;
 use lore_transport::AuthSessionPoll;
 use lore_transport::Authentication;
 use lore_transport::AuthenticationToken;
 use lore_transport::auth::authentication;
+use lore_transport::auth::oidc::backend::OidcAuthentication;
 use tokio::time::Instant;
 use tokio::time::sleep;
 use tokio::time::timeout_at;
 use url::Url;
 use uuid::Uuid;
 
+use crate::auth::AuthMode;
+use crate::auth::AuthPath;
 use crate::auth::LoreAuthPendingEventData;
 use crate::auth::LoreAuthUrlEventData;
 use crate::errors::AddressNotFound;
@@ -110,6 +115,46 @@ const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 /// loop.
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Resolves the auth URL a login flow uses (D2): the caller's `auth_mode`,
+/// resolved against what the server advertises -- its gRPC auth URL, if
+/// any, and its OIDC issuer, if any.
+///
+/// On the gRPC path the server's `auth_url` must be present; the caller
+/// sees "No authentication configured on server" otherwise, exactly as
+/// before the dispatch existed. On the OIDC path the advertisement builds
+/// the backend, which is registered under the issuer so every later lookup
+/// by URL finds it, and the issuer becomes the flow's auth URL -- the token
+/// store, the refresh loop and the user service all key on it.
+fn resolve_login_auth_url<E>(
+    auth_mode: AuthMode,
+    auth_url: String,
+    oidc: Option<lore_transport::types::Oidc>,
+) -> Result<String, E>
+where
+    E: SupportsInternalError + From<lore_base::error::NotSupported>,
+{
+    match auth_mode.resolve(Some(auth_url.as_str()), oidc.as_ref()) {
+        AuthPath::Grpc => {
+            if auth_url.is_empty() {
+                return Err(NotSupported {
+                    operation: "No authentication configured on server".to_string(),
+                }
+                .into());
+            }
+            Ok(auth_url)
+        }
+        AuthPath::Oidc => {
+            let oidc =
+                oidc.ok_or_else(|| E::internal("server does not advertise the OIDC auth path"))?;
+            authentication::add_for_url(
+                &oidc.issuer,
+                Arc::new(OidcAuthentication::new(oidc.clone())),
+            );
+            Ok(oidc.issuer)
+        }
+    }
+}
+
 /// Exchanges an external token for a URC authentication token via the
 /// registered `Authentication` implementation.
 async fn exchange_token(
@@ -180,6 +225,13 @@ pub(crate) async fn with_token(
         // Use the auth URL's domain for JWT validation when no remote URL is available.
         lore_debug!("Using explicit auth URL: {url}");
         let parsed = url::Url::parse(url).internal("parsing explicit auth URL")?;
+        // The explicit path has no advertisement to build the OIDC backend
+        // from, so it cannot serve that scheme.
+        if parsed.scheme() == "oidc" {
+            return Err(LoginError::internal(
+                "OIDC login resolves from the server advertisement; omit --auth-url",
+            ));
+        }
         (url.to_string(), parsed)
     } else {
         let (parsed_remote, protocol) =
@@ -197,15 +249,15 @@ pub(crate) async fn with_token(
 
         let auth_url = environment
             .endpoint
-            .and_then(|endpoint| endpoint.auth_url)
+            .as_ref()
+            .and_then(|endpoint| endpoint.auth_url.clone())
             .unwrap_or_default();
 
-        if auth_url.is_empty() {
-            return Err(NotSupported {
-                operation: "No authentication configured on server".to_string(),
-            }
-            .into());
-        }
+        let auth_url = resolve_login_auth_url::<LoginError>(
+            crate::lore::execution_context().globals().auth_mode,
+            auth_url,
+            environment.oidc,
+        )?;
 
         (auth_url, parsed_remote)
     };
@@ -280,15 +332,15 @@ pub async fn interactive(
 
     let auth_url = environment
         .endpoint
-        .and_then(|endpoint| endpoint.auth_url)
+        .as_ref()
+        .and_then(|endpoint| endpoint.auth_url.clone())
         .unwrap_or_default();
 
-    if auth_url.is_empty() {
-        return Err(NotSupported {
-            operation: "No authentication configured on server".to_string(),
-        }
-        .into());
-    }
+    let auth_url = resolve_login_auth_url::<InteractiveLoginError>(
+        crate::lore::execution_context().globals().auth_mode,
+        auth_url,
+        environment.oidc,
+    )?;
 
     let auth_impl = authentication::find(&auth_url)
         .forward::<InteractiveLoginError>("finding authentication handler")?;

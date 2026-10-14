@@ -2,7 +2,14 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
+/// The shared fake OIDC provider, included once for the whole binary:
+/// including it in more than one submodule of the same test binary trips
+/// `duplicate_mod`.
+#[path = "../support/oidc_provider.rs"]
+pub mod provider;
+
 mod exchange;
+mod mode;
 mod oidc;
 mod token_only;
 mod ucs_auth;
@@ -44,4 +51,42 @@ fn builtin_schemes_are_served_by_the_auth_service() {
             "scheme {scheme} should resolve users through the same auth service instance"
         );
     }
+}
+
+/// An instance registered for one exact URL wins over the scheme registry,
+/// while other URLs on the same scheme keep the scheme implementation.
+/// Overwriting a URL's instance hands the endpoint to the replacement, so a
+/// refreshed advertisement wins.
+#[test]
+fn an_instance_registered_for_a_url_wins_over_the_scheme_registry() {
+    let oidc_url = "https://oidc-registers-itself.example.com";
+    let other_url = "https://other-host.example.com";
+    let oidc =
+        Arc::new(lore_transport::auth::oidc::backend::OidcAuthentication::new(Default::default()));
+
+    authentication::add_for_url(oidc_url, oidc.clone());
+
+    let found = authentication::find(oidc_url).expect("the instance is found by its URL");
+    assert!(
+        std::ptr::addr_eq(Arc::as_ptr(&found), Arc::as_ptr(&oidc)),
+        "the exact URL must resolve to the registered instance"
+    );
+
+    // The same scheme elsewhere keeps the scheme implementation (`https`
+    // falls back to the UCS auth service).
+    let found = authentication::find(other_url).expect("the scheme fallback is found");
+    assert!(
+        !std::ptr::addr_eq(Arc::as_ptr(&found), Arc::as_ptr(&oidc)),
+        "another URL on the same scheme must not get the instance"
+    );
+
+    // A replacement for the same URL takes over.
+    let replacement =
+        Arc::new(lore_transport::auth::oidc::backend::OidcAuthentication::new(Default::default()));
+    authentication::add_for_url(oidc_url, replacement.clone());
+    let found = authentication::find(oidc_url).expect("the replacement is found");
+    assert!(
+        std::ptr::addr_eq(Arc::as_ptr(&found), Arc::as_ptr(&replacement)),
+        "the newest instance for a URL must win"
+    );
 }
