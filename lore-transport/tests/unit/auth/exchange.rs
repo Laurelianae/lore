@@ -161,6 +161,11 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
     use lore_transport::types::AuthenticationToken;
     use lore_transport::types::AuthorizationToken;
 
+    let _lock = STORE_MUTEX
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
     /// `sub` alice, `aud` example.com, expiring in 2033.
     const AUTHN_ONE: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJuYW1lIjoiQWxpY2UifQ.signature";
     /// The same user, a different credential -- note the `scope` claim.
