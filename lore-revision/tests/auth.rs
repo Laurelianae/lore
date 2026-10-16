@@ -47,13 +47,15 @@ mod tests {
             JWTUserInfo {
                 issuer: "my_test_issuer.example.com".to_string(),
                 user_id: "my_user_id".into(),
+                identity: None,
+                identity_namespaced: None,
                 name: Some("my_name".into()),
                 preferred_username: None,
                 is_service_account: None,
                 expires: 1,
                 audience,
                 root_domains: None,
-                namespaced_root_domains: None,
+                root_domains_namespaced: None,
             }
         }
 
@@ -65,48 +67,11 @@ mod tests {
             ]);
             let acceptable_domains = token.acceptable_root_domains();
 
-            // D5: a domain-shaped `aud` entry contributes a suffix; the
-            // issuer itself is no longer part of the list.
             assert_eq!(
                 acceptable_domains,
                 vec![
-                    ".lore-1.example.com".to_string(),
-                    ".lore-2.example.com".to_string(),
-                ]
-            );
-        }
-
-        #[test]
-        fn root_domains_claim_takes_precedence_over_aud() {
-            let mut token = make_jwt_with_audience(vec!["aud.example.com".to_string()]);
-            token.root_domains = Some(vec!["claimed.example.com".to_string()]);
-            assert_eq!(token.acceptable_root_domains(), vec!["claimed.example.com"]);
-
-            // The namespaced alias works too, and the fixed name wins when
-            // both are set.
-            token.namespaced_root_domains = Some(vec!["aliased.example.com".to_string()]);
-            assert_eq!(token.acceptable_root_domains(), vec!["claimed.example.com"]);
-            token.root_domains = None;
-            assert_eq!(token.acceptable_root_domains(), vec!["aliased.example.com"]);
-        }
-
-        #[test]
-        fn https_aud_entry_contributes_its_host_and_opaque_ones_contribute_nothing() {
-            let token = make_jwt_with_audience(vec![
-                "https://lore.example.com".to_string(),
-                "https://lore.example.com:8443/path".to_string(),
-                "http://insecure.example.com".to_string(),
-                "lore-api".to_string(),
-                "localhost:8080".to_string(),
-                "lore.example.com/path".to_string(),
-            ]);
-
-            assert_eq!(
-                token.acceptable_root_domains(),
-                // Both https entries name the same host; each contributes it.
-                vec![
-                    "lore.example.com".to_string(),
-                    "lore.example.com".to_string()
+                    "lore-1.example.com".to_string(),
+                    "lore-2.example.com".to_string(),
                 ]
             );
         }
@@ -161,6 +126,42 @@ mod tests {
             verify_jwt_usage_for_remote(&token, "lore.epicgames.net").unwrap();
             // The look-alike registrable domain does not.
             verify_jwt_usage_for_remote(&token, "evilepicgames.net").unwrap_err();
+        }
+
+        #[test]
+        fn legacy_audience_yields_only_the_suffix() {
+            let token = make_jwt_with_audience(vec!["URC".into(), ".epicgames.net".into()]);
+            assert_eq!(token.acceptable_root_domains(), vec![".epicgames.net"]);
+        }
+
+        #[test]
+        fn https_audience_yields_its_host() {
+            let token = make_jwt_with_audience(vec!["https://lore.example.com/api".into()]);
+            assert_eq!(token.acceptable_root_domains(), vec!["lore.example.com"]);
+        }
+
+        #[test]
+        fn opaque_audience_fails_closed() {
+            let token = make_jwt_with_audience(vec!["lore-api".into()]);
+            assert!(token.acceptable_root_domains().is_empty());
+            let err = verify_jwt_usage_for_remote(&token, "my_test_issuer.example.com")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("root_domains") && err.contains("audience"));
+        }
+
+        #[test]
+        fn root_domains_claim_wins_over_audience() {
+            let mut token = make_jwt_with_audience(vec!["other.example.org".into()]);
+            token.root_domains = Some(vec!["lore.example.com".into()]);
+            assert_eq!(token.acceptable_root_domains(), vec!["lore.example.com"]);
+        }
+
+        #[test]
+        fn namespaced_alias_is_read_identically() {
+            let mut token = make_jwt_with_audience(vec!["other.example.org".into()]);
+            token.root_domains_namespaced = Some(vec!["lore.example.com".into()]);
+            assert_eq!(token.acceptable_root_domains(), vec!["lore.example.com"]);
         }
     }
 }

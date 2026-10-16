@@ -1946,6 +1946,14 @@ impl State {
         self.data.read().revision_number
     }
 
+    pub fn committed_revision(&self) -> Hash {
+        if self.revision_number() == 0 {
+            self.parent_self()
+        } else {
+            self.revision()
+        }
+    }
+
     pub fn set_revision_number(&self, revision_number: u64) {
         let mut data = self.data.write();
         if data.revision_number != revision_number {
@@ -1954,11 +1962,24 @@ impl State {
         }
     }
 
+    /// Make the state a staged state on top of `current_revision`.
+    ///
+    /// A state that is the committed revision `current_revision` itself drops that revision's
+    /// second parent and metadata, which belong to the revision and not to the one staged on top
+    /// of it. A staged state, numbered 0, is left as it is when `current_revision` is its own
+    /// signature, which is no revision to stage on. A merge that
+    /// [reconciles divergent history](Self::reconciles_divergent_history) keeps its first parent,
+    /// the branch latest it merged; `current_revision` is already its second parent.
     pub fn reparent_onto(&self, current_revision: Hash) {
         let based_on_current = self.revision() == current_revision;
+        if based_on_current && self.revision_number() == 0 {
+            return;
+        }
 
         self.set_revision_number(0);
-        self.set_parent_self(current_revision);
+        if !self.reconciles_divergent_history(current_revision) {
+            self.set_parent_self(current_revision);
+        }
 
         if based_on_current {
             self.set_parent_other(Hash::default());
@@ -1968,6 +1989,13 @@ impl State {
 
     pub fn is_merge(&self) -> bool {
         self.data.read().flags & StateFlags::Merge != 0
+    }
+
+    /// Whether the state is a merge whose second parent is `current_revision`, which is how a
+    /// merge of the branch's latest into `current_revision` is staged: the branch latest is the
+    /// first parent and stays the first-parent line.
+    pub fn reconciles_divergent_history(&self, current_revision: Hash) -> bool {
+        self.is_merge() && self.parent_other() == current_revision
     }
 
     pub fn is_cherry_pick(&self) -> bool {
@@ -3522,12 +3550,24 @@ impl State {
 
     /// Collect the repository-relative paths of all dirty nodes at or under
     /// `root_node`, the set to stage. `base_path` is `root_node`'s path and the
-    /// prefix of every returned path.
+    /// prefix of every returned path. A dirty link is followed into the linked
+    /// state it pins, up to [`MAX_LINK_DEPTH`] links deep.
     pub async fn collect_dirty_paths(
         &self,
         repository: Arc<RepositoryContext>,
         root_node: NodeID,
         base_path: RelativePath,
+    ) -> Result<Vec<RelativePath>, StateError> {
+        self.collect_dirty_paths_linked(repository, root_node, base_path, 0)
+            .await
+    }
+
+    async fn collect_dirty_paths_linked(
+        &self,
+        repository: Arc<RepositoryContext>,
+        root_node: NodeID,
+        base_path: RelativePath,
+        link_depth: usize,
     ) -> Result<Vec<RelativePath>, StateError> {
         let mut result = Vec::new();
         let force = execution_context().globals().force();
@@ -3580,7 +3620,7 @@ impl State {
                     force,
                     states,
                     &child_path,
-                    child.is_directory(),
+                    !child.is_file(),
                     FilterMode::Full,
                 );
                 if excluded {
@@ -3589,6 +3629,19 @@ impl State {
 
                 if child.is_file() {
                     result.push(child_path);
+                } else if child.is_link() {
+                    if link_depth < MAX_LINK_DEPTH {
+                        let pin = child.linked_node();
+                        let (linked_repository, linked_state) = pin.open(&repository).await?;
+                        let linked_paths = Box::pin(linked_state.collect_dirty_paths_linked(
+                            linked_repository,
+                            pin.node,
+                            child_path,
+                            link_depth + 1,
+                        ))
+                        .await?;
+                        result.extend(linked_paths);
+                    }
                 } else if child.is_directory() {
                     // A new (dirty-add) directory is itself a change to stage; an
                     // empty one has no child files to carry it.
@@ -4678,10 +4731,10 @@ pub async fn rebase_staged_state(
 /// action (`DirtyAdd`/`DirtyModify`/`DirtyDelete`/`DirtyMove`/`DirtyCopy`).
 ///
 /// Propagated-only `Dirty` parents are walked but not recorded — only the
-/// leaves with concrete actions need re-application. Descent stops at link
-/// boundaries (children live in another repository's state) and at
-/// `DirtyDelete`/`DirtyMove` subtrees (the parent action carries the whole
-/// subtree when re-applied).
+/// leaves with concrete actions need re-application. A dirty link is followed
+/// into the linked state it pins, recording its paths below the mount. Descent
+/// stops at `DirtyDelete`/`DirtyMove` subtrees (the parent action carries the
+/// whole subtree when re-applied).
 pub(crate) async fn collect_dirty_paths(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
@@ -4909,8 +4962,9 @@ async fn dirty_walk_level(
 /// name, and under `skip_staged` most of a tree is wanted for neither: a commit
 /// stages what it writes.
 ///
-/// `parent_node` is walked only if it is a directory. Nothing below a link is in
-/// this state, and [`Node::child`] means nothing on a file.
+/// `parent_node` is walked only if it is a directory, as [`Node::child`] means
+/// nothing on a file. A dirty link is walked in the linked state it pins, up to
+/// [`MAX_LINK_DEPTH`] links deep, its paths named below the mount.
 ///
 /// `parent_path` is the path of `parent_node` and the buffer every descendant is
 /// named into, so naming costs no allocation and a path is allocated only where one
@@ -4934,10 +4988,36 @@ async fn collect_dirty_paths_inner(
     paths: &mut Vec<RelativePath>,
     options: DirtyWalkOptions,
 ) -> Result<(), StateError> {
-    let mut levels: Vec<DirtyWalkLevel> = Vec::with_capacity(DIRTY_WALK_LEVELS);
     // The parent is folded once; every level below carries the verdict its own
     // children step from.
     let parent_states = repository.filter.exclusion_states(&*parent_path);
+    collect_dirty_paths_linked(
+        state,
+        repository,
+        parent_node,
+        parent_path,
+        parent_states,
+        paths,
+        options,
+        0,
+    )
+    .await
+}
+
+/// [`collect_dirty_paths_inner`] in a state reached through `link_depth` links,
+/// from the filter's verdict for `parent_path`.
+#[allow(clippy::too_many_arguments)]
+async fn collect_dirty_paths_linked(
+    state: Arc<State>,
+    repository: Arc<RepositoryContext>,
+    parent_node: NodeID,
+    parent_path: &mut RelativePathBuf,
+    parent_states: FilterStates,
+    paths: &mut Vec<RelativePath>,
+    options: DirtyWalkOptions,
+    link_depth: usize,
+) -> Result<(), StateError> {
+    let mut levels: Vec<DirtyWalkLevel> = Vec::with_capacity(DIRTY_WALK_LEVELS);
     levels.extend(dirty_walk_level(&state, &repository, parent_node, false, parent_states).await?);
 
     while let Some(level) = levels.last_mut() {
@@ -4959,7 +5039,8 @@ async fn collect_dirty_paths_inner(
 
         let contributes = dirty_path_contributes(&child, options.skip_staged);
         let descends = dirty_path_descends(&child);
-        if !contributes && !descends {
+        let crosses = child.is_link() && link_depth < MAX_LINK_DEPTH;
+        if !contributes && !descends && !crosses {
             continue;
         }
 
@@ -4976,7 +5057,7 @@ async fn collect_dirty_paths_inner(
             options.force,
             level_states,
             &*parent_path,
-            child.is_directory(),
+            !child.is_file(),
             FilterMode::Full,
         );
 
@@ -4991,6 +5072,20 @@ async fn collect_dirty_paths_inner(
                     dirty_walk_level(&state, &repository, child_id, appended, child_states).await?;
                 descended = opened.is_some();
                 levels.extend(opened);
+            } else if crosses {
+                let pin = child.linked_node();
+                let (linked_repository, linked_state) = pin.open(&repository).await?;
+                Box::pin(collect_dirty_paths_linked(
+                    linked_state,
+                    linked_repository,
+                    pin.node,
+                    parent_path,
+                    child_states,
+                    paths,
+                    options,
+                    link_depth + 1,
+                ))
+                .await?;
             }
         }
 

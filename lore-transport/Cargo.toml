@@ -16,7 +16,6 @@ lore-credential = { workspace = true }
 
 async-trait = { workspace = true }
 async-stream = { workspace = true }
-base64 = { workspace = true }
 bitcode = { workspace = true }
 prost-types = { workspace = true }
 rand = { workspace = true }
@@ -49,6 +48,7 @@ lore-macro = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+base64 = { workspace = true }
 libc = { workspace = true }
 lore-transport = { workspace = true, features = ["test-util"] }
 

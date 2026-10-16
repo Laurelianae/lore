@@ -491,7 +491,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -532,7 +532,7 @@ mod defragment_integration {
         }
         let root_address = put_list(&store, partition, context, &refs, offset).await;
 
-        let options = ReadOptions::default().no_verify().with_decompress();
+        let options = ReadOptions::default().with_decompress();
         let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
             store.clone(),
             partition,
@@ -593,7 +593,7 @@ mod defragment_integration {
             partition,
             leaf_rx,
             data_tx,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         ));
 
@@ -689,7 +689,7 @@ mod defragment_integration {
             partition,
             leaf_rx,
             data_tx,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         ));
 
@@ -821,7 +821,7 @@ mod defragment_integration {
         }
         let root_address = put_list(&store, partition, context, &refs, offset).await;
 
-        let options = ReadOptions::default().no_verify().with_decompress();
+        let options = ReadOptions::default().with_decompress();
         let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
             store.clone(),
             partition,
@@ -1044,7 +1044,7 @@ mod defragment_integration {
             gets: gets.clone(),
         });
 
-        let options = ReadOptions::default().no_verify().with_decompress();
+        let options = ReadOptions::default().with_decompress();
         let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
             store.clone(),
             partition,
@@ -1103,7 +1103,7 @@ mod defragment_integration {
             gets: gets.clone(),
         });
 
-        let options = ReadOptions::default().no_verify().with_decompress();
+        let options = ReadOptions::default().with_decompress();
         let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
             store.clone(),
             partition,
@@ -1175,7 +1175,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1261,7 +1261,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1328,7 +1328,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1372,7 +1372,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1415,7 +1415,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1459,7 +1459,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1526,7 +1526,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1574,7 +1574,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1617,7 +1617,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1663,7 +1663,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1671,7 +1671,7 @@ mod defragment_integration {
 
         assert!(
             err.to_string()
-                .contains("entry at content offset 100 has a zero hash"),
+                .contains("entry 1 at content offset 100 has a zero hash"),
             "unexpected error: {err}"
         );
     }
@@ -1709,7 +1709,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1759,7 +1759,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1803,7 +1803,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1863,7 +1863,7 @@ mod defragment_integration {
             partition,
             leaf_rx,
             data_tx,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         ));
 
@@ -1984,7 +1984,7 @@ mod defragment_integration {
         assert_ne!(leaves[1].0.flags & FragmentFlags::PayloadCompressed, 0);
 
         for options in [
-            ReadOptions::default().no_decompress().no_verify(),
+            ReadOptions::default().no_decompress(),
             ReadOptions::default(),
         ] {
             let (fragment, list) = list_over(&entries, content.len() as u64);
@@ -2039,7 +2039,7 @@ mod defragment_integration {
             fragment,
             list,
             tx,
-            ReadOptions::default().no_decompress().no_verify(),
+            ReadOptions::default().no_decompress(),
             None,
         )
         .await;
@@ -2082,5 +2082,89 @@ mod whole_leaf {
         assert!(whole_leaf(zstd(10, 64), payload.clone(), 64, 0..32).is_err());
         assert!(whole_leaf(zstd(11, 64), payload.clone(), 64, 0..64).is_err());
         assert!(whole_leaf(uncompressed, payload, 64, 0..64).is_err());
+    }
+}
+
+mod list_checks {
+    use super::*;
+
+    /// An entry at `offset` with a distinct, non-zero hash.
+    fn entry(offset: u64) -> FragmentReference {
+        FragmentReference {
+            hash: lore_storage::hash::hash_slice(&offset.to_le_bytes()),
+            offset_content: offset,
+        }
+    }
+
+    /// The entries a window reaches form one range; a window past the level reaches none.
+    #[test]
+    fn wanted_entries_answers_the_entries_a_window_reaches() {
+        let list = [entry(0), entry(100), entry(200)];
+
+        assert_eq!(
+            wanted_entries(&list, 300, &(50..150)).expect("a valid list"),
+            Some(0..2)
+        );
+        assert_eq!(
+            wanted_entries(&list, 300, &(300..400)).expect("a valid list"),
+            None
+        );
+    }
+
+    /// An entry the window does not reach is checked all the same: a zero hash there fails the
+    /// call, whichever part of the content the caller asked for.
+    #[test]
+    fn wanted_entries_rejects_a_zero_hash_outside_the_window() {
+        let list = [
+            entry(0),
+            FragmentReference {
+                hash: Hash::default(),
+                offset_content: 100,
+            },
+        ];
+
+        let err = wanted_entries(&list, 200, &(0..50)).expect_err("a zero hash is no entry");
+
+        assert!(
+            err.to_string()
+                .contains("entry 1 at content offset 100 has a zero hash"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A sublist covers exactly the window its parent's list gives it: one that starts at the
+    /// parent's offset and expands to the window passes, and one that falls short fails, as do an
+    /// empty sublist, a window that starts elsewhere than the parent, a reversed window and a
+    /// zero-hash parent.
+    #[test]
+    fn sublist_coverage_requires_the_parents_window() {
+        let parent = entry(100);
+        let sub_list = [entry(100), entry(150)];
+
+        sublist_coverage(&parent, &sub_list, 100, &(100..200)).expect("an exact sublist");
+        let err = sublist_coverage(&parent, &sub_list, 90, &(100..200))
+            .expect_err("a sublist that falls short");
+        assert!(
+            err.to_string().contains("expands to 90 bytes"),
+            "unexpected error: {err}"
+        );
+
+        assert!(sublist_coverage(&parent, &[], 100, &(100..200)).is_err());
+        let reversed = Range {
+            start: 100,
+            end: 50,
+        };
+        assert!(sublist_coverage(&parent, &sub_list, 100, &reversed).is_err());
+        let err = sublist_coverage(&parent, &sub_list, 100, &(50..200))
+            .expect_err("a window that starts before the parent's offset");
+        assert!(
+            err.to_string().contains("given the window 50..200"),
+            "unexpected error: {err}"
+        );
+        let zero = FragmentReference {
+            hash: Hash::default(),
+            offset_content: 100,
+        };
+        assert!(sublist_coverage(&zero, &sub_list, 100, &(100..200)).is_err());
     }
 }

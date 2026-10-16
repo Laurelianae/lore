@@ -31,10 +31,6 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use futures::FutureExt;
-use futures::future::BoxFuture;
-use futures::future::Shared;
-use lore_base::lore_spawn;
 use lore_base::lore_spawn_guarded;
 use lore_error_set::prelude::*;
 use lore_transport::Connection;
@@ -43,7 +39,6 @@ use lore_transport::RepositoryData;
 use lore_transport::SessionPool;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use zerocopy::IntoBytes;
 
@@ -75,6 +70,7 @@ use crate::lore_debug;
 use crate::lore_warn;
 use crate::metadata::Metadata;
 use crate::protocol;
+use crate::protocol::RemoteFuture;
 use crate::revision;
 use crate::revision::sync;
 use crate::revision::sync::SyncOptions;
@@ -536,11 +532,6 @@ struct InternalServerContext;
 impl ServerContext for InternalServerContext {}
 const INTERNAL_SERVER_CONTEXT: InternalServerContext = InternalServerContext;
 
-/// Shared, clone-able future that resolves the pending remote connection exactly once
-/// while fanning the result out to all awaiters.
-#[lore_macro::test_pub]
-type RemoteFuture = Shared<BoxFuture<'static, Result<Arc<Connection>, ProtocolError>>>;
-
 /// State machine for the remote connection. Lives behind `Arc<RwLock<_>>` so related
 /// contexts (e.g. filter views) can share the same underlying connection state while
 /// link/layer contexts build their own against a freshly-connected module.
@@ -633,19 +624,18 @@ pub struct RepositoryContext {
     write_token: Option<RepositoryWriteToken>,
     repo_lock: Option<Arc<RepositoryLock>>,
     /// The storage session pool this repository's reads and writes take sessions from,
-    /// resolved on first use.
-    ///
-    /// Weak on purpose. The strong reference lives in the connection's session
-    /// cache, and `StorageSession::invalidate` clears that cache when the server
-    /// reports a stale session id — after a reconnect that rotated its session
-    /// map, say. An invalidated pool then stops upgrading here, so the next caller
-    /// resolves a fresh one rather than handing out sessions the server has
-    /// forgotten.
-    session_pool: parking_lot::RwLock<Weak<SessionPool>>,
-    /// The lazy storage session this context's reads and writes carry, built on first
-    /// use. Held strongly: a pending session re-resolves after invalidation, so one
-    /// serves every operation against this context's partition for its lifetime.
-    lazy_session: parking_lot::RwLock<Option<Arc<lore_transport::StorageSession>>>,
+    /// resolved on first use, and resolved again for a call under another correlation id or
+    /// once the pool is stale, as after a reconnect rotated the server's session map.
+    session_pool: parking_lot::RwLock<Option<Arc<SessionPool>>>,
+    /// Whether this context is the only holder of its session pool, so the pool's sessions
+    /// stop with the context, as a revision tree handle's do. Otherwise the connection pins
+    /// the pool as well, for later calls under the same correlation id to take.
+    holds_its_sessions: bool,
+    /// The lazy storage session this context's reads and writes carry, with the correlation id
+    /// it was built for. Held strongly: a pending session re-resolves after invalidation, so one
+    /// serves every operation against this context's partition under that correlation id, until
+    /// an operation under another replaces it.
+    lazy_session: parking_lot::RwLock<Option<(Arc<str>, Arc<lore_transport::StorageSession>)>>,
 }
 
 impl std::fmt::Debug for RepositoryContext {
@@ -730,6 +720,7 @@ impl RepositoryContext {
             write_token: None,
             repo_lock: None,
             session_pool: Default::default(),
+            holds_its_sessions: false,
             lazy_session: Default::default(),
             file_system,
         }
@@ -760,6 +751,7 @@ impl RepositoryContext {
             write_token: self.write_token.as_ref().map(|token| token.share()),
             repo_lock: self.repo_lock.clone(),
             session_pool: Default::default(),
+            holds_its_sessions: self.holds_its_sessions,
             lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
@@ -849,6 +841,7 @@ impl RepositoryContext {
     /// propagate the field). Used by `load_and_connect` on the disk-backed
     /// path; other construction paths leave `repo_lock` as `None`.
     #[must_use]
+    #[lore_macro::test_pub]
     pub(crate) fn with_repository_lock(mut self, lock: Arc<RepositoryLock>) -> Self {
         self.repo_lock = Some(lock);
         self
@@ -1020,6 +1013,7 @@ impl RepositoryContext {
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
             session_pool: Default::default(),
+            holds_its_sessions: false,
             lazy_session: Default::default(),
         }
     }
@@ -1042,6 +1036,19 @@ impl RepositoryContext {
         mutable_store: Arc<dyn MutableStore>,
     ) -> Self {
         Self::new_server_context(immutable_store, mutable_store, RepositoryId::default())
+    }
+
+    /// This context without the write token and repository lock, for a holder that outlives
+    /// the command it came from: a token held past the command blocks every later write to the
+    /// instance. Its filesystem provider is an invalid one, so the holder never keeps the
+    /// provider alive.
+    pub fn without_command_locks(&self) -> Self {
+        RepositoryContext {
+            write_token: None,
+            repo_lock: None,
+            file_system: crate::fs::invalid_filesystem_provider::InvalidFilesystemProvider::new(),
+            ..self.inherited()
+        }
     }
 
     /// Rebuild this context with a different filter view and remote connection,
@@ -1169,40 +1176,63 @@ impl RepositoryContext {
         result
     }
 
-    /// The storage session pool for this repository, resolved once and reused for
-    /// as long as it lives.
-    ///
-    /// `correlation_id` is only read when the pool has to be resolved. It belongs
-    /// to the command being executed and a context belongs to one command, so a
-    /// cached pool is always the one this context's correlation id asked for.
+    /// The storage session pool for this repository under `correlation_id`, resolved once and
+    /// reused for as long as it [`serves`](SessionPool::serves) that correlation id.
     #[lore_macro::test_pub]
     pub(crate) async fn session_pool(
         &self,
         correlation_id: &str,
     ) -> Result<Arc<SessionPool>, ProtocolError> {
-        if let Some(pool) = self.cached_session_pool() {
+        if let Some(pool) = self.cached_session_pool(correlation_id) {
             return Ok(pool);
         }
         let remote = self.remote().await?;
-        let pool = remote.session_pool(self.id, correlation_id).await?;
-        *self.session_pool.write() = Arc::downgrade(&pool);
+        let pool = if self.holds_its_sessions {
+            remote
+                .unpinned_session_pool(self.id, correlation_id)
+                .await?
+        } else {
+            remote.session_pool(self.id, correlation_id).await?
+        };
+        *self.session_pool.write() = Some(pool.clone());
         Ok(pool)
     }
 
-    /// The lazy storage session for this context, built once and shared. Partition-scoped,
-    /// so a derived context for a link or a layer resolves its own rather than borrowing one
-    /// started for another partition.
-    pub(crate) fn lazy_session(
-        &self,
-        build: impl FnOnce() -> Arc<lore_transport::StorageSession>,
-    ) -> Arc<lore_transport::StorageSession> {
-        if let Some(session) = self.lazy_session.read().as_ref() {
-            return session.clone();
-        }
-        self.lazy_session.write().get_or_insert_with(build).clone()
+    /// This context as the only holder of its session pools, so their sessions stop with it
+    /// rather than stay pinned on the connection.
+    pub fn holding_its_sessions(mut self) -> Self {
+        self.holds_its_sessions = true;
+        self
     }
 
-    /// The session pool if one is already resolved, live and not stale, without
+    /// The lazy storage session for this context under `correlation_id`, shared by every
+    /// operation under it. `build` makes one for the correlation id in place of a session held
+    /// for another, so operations of overlapping calls under distinct ids never share one.
+    /// Partition-scoped, so a derived context for a link or a layer resolves its own rather than
+    /// borrowing one started for another partition.
+    pub(crate) fn lazy_session(
+        &self,
+        correlation_id: &str,
+        build: impl FnOnce(Arc<str>) -> Arc<lore_transport::StorageSession>,
+    ) -> Arc<lore_transport::StorageSession> {
+        if let Some((held, session)) = self.lazy_session.read().as_ref()
+            && **held == *correlation_id
+        {
+            return session.clone();
+        }
+        let mut lazy = self.lazy_session.write();
+        if let Some((held, session)) = lazy.as_ref()
+            && **held == *correlation_id
+        {
+            return session.clone();
+        }
+        let correlation_id = Arc::<str>::from(correlation_id);
+        let session = build(correlation_id.clone());
+        *lazy = Some((correlation_id, session.clone()));
+        session
+    }
+
+    /// The session pool if one is already resolved and serves `correlation_id`, without
     /// touching the remote. `None` means "resolve it", not "there is none".
     ///
     /// Private so the pool is only ever reached through [`Self::session_pool`]. A
@@ -1210,19 +1240,18 @@ impl RepositoryContext {
     /// session cannot be invalidated and retried — see [`crate::immutable`]'s
     /// session resolution.
     #[lore_macro::test_pub]
-    fn cached_session_pool(&self) -> Option<Arc<SessionPool>> {
+    fn cached_session_pool(&self, correlation_id: &str) -> Option<Arc<SessionPool>> {
         self.session_pool
             .read()
-            .upgrade()
-            .filter(|pool| !pool.is_stale())
+            .as_ref()
+            .filter(|pool| pool.serves(correlation_id))
+            .cloned()
     }
 
     /// Hold `pool` as resolved, standing in for a resolution against a live remote.
-    /// The caller keeps the strong reference, as the connection's session cache
-    /// does.
     #[cfg(feature = "test-util")]
     pub fn set_session_pool(&self, pool: &Arc<SessionPool>) {
-        *self.session_pool.write() = Arc::downgrade(pool);
+        *self.session_pool.write() = Some(pool.clone());
     }
 
     /// Whether this context is known to hold no remote, answered without waiting
@@ -1488,6 +1517,7 @@ pub fn load_repository_config(path: impl AsRef<Path>) -> Result<RepositoryConfig
 /// managed via an `Arc` + weak-ref cache so overlapping commands share one
 /// acquisition; the underlying flock drops when the last strong reference is
 /// released.
+#[lore_macro::test_pub]
 pub(crate) struct RepositoryLock {
     _lock: FSLock,
 }
@@ -1511,6 +1541,7 @@ static REPOSITORY_LOCK_INIT_MUTEXES: OnceLock<
 /// reference drops. Concurrent first-time initializers are serialized via a
 /// per-path `tokio::sync::Mutex` so only one thread calls into the OS flock
 /// for a given path at a time; others wait, then observe the cached entry.
+#[lore_macro::test_pub]
 pub(crate) async fn get_or_create_repository_lock(
     dot_path: PathBuf,
 ) -> Result<Arc<RepositoryLock>, RepositoryError> {
@@ -1940,7 +1971,7 @@ fn connect(
     let identity = identity.as_deref().unwrap_or_default().to_string();
 
     let correlation_id = globals.correlation_id.to_string();
-    let handle: JoinHandle<Result<Arc<Connection>, ProtocolError>> = lore_spawn!(async move {
+    Ok(protocol::shared_connect(async move {
         let connection =
             protocol::connect(remote_url.as_str(), identity.as_str(), repository).await?;
         // Pre-warm the session pool so it's ready when the command runs
@@ -1948,16 +1979,7 @@ fn connect(
             let _ = connection.session_pool(repository, &correlation_id).await;
         }
         Ok(connection)
-    });
-
-    // Wrap the JoinHandle in a Shared future so many awaiters can poll one spawned task.
-    Ok(async move {
-        handle
-            .await
-            .unwrap_or_else(|_| Err(ProtocolError::internal("connect task failed")))
-    }
-    .boxed()
-    .shared())
+    }))
 }
 
 pub fn read_id_from_file(path: PathBuf) -> io::Result<RepositoryId> {
@@ -2599,7 +2621,11 @@ pub async fn create_local(
     let config_path = dotpath.join(CONFIG);
     save_config(config_path, &config).await?;
 
-    repository.flush(true).await?;
+    // Written before returning, since clone drops this handle and loads the
+    // repository afresh from disk; synced only under `--sync-data`.
+    let sync_data = crate::runtime::try_execution_context()
+        .is_some_and(|context| context.globals().sync_data());
+    repository.flush(sync_data).await?;
 
     Ok(repository)
 }

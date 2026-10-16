@@ -27,6 +27,7 @@ use lore_credential::verify_jwt_usage_for_remote;
 use lore_error_set::prelude::*;
 use tokio::sync::Mutex;
 
+use crate::auth::AuthEndpoint;
 use crate::auth::authentication;
 use crate::connection::CredentialStore;
 use crate::connection::credential_store;
@@ -45,7 +46,7 @@ pub enum ExchangeError {
     Oversized,
 }
 
-type AuthUrl = String;
+type AuthEndpointUrl = String;
 type Identity = String;
 type CacheResourceId = String;
 type RecipientDomain = String;
@@ -53,7 +54,7 @@ type CredentialFingerprint = String;
 type AuthzCache = Mutex<
     HashMap<
         (
-            AuthUrl,
+            AuthEndpointUrl,
             Identity,
             CacheResourceId,
             RecipientDomain,
@@ -150,7 +151,7 @@ async fn refresh_if_expired(auth_url: &str, identity: &str) -> Option<String> {
 /// by the token store the call reads, so a call is never served an authorization
 /// another caller's store produced.
 ///
-/// Token store keys use `"{auth_url}/{repository_id}"` (no implementation-
+/// Token store keys use `"{auth_endpoint.url}/{repository_id}"` (no implementation-
 /// specific prefix). The `Authentication` implementation handles resource ID
 /// formatting internally.
 ///
@@ -158,7 +159,7 @@ async fn refresh_if_expired(auth_url: &str, identity: &str) -> Option<String> {
 ///
 /// A non-empty `access_token` the authorization token.
 pub async fn exchange(
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     identity: &str,
     repository: RepositoryId,
     recipient_domain: String,
@@ -169,7 +170,7 @@ pub async fn exchange(
         lore_debug!("Using the supplied access token for repository {repository}");
         return Ok(access_token.to_string());
     }
-    if auth_url.is_empty() {
+    if auth_endpoint.is_none() {
         lore_debug!("No auth url, unable to perform authz exchange");
         return Err(NotSupported {
             operation: "No authentication configured on server".to_string(),
@@ -181,8 +182,8 @@ pub async fn exchange(
         return Err(NotAuthenticated.into());
     }
 
-    let auth_domain = get_domain_or_empty(auth_url);
-    let auth_url = auth_url.to_string();
+    let auth_domain = get_domain_or_empty(&auth_endpoint.url);
+    let auth_url = auth_endpoint.url.clone();
     let repo_id_str = repository.to_string();
     // A supplied access token returned above, so the identity token is the only
     // credential that reaches the cache or the store from here.
@@ -205,8 +206,8 @@ pub async fn exchange(
 
     let mut token = cache.get(&cache_key).cloned().unwrap_or_default();
 
-    // Token store key: "{auth_url}/{repository_id}" (no urc- prefix)
-    let token_store_key = format!("{auth_url}/{repo_id_str}");
+    // Token store key: "{auth_endpoint}/{repository_id}" (no urc- prefix)
+    let token_store_key = format!("{auth_endpoint}/{repo_id_str}");
 
     if !token.is_empty() {
         lore_trace!("Found cached authz token for {cache_key:?}");
@@ -252,13 +253,12 @@ pub async fn exchange(
         lore_debug!("Not authenticated, unable to perform authz exchange");
         return Err(NotAuthenticated.into());
     };
-    lore_trace!("Authorizing using endpoint: {auth_url}");
+    lore_trace!("Authorizing using endpoint: {auth_endpoint}");
 
     let time_start = Instant::now();
 
     // Delegate to the Authentication implementation
-    let auth_impl = authentication::find(&auth_url)
-        .forward::<ExchangeError>("Unable to connect to auth exchange endpoint")?;
+    let auth_impl = &auth_endpoint.auth;
     // The correlation_id is no longer available from ExecutionContext in lore-transport.
     // Pass an empty string -- the gRPC interceptor may inject it from ambient state.
     let correlation_id = String::new();
@@ -275,6 +275,8 @@ pub async fn exchange(
         .map_err(|err| {
             if err.is_not_authorized() {
                 ExchangeError::from(NotAuthorized)
+            } else if err.is_not_authenticated() {
+                ExchangeError::from(NotAuthenticated)
             } else {
                 ExchangeError::internal_with_context(err, "Failed to exchange token")
             }
@@ -330,7 +332,7 @@ pub async fn exchange(
 ///
 /// `identity_token` and `access_token` are the caller-supplied credentials.
 pub async fn exchange_custom_resource(
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     identity: &str,
     resource_id: &str,
     recipient_domain: String,
@@ -341,7 +343,7 @@ pub async fn exchange_custom_resource(
         lore_debug!("Using the supplied access token for resource {resource_id}");
         return Ok(access_token.to_string());
     }
-    if auth_url.is_empty() {
+    if auth_endpoint.is_none() {
         lore_debug!("No auth url, unable to perform authz exchange");
         return Err(NotSupported {
             operation: "No authentication configured on server".to_string(),
@@ -359,8 +361,8 @@ pub async fn exchange_custom_resource(
         ));
     }
 
-    let auth_domain = get_domain_or_empty(auth_url);
-    let auth_url = auth_url.to_string();
+    let auth_domain = get_domain_or_empty(&auth_endpoint.url);
+    let auth_url = auth_endpoint.url.clone();
     // A supplied access token returned above, so the identity token is the only
     // credential that reaches the cache or the store from here.
     let credential_fingerprint = lore_credential::token_fingerprint(identity_token);
@@ -382,9 +384,9 @@ pub async fn exchange_custom_resource(
 
     let mut token = cache.get(&cache_key).cloned().unwrap_or_default();
 
-    // Token store key: "{auth_url}/{resource_id}" -- same shape as the
+    // Token store key: "{auth_endpoint}/{resource_id}" -- same shape as the
     // repository variant, with the resource ID taking the repository slot.
-    let token_store_key = format!("{auth_url}/{resource_id}");
+    let token_store_key = format!("{auth_endpoint}/{resource_id}");
 
     if !token.is_empty() {
         lore_trace!("Found cached authz token for {cache_key:?}");
@@ -429,12 +431,11 @@ pub async fn exchange_custom_resource(
         lore_debug!("Not authenticated, unable to perform authz exchange");
         return Err(NotAuthenticated.into());
     };
-    lore_trace!("Authorizing using endpoint: {auth_url}");
+    lore_trace!("Authorizing using endpoint: {auth_endpoint}");
 
     let time_start = Instant::now();
 
-    let auth_impl = authentication::find(&auth_url)
-        .forward::<ExchangeError>("Unable to connect to auth exchange endpoint")?;
+    let auth_impl = &auth_endpoint.auth;
     // The correlation_id is no longer available from ExecutionContext in lore-transport.
     // Pass an empty string -- the gRPC interceptor may inject it from ambient state.
     let correlation_id = String::new();
@@ -451,6 +452,8 @@ pub async fn exchange_custom_resource(
         .map_err(|err| {
             if err.is_not_authorized() {
                 ExchangeError::from(NotAuthorized)
+            } else if err.is_not_authenticated() {
+                ExchangeError::from(NotAuthenticated)
             } else {
                 ExchangeError::internal_with_context(err, "Failed to exchange token")
             }
@@ -501,12 +504,12 @@ pub async fn exchange_custom_resource(
 /// Returned tuple: (`authentication_token`, `authorization_token`, `resolved_identity`)
 ///
 /// If `identity` is empty, iterates over available identities for the given
-/// `auth_url` and tries to find one that can authenticate (and optionally
+/// `auth_endpoint` and tries to find one that can authenticate (and optionally
 /// authorize for the given repository).
 ///
 /// `identity_token` and `access_token` are the caller-supplied credentials.
 pub async fn auth_exchange(
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     remote_domain: &str,
     identity: &str,
     repository: RepositoryId,
@@ -515,7 +518,7 @@ pub async fn auth_exchange(
 ) -> (String, String, String) {
     if !identity.is_empty() {
         return auth_exchange_for_identity(
-            auth_url,
+            auth_endpoint,
             remote_domain,
             identity,
             repository,
@@ -526,8 +529,8 @@ pub async fn auth_exchange(
     }
 
     // No identity given, resolve one from available identities
-    let Ok(identities) = token_store::load_identities(auth_url).await else {
-        lore_debug!("No identities found for {auth_url}");
+    let Ok(identities) = token_store::load_identities(&auth_endpoint.url).await else {
+        lore_debug!("No identities found for {auth_endpoint}");
         return (String::new(), String::new(), String::new());
     };
 
@@ -535,7 +538,7 @@ pub async fn auth_exchange(
         // No resource, pick first identity with a valid authn token
         for entry in &identities {
             let result =
-                auth_exchange_for_identity(auth_url, remote_domain, entry, repository, "", "")
+                auth_exchange_for_identity(auth_endpoint, remote_domain, entry, repository, "", "")
                     .await;
             if !result.0.is_empty() {
                 return result;
@@ -547,7 +550,8 @@ pub async fn auth_exchange(
     // Try each identity: first check for cached/stored authz token, then try exchange
     for entry in &identities {
         let result =
-            auth_exchange_for_identity(auth_url, remote_domain, entry, repository, "", "").await;
+            auth_exchange_for_identity(auth_endpoint, remote_domain, entry, repository, "", "")
+                .await;
         if !result.1.is_empty() {
             return result;
         }
@@ -558,7 +562,7 @@ pub async fn auth_exchange(
 }
 
 async fn auth_exchange_for_identity(
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     remote_domain: &str,
     identity: &str,
     repository: RepositoryId,
@@ -566,7 +570,7 @@ async fn auth_exchange_for_identity(
     access_token: &str,
 ) -> (String, String, String) {
     let authentication_token = token_store::load_user_token(
-        auth_url,
+        &auth_endpoint.url,
         identity,
         tokens_only_for_recipient_domain(remote_domain.to_string()),
         identity_token,
@@ -598,7 +602,7 @@ async fn auth_exchange_for_identity(
         && let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
         && is_expired(info.expires)
     {
-        if let Some(refreshed) = refresh_if_expired(auth_url, identity).await {
+        if let Some(refreshed) = refresh_if_expired(&auth_endpoint.url, identity).await {
             authentication_token = refreshed;
         } else {
             lore_debug!("Skipping identity {identity}, authn token is expired");
@@ -610,7 +614,7 @@ async fn auth_exchange_for_identity(
     // or perform an authz exchange if needed
     let authorization_token = if !repository.is_zero() {
         exchange(
-            auth_url,
+            auth_endpoint,
             identity,
             repository,
             remote_domain.to_string(),
@@ -682,7 +686,7 @@ async fn auth_exchange_for_identity(
 /// Mirrors `auth_exchange`, but authorizes against a caller-supplied resource
 /// identifier rather than a repository.
 pub async fn auth_exchange_custom_resource(
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     remote_domain: &str,
     identity: &str,
     resource_id: &str,
@@ -691,7 +695,7 @@ pub async fn auth_exchange_custom_resource(
 ) -> (String, String, String) {
     if !identity.is_empty() {
         return auth_exchange_custom_resource_for_identity(
-            auth_url,
+            auth_endpoint,
             remote_domain,
             identity,
             resource_id,
@@ -701,15 +705,15 @@ pub async fn auth_exchange_custom_resource(
         .await;
     }
 
-    let Ok(identities) = token_store::load_identities(auth_url).await else {
-        lore_debug!("No identities found for {auth_url}");
+    let Ok(identities) = token_store::load_identities(&auth_endpoint.url).await else {
+        lore_debug!("No identities found for {auth_endpoint}");
         return (String::new(), String::new(), String::new());
     };
 
     // Store-resolved identities use store credentials, pass empty tokens.
     for entry in &identities {
         let result = auth_exchange_custom_resource_for_identity(
-            auth_url,
+            auth_endpoint,
             remote_domain,
             entry,
             resource_id,
@@ -727,7 +731,7 @@ pub async fn auth_exchange_custom_resource(
 }
 
 async fn auth_exchange_custom_resource_for_identity(
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     remote_domain: &str,
     identity: &str,
     resource_id: &str,
@@ -735,7 +739,7 @@ async fn auth_exchange_custom_resource_for_identity(
     access_token: &str,
 ) -> (String, String, String) {
     let authentication_token = token_store::load_user_token(
-        auth_url,
+        &auth_endpoint.url,
         identity,
         tokens_only_for_recipient_domain(remote_domain.to_string()),
         identity_token,
@@ -761,7 +765,7 @@ async fn auth_exchange_custom_resource_for_identity(
         && let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
         && is_expired(info.expires)
     {
-        if let Some(refreshed) = refresh_if_expired(auth_url, identity).await {
+        if let Some(refreshed) = refresh_if_expired(&auth_endpoint.url, identity).await {
             authentication_token = refreshed;
         } else {
             lore_debug!("Skipping identity {identity}, authn token is expired");
@@ -770,7 +774,7 @@ async fn auth_exchange_custom_resource_for_identity(
     }
 
     let authorization_token = exchange_custom_resource(
-        auth_url,
+        auth_endpoint,
         identity,
         resource_id,
         remote_domain.to_string(),

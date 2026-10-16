@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic;
 use std::sync::atomic::AtomicUsize;
+use std::time::Duration;
 
 use bytes::Bytes;
 use lore_storage::Address;
@@ -14,6 +15,7 @@ use lore_storage::Fragment;
 use lore_storage::FragmentFlags;
 use lore_storage::FragmentReference;
 use lore_storage::Hash;
+use lore_storage::PackfileSize;
 use lore_storage::Partition;
 use lore_storage::hash;
 use lore_storage::immutable_store::CopyBehavior;
@@ -21,12 +23,16 @@ use lore_storage::immutable_store::StoreError;
 use lore_storage::local::immutable_store::info::info_path_for_store_root;
 use lore_storage::store_types::StoreMatch;
 use lore_storage::store_types::StoreMatchResult;
+use lore_storage::test_util::PausePoint;
+use lore_storage::test_util::pause_at;
+use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
 
 mod info;
 #[cfg(feature = "oodle")]
 mod oodle_migration;
+mod payload_gate;
 
 use lore_storage::local::immutable_store::*;
 
@@ -37,6 +43,8 @@ use crate::store_fixture::payloads_in_one_group;
 use crate::store_fixture::payloads_of_size_in_one_group;
 use crate::store_fixture::put_payload;
 use crate::store_fixture::try_compact_group_toward;
+use crate::store_fixture::try_put_payload;
+use crate::store_fixture::wait_until;
 
 fn write_bucket_file(path: &Path, version: u32) {
     let entry = ImmutableStoreEntry::default();
@@ -87,8 +95,8 @@ async fn deserialize_scatters_a_bucket_larger_than_the_head_read() {
     }
     std::fs::write(&path, &bytes).unwrap();
 
-    let (sorted_index, entry, _upgrade, _dirty) =
-        ImmutableStoreBucket::deserialize_files(path).await.unwrap();
+    let file = ImmutableStoreBucket::deserialize_files(path).await.unwrap();
+    let (sorted_index, entry) = (file.sorted_index, file.entry);
 
     assert_eq!(sorted_index.len(), count);
     assert_eq!(entry.len(), count);
@@ -765,8 +773,12 @@ async fn deserialize_recovers_from_bad_count_header() {
     let path = dir.path().join("bucket");
     write_bucket_file_with_count_mismatch(&path, 670, 518);
     let result = ImmutableStoreBucket::deserialize_files(path.clone()).await;
-    let (sorted_index, entry, _, mark_dirty) =
-        result.expect("count-mismatch corruption must recover");
+    let BucketFile {
+        sorted_index,
+        entry,
+        mark_dirty,
+        ..
+    } = result.expect("count-mismatch corruption must recover");
     assert!(sorted_index.is_empty());
     assert!(entry.is_empty());
     assert!(!mark_dirty);
@@ -780,7 +792,11 @@ async fn deserialize_recovers_from_invalid_version() {
     let path = dir.path().join("bucket");
     write_bucket_file(&path, 0xFFFF);
     let result = ImmutableStoreBucket::deserialize_files(path.clone()).await;
-    let (sorted_index, entry, _, _) = result.expect("invalid-version corruption must recover");
+    let BucketFile {
+        sorted_index,
+        entry,
+        ..
+    } = result.expect("invalid-version corruption must recover");
     assert!(sorted_index.is_empty());
     assert!(entry.is_empty());
     assert!(!path.exists(), "corrupt bucket file must be removed");
@@ -804,7 +820,11 @@ async fn deserialize_recovers_from_truncated_entries() {
     std::fs::write(&path, bytes).unwrap();
 
     let result = ImmutableStoreBucket::deserialize_files(path.clone()).await;
-    let (sorted_index, entry, _, _) = result.expect("truncated-entries corruption must recover");
+    let BucketFile {
+        sorted_index,
+        entry,
+        ..
+    } = result.expect("truncated-entries corruption must recover");
     assert!(sorted_index.is_empty());
     assert!(entry.is_empty());
     assert!(!path.exists(), "corrupt bucket file must be removed");
@@ -817,7 +837,11 @@ async fn deserialize_recovers_from_short_header() {
     let path = dir.path().join("bucket");
     std::fs::write(&path, [0u8; 4]).unwrap();
     let result = ImmutableStoreBucket::deserialize_files(path.clone()).await;
-    let (sorted_index, entry, _, _) = result.expect("short-header corruption must recover");
+    let BucketFile {
+        sorted_index,
+        entry,
+        ..
+    } = result.expect("short-header corruption must recover");
     assert!(sorted_index.is_empty());
     assert!(entry.is_empty());
     assert!(!path.exists(), "corrupt bucket file must be removed");
@@ -2285,11 +2309,14 @@ async fn a_stamp_reaches_the_bucket_file() {
     store.clone().flush(true).await.unwrap();
 
     let root = store.path.clone().expect("a disk-backed store has a path");
-    let (_sorted_index, entry, _upgrade, _dirty) = ImmutableStoreBucket::deserialize_files(
-        format_bucket_path(&root, group_index, bucket_index),
-    )
+    let entry = ImmutableStoreBucket::deserialize_files(format_bucket_path(
+        &root,
+        group_index,
+        bucket_index,
+    ))
     .await
-    .unwrap();
+    .unwrap()
+    .entry;
 
     assert_eq!(entry.len(), 1, "the stamp must have dirtied the bucket");
     assert!(
@@ -4241,4 +4268,1005 @@ async fn compaction_goes_on_past_a_group_whose_packfiles_fail_to_load() {
         .await
         .unwrap();
     assert_payloads_read_back(&store, partition, failing_local).await;
+}
+
+/// A client store over `dir` holding `payloads`, all in one group, the first `durable` of them
+/// durable and the rest local, flushed, so that compacting the group evicts the durable ones and
+/// rewrites packfile 1 down to the local ones.
+async fn store_for_rewrite(
+    dir: &Path,
+    partition: Partition,
+    payloads: &[Vec<u8>],
+    durable: usize,
+) -> Arc<LocalImmutableStore> {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    for (index, payload) in payloads.iter().enumerate() {
+        put_payload(
+            &store,
+            partition,
+            Context::default(),
+            payload,
+            index < durable,
+        )
+        .await;
+    }
+    store.clone().flush(true).await.unwrap();
+    store
+}
+
+/// A payload written into a packfile before compaction stopped writes to it, whose entry is not
+/// in the index yet, is copied by the rewrite once the entry is in, rather than truncated away
+/// under the entry: compaction waits for it.
+#[tokio::test]
+async fn compaction_waits_for_an_entry_written_into_a_packfile_it_rewrites() {
+    let dir = lore_base::test_util::TempDir::new("is_compact_unindexed_");
+    let partition = Partition::from([0x31u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(5);
+    let store = store_for_rewrite(&dir, partition, &payloads[..4], 2).await;
+
+    let selected = pause_at(PausePoint::Selected);
+    let compaction = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { compact_group(&store, group_index).await })
+    };
+    selected.reached.notified().await;
+
+    let written = pause_at(PausePoint::Written);
+    let put = {
+        let store = store.clone();
+        let payload = payloads[4].clone();
+        lore_base::lore_spawn!(async move {
+            put_payload(&store, partition, Context::default(), &payload, false).await
+        })
+    };
+    written.reached.notified().await;
+    selected.resume.notify_one();
+
+    let gate = &store.group[group_index].payload_gate;
+    wait_until(|| gate.is_draining(), &compaction).await;
+    assert!(!compaction.is_finished(), "compaction waits for the entry");
+    written.resume.notify_one();
+    put.await.unwrap();
+    assert!(compaction.await.unwrap());
+
+    assert!(
+        group_entries(&store, group_index)
+            .await
+            .iter()
+            .filter(|entry| entry.data.pack_file != 0)
+            .all(|entry| entry.data.pack_file == 2),
+        "the rewrite copied the late entry's payload with the others"
+    );
+    assert_payloads_read_back(
+        &store,
+        partition,
+        payloads[2..].iter().map(|payload| {
+            (
+                Address::zero_context_hash(hash::hash_slice(payload)),
+                payload.clone(),
+            )
+        }),
+    )
+    .await;
+}
+
+/// A payload written but not yet in the index does not make its packfile look reclaimable:
+/// compaction waits for the entry before it measures what the index references, and leaves the
+/// fully referenced group in place.
+#[tokio::test]
+async fn compaction_measures_a_written_payload_once_its_entry_is_in() {
+    let dir = lore_base::test_util::TempDir::new("is_compact_measure_unindexed_");
+    let partition = Partition::from([0x32u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(4);
+    let store = store_for_rewrite(&dir, partition, &payloads[..3], 0).await;
+
+    let written = pause_at(PausePoint::Written);
+    let put = {
+        let store = store.clone();
+        let payload = payloads[3].clone();
+        lore_base::lore_spawn!(async move {
+            put_payload(&store, partition, Context::default(), &payload, false).await
+        })
+    };
+    written.reached.notified().await;
+    let compaction = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { compact_group(&store, group_index).await })
+    };
+
+    let gate = &store.group[group_index].payload_gate;
+    wait_until(|| gate.is_draining(), &compaction).await;
+    assert!(!compaction.is_finished(), "compaction waits for the entry");
+    written.resume.notify_one();
+    put.await.unwrap();
+    assert!(compaction.await.unwrap());
+
+    assert!(
+        group_entries(&store, group_index)
+            .await
+            .iter()
+            .all(|entry| entry.data.pack_file == 1),
+        "the packfile is not rewritten"
+    );
+    assert_eq!(
+        store.group[group_index].packstore.sizes().await.unwrap(),
+        vec![4 * 4096]
+    );
+}
+
+/// Read `address`'s payload through `get`, or through `get_into` with `into`.
+async fn read_payload(
+    store: Arc<LocalImmutableStore>,
+    partition: Partition,
+    address: Address,
+    into: bool,
+) -> Result<Vec<u8>, StoreError> {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    if !into {
+        let (_fragment, payload) = store.get(partition, address).await?.into_payload()?;
+        return Ok(payload.to_vec());
+    }
+    let mut buffer = vec![0u8; lore_storage::FRAGMENT_SIZE_THRESHOLD];
+    // SAFETY: `buffer` outlives the read and nothing else touches it until the read returns.
+    let mut dst = unsafe { lore_storage::CallerBuffer::new(buffer.as_mut_ptr(), buffer.len()) };
+    let (fragment, read) = store.get_into(partition, address, &mut dst).await?;
+    Ok(match read {
+        lore_storage::store_types::PayloadRead::Returned(payload) => payload.to_vec(),
+        lore_storage::store_types::PayloadRead::IntoBuffer => {
+            buffer.truncate(fragment.size_payload as usize);
+            buffer
+        }
+    })
+}
+
+/// A read, through `get` or `get_into`, that found its payload's location before compaction moved
+/// the entry loads it before the packfile is truncated: compaction waits for the read.
+#[tokio::test]
+async fn compaction_waits_for_a_read_of_a_packfile_it_truncates() {
+    for into in [false, true] {
+        let dir = lore_base::test_util::TempDir::new("is_compact_reading_");
+        let partition = Partition::from([0x33u8; 16]);
+        let (group_index, payloads) = payloads_in_one_group(4);
+        let store = store_for_rewrite(&dir, partition, &payloads, 2).await;
+
+        let stopped = pause_at(PausePoint::Stopped);
+        let compaction = {
+            let store = store.clone();
+            lore_base::lore_spawn!(async move { compact_group(&store, group_index).await })
+        };
+        stopped.reached.notified().await;
+
+        let located = pause_at(PausePoint::Located);
+        let read = lore_base::lore_spawn!(read_payload(
+            store.clone(),
+            partition,
+            Address::zero_context_hash(hash::hash_slice(&payloads[2])),
+            into
+        ));
+        located.reached.notified().await;
+        stopped.resume.notify_one();
+
+        let gate = &store.group[group_index].payload_gate;
+        wait_until(|| gate.is_draining(), &compaction).await;
+        assert!(
+            !compaction.is_finished(),
+            "compaction waits for the read before it truncates"
+        );
+        located.resume.notify_one();
+        let read = read.await.unwrap().expect("the read loads its payload");
+        assert_eq!(read, payloads[2]);
+        assert!(compaction.await.unwrap());
+
+        assert_eq!(
+            store.group[group_index].packstore.sizes().await.unwrap(),
+            vec![0, 2 * 4096],
+            "packfile 1 is truncated once the read is done"
+        );
+        assert_payloads_read_back(
+            &store,
+            partition,
+            payloads[2..].iter().map(|payload| {
+                (
+                    Address::zero_context_hash(hash::hash_slice(payload)),
+                    payload.clone(),
+                )
+            }),
+        )
+        .await;
+    }
+}
+
+/// A bucket being written to disk holds up neither a lookup nor an insert in it, and the insert
+/// made during the write reaches the next one.
+#[tokio::test]
+async fn a_bucket_write_in_flight_holds_up_no_lookup_or_insert() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_bucket_write_in_flight_");
+    let settings = || ImmutableStoreSettings {
+        initial_fan_out_level: 1,
+        ..client_settings()
+    };
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
+        .await
+        .unwrap();
+    let partition = Partition::from([0x37u8; 16]);
+    let (_, payloads) = payloads_in_one_group(2);
+    let first = put_payload(&store, partition, Context::default(), &payloads[0], false).await;
+
+    let serializing = pause_at(PausePoint::Serializing);
+    let flush = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { store.flush(false).await })
+    };
+    serializing.reached.notified().await;
+
+    let during = tokio::time::timeout(Duration::from_secs(10), async {
+        let second = put_payload(&store, partition, Context::default(), &payloads[1], false).await;
+        assert_payloads_read_back(&store, partition, [(first, payloads[0].clone())]).await;
+        second
+    })
+    .await;
+    serializing.resume.notify_one();
+    let second = during.expect("the insert and the lookup do not wait for the bucket write");
+    flush.await.unwrap().unwrap();
+
+    store.clone().flush(false).await.unwrap();
+    drop(store);
+    let reopened = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
+        .await
+        .unwrap();
+    assert_payloads_read_back(
+        &reopened,
+        partition,
+        [(first, payloads[0].clone()), (second, payloads[1].clone())],
+    )
+    .await;
+}
+
+/// Run the operation `start` spawns until it reaches [`PausePoint::Located`], and assert that a
+/// drain of `group_index`'s payload gate waits for it there. Returns what the operation returns.
+async fn assert_held_while_located<T: Send + 'static>(
+    store: &Arc<LocalImmutableStore>,
+    group_index: usize,
+    start: impl FnOnce() -> tokio::task::JoinHandle<T>,
+) -> T {
+    let located = pause_at(PausePoint::Located);
+    let operation = start();
+    located.reached.notified().await;
+    let drain = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { store.group[group_index].payload_gate.drain().await })
+    };
+
+    let gate = &store.group[group_index].payload_gate;
+    wait_until(|| gate.is_draining(), &drain).await;
+    assert!(!drain.is_finished(), "the drain waits for the load");
+    located.resume.notify_one();
+    drain.await.unwrap();
+    operation.await.unwrap()
+}
+
+/// Obliterating a fragment list holds the group's payload gate from its lookup until it has loaded
+/// the list, so that a drain, as compaction runs before it truncates a packfile, waits for the
+/// load.
+#[tokio::test]
+async fn obliterate_holds_the_payload_gate_while_it_loads_the_fragment_list() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_obliterate_gate_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    let partition = Partition::from([0x38u8; 16]);
+    let leaf_payload = b"the one leaf of the list";
+    let leaf = put_payload(&store, partition, Context::default(), leaf_payload, false).await;
+    let references = [FragmentReference {
+        hash: leaf.hash,
+        offset_content: 0,
+    }];
+    let list = Address::zero_context_hash(hash::hash_slice(references.as_bytes()));
+    store
+        .clone()
+        .put(
+            partition,
+            list,
+            Fragment {
+                flags: (FragmentFlags::PayloadFragmented | FragmentFlags::PayloadStoredLocal)
+                    .bits(),
+                size_payload: references.as_bytes().len() as u32,
+                size_content: leaf_payload.len() as u64,
+            },
+            Some(Bytes::copy_from_slice(references.as_bytes())),
+            false,
+        )
+        .await
+        .unwrap();
+    let group_index = list.hash.data()[0] as usize;
+
+    assert_held_while_located(&store, group_index, || {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move {
+            store
+                .obliterate(
+                    partition,
+                    list,
+                    Arc::new(lore_storage::store_types::StoreObliterateStats::default()),
+                )
+                .await
+        })
+    })
+    .await
+    .unwrap();
+    assert!(
+        store.clone().get(partition, leaf).await.is_err(),
+        "the list loaded, and its leaf is obliterated"
+    );
+}
+
+/// Verifying a fragment holds the group's payload gate from its lookup until it has loaded the
+/// payloads it checks, so that a drain waits for the load.
+#[tokio::test]
+async fn verify_holds_the_payload_gate_while_it_loads_the_payload() {
+    let dir = lore_base::test_util::TempDir::new("is_verify_gate_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    let partition = Partition::from([0x39u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(1);
+    let address = put_payload(&store, partition, Context::default(), &payloads[0], false).await;
+
+    let verified = assert_held_while_located(&store, group_index, || {
+        lore_base::lore_spawn!(store.clone().verify_fragment(
+            address,
+            partition,
+            StoreMatch::MatchFull,
+            false
+        ))
+    })
+    .await
+    .unwrap();
+    assert!(verified.verification_result.is_ok());
+}
+
+/// A store verifying its write holds the group's payload gate from its lookup until it has loaded
+/// the payload it checks, so that a drain waits for the load.
+#[tokio::test]
+async fn a_verified_store_holds_the_payload_gate_while_it_loads_the_payload() {
+    let dir = lore_base::test_util::TempDir::new("is_verify_write_gate_");
+    let store = LocalImmutableStore::new(
+        Some(dir.to_path_buf()),
+        ImmutableStoreSettings {
+            verify_write: true,
+            ..client_settings()
+        },
+    )
+    .await
+    .unwrap();
+    let partition = Partition::from([0x3cu8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(1);
+
+    let address = assert_held_while_located(&store, group_index, || {
+        let store = store.clone();
+        let payload = payloads[0].clone();
+        lore_base::lore_spawn!(async move {
+            put_payload(&store, partition, Context::default(), &payload, false).await
+        })
+    })
+    .await;
+    assert_payloads_read_back(&store, partition, [(address, payloads[0].clone())]).await;
+}
+
+/// Stores of one new hash in flight together each write the payload. Every entry takes the
+/// payload of the store that inserted first, the other copy stays unreferenced, and each address
+/// reads the payload back.
+#[tokio::test]
+async fn stores_of_one_new_hash_in_flight_together_read_back() {
+    let dir = lore_base::test_util::TempDir::new("is_same_hash_stores_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    let partition = Partition::from([0x3au8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(1);
+    let payload = payloads[0].clone();
+
+    let written = pause_at(PausePoint::Written);
+    let first = {
+        let store = store.clone();
+        let payload = payload.clone();
+        lore_base::lore_spawn!(async move {
+            put_payload(&store, partition, Context::from([1u8; 16]), &payload, false).await
+        })
+    };
+    written.reached.notified().await;
+    let second = put_payload(&store, partition, Context::from([2u8; 16]), &payload, false).await;
+    written.resume.notify_one();
+    let first = first.await.unwrap();
+
+    let entries = group_entries(&store, group_index).await;
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| (entry.data.pack_file, entry.data.pack_offset) == (1, 4096)),
+        "both entries take the payload the second store inserted"
+    );
+    assert_eq!(
+        store.group[group_index].packstore.sizes().await.unwrap(),
+        vec![2 * 4096],
+        "the first store's copy stays in the packfile, unreferenced"
+    );
+    assert_payloads_read_back(
+        &store,
+        partition,
+        [(first, payload.clone()), (second, payload)],
+    )
+    .await;
+}
+
+/// Compaction syncs the group's packfiles before it writes a bucket it rewrote, without holding
+/// the bucket, so that a lookup and an insert in it go on during the sync, and the insert reaches
+/// the next bucket write.
+#[tokio::test]
+async fn a_compaction_sync_holds_up_no_lookup_or_insert() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_sync_");
+    let partition = Partition::from([0x3bu8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(5);
+    let store = store_for_rewrite(&dir, partition, &payloads[..4], 2).await;
+
+    let syncing = pause_at(PausePoint::Syncing);
+    let compaction = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { compact_group(&store, group_index).await })
+    };
+    syncing.reached.notified().await;
+
+    let during = tokio::time::timeout(Duration::from_secs(10), async {
+        let late = put_payload(&store, partition, Context::default(), &payloads[4], false).await;
+        assert_payloads_read_back(
+            &store,
+            partition,
+            [(
+                Address::zero_context_hash(hash::hash_slice(&payloads[2])),
+                payloads[2].clone(),
+            )],
+        )
+        .await;
+        late
+    })
+    .await;
+    syncing.resume.notify_one();
+    let late = during.expect("the insert and the lookup do not wait for the sync");
+    assert!(compaction.await.unwrap());
+
+    store.clone().flush(true).await.unwrap();
+    drop(store);
+    let reopened = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    assert_payloads_read_back(
+        &reopened,
+        partition,
+        payloads[2..4]
+            .iter()
+            .map(|payload| {
+                (
+                    Address::zero_context_hash(hash::hash_slice(payload)),
+                    payload.clone(),
+                )
+            })
+            .chain([(late, payloads[4].clone())]),
+    )
+    .await;
+}
+
+/// A store whose payload write fails reports the failure and leaves no entry, and the next store
+/// of the payload stores it.
+#[tokio::test]
+async fn a_failed_payload_write_leaves_no_entry() {
+    let dir = lore_base::test_util::TempDir::new("is_failed_payload_write_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    let partition = Partition::from([0x3du8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(1);
+
+    lore_storage::test_util::fail_packfile_writes(1);
+    let failed = try_put_payload(
+        &store,
+        partition,
+        Context::default(),
+        &payloads[0],
+        false,
+        false,
+    )
+    .await;
+    assert!(failed.is_err());
+    assert!(group_entries(&store, group_index).await.is_empty());
+
+    let address = put_payload(&store, partition, Context::default(), &payloads[0], false).await;
+    assert_payloads_read_back(&store, partition, [(address, payloads[0].clone())]).await;
+}
+
+/// A forced store writes the payload again, though one is stored for its hash, and the entry
+/// points at the new copy.
+#[tokio::test]
+async fn a_forced_store_points_the_entry_at_a_new_copy() {
+    let dir = lore_base::test_util::TempDir::new("is_forced_store_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    let partition = Partition::from([0x3eu8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(1);
+    put_payload(&store, partition, Context::default(), &payloads[0], false).await;
+
+    let address = try_put_payload(
+        &store,
+        partition,
+        Context::default(),
+        &payloads[0],
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+
+    let entries = group_entries(&store, group_index).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        (entries[0].data.pack_file, entries[0].data.pack_offset),
+        (1, 4096)
+    );
+    assert_payloads_read_back(&store, partition, [(address, payloads[0].clone())]).await;
+}
+
+/// A store giving a payload to an entry held without one changes the entry's stored flags only
+/// as it inserts the payload, so that until then the entry is as it was.
+#[tokio::test]
+async fn an_entry_takes_new_flags_with_its_payload() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_flags_with_payload_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    let partition = Partition::from([0x3fu8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(1);
+    let address = Address::zero_context_hash(hash::hash_slice(&payloads[0]));
+    let durable = FragmentFlags::PayloadStoredDurable.bits();
+    store
+        .clone()
+        .put(
+            partition,
+            address,
+            Fragment {
+                flags: durable,
+                size_payload: payloads[0].len() as u32,
+                size_content: payloads[0].len() as u64,
+            },
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let written = pause_at(PausePoint::Written);
+    let put = {
+        let store = store.clone();
+        let payload = payloads[0].clone();
+        lore_base::lore_spawn!(async move {
+            put_payload(&store, partition, Context::default(), &payload, false).await
+        })
+    };
+    written.reached.notified().await;
+    let entries = group_entries(&store, group_index).await;
+    assert_eq!(
+        (entries[0].data.flags, entries[0].data.pack_file),
+        (durable, 0),
+        "the entry is as it was while the payload is written"
+    );
+    written.resume.notify_one();
+    put.await.unwrap();
+
+    let entries = group_entries(&store, group_index).await;
+    assert_eq!(
+        entries[0].data.flags,
+        durable | FragmentFlags::PayloadStoredLocal.bits()
+    );
+    assert_ne!(entries[0].data.pack_file, 0);
+}
+
+/// A durable flush syncs the payloads of the entries in each bucket file it writes, including
+/// entries inserted after the flush began: a payload stored while the flush writes another bucket
+/// is synced by the time the flush returns.
+#[tokio::test]
+async fn a_durable_flush_syncs_the_payloads_its_bucket_files_point_at() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_durable_flush_");
+    let store = LocalImmutableStore::new(
+        Some(dir.to_path_buf()),
+        ImmutableStoreSettings {
+            initial_fan_out_level: 32,
+            flush_delay_seconds: 3600,
+            ..client_settings()
+        },
+    )
+    .await
+    .unwrap();
+    let partition = Partition::from([0x40u8; 16]);
+    let (group_index, mut payloads) = payloads_in_one_group(16);
+    payloads.sort_by_key(|payload| {
+        lore_storage::local::fan_out::bucket_index_for(&hash::hash_slice(payload), 32)
+    });
+    let late = payloads.pop().unwrap();
+    put_payload(&store, partition, Context::default(), &payloads[0], false).await;
+    store.clone().flush(true).await.unwrap();
+    put_payload(&store, partition, Context::default(), &payloads[0], true).await;
+
+    let serializing = pause_at(PausePoint::Serializing);
+    let flush = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { store.flush(true).await })
+    };
+    serializing.reached.notified().await;
+    put_payload(&store, partition, Context::default(), &late, false).await;
+    serializing.resume.notify_one();
+    flush.await.unwrap().unwrap();
+
+    assert!(
+        !store.group[group_index].packstore.is_dirty(1).await,
+        "the late payload is synced"
+    );
+}
+
+/// The directory group `group_index` of a store over `dir` keeps its packfiles in.
+fn group_pack_dir(dir: &Path, group_index: usize) -> PathBuf {
+    lore_storage::local::fan_out::group_dir_path(&dir.join("immutable").join("index"), group_index)
+        .join("pack")
+}
+
+/// The header and bytes of the file of bucket `bucket_index` of group `group_index`, in a store
+/// over `dir`.
+fn read_bucket_file(
+    dir: &Path,
+    group_index: usize,
+    bucket_index: usize,
+) -> (ImmutableStoreHeader, Vec<u8>) {
+    let bytes = std::fs::read(format_bucket_path(
+        &dir.join("immutable"),
+        group_index,
+        bucket_index,
+    ))
+    .unwrap();
+    let (header, _) = ImmutableStoreHeader::read_from_prefix(&bytes).unwrap();
+    (header, bytes)
+}
+
+/// Rewrite the header of the file of bucket 0 of group `group_index`, in a store over `dir`.
+fn edit_bucket_header(
+    dir: &Path,
+    group_index: usize,
+    edit: impl FnOnce(&mut ImmutableStoreHeader),
+) {
+    let (mut header, mut bytes) = read_bucket_file(dir, group_index, 0);
+    edit(&mut header);
+    bytes[..size_of::<ImmutableStoreHeader>()].copy_from_slice(header.as_bytes());
+    std::fs::write(
+        format_bucket_path(&dir.join("immutable"), group_index, 0),
+        bytes,
+    )
+    .unwrap();
+}
+
+/// The bytes of a bucket file holding `count` entries and no packfile sizes after them.
+fn bucket_file_len(count: usize) -> usize {
+    size_of::<ImmutableStoreHeader>()
+        + count * (size_of::<u32>() + size_of::<ImmutableStoreEntry>())
+}
+
+/// A bucket file records the size of the packfile taking writes in its header, and none when the
+/// write synced every packfile first.
+#[tokio::test]
+async fn a_bucket_file_records_the_size_of_the_packfile_taking_writes() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_sizes_recorded_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    let partition = Partition::from([0x41u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(3);
+    for payload in &payloads[..2] {
+        put_payload(&store, partition, Context::default(), payload, false).await;
+    }
+    store.clone().flush(false).await.unwrap();
+
+    let (header, bytes) = read_bucket_file(&dir, group_index, 0);
+    assert_eq!(
+        (header.packfile_sizes, header.first_packfile_size),
+        (SIZES_RECORDED | (1 << SIZES_COUNT_SHIFT) | 1, 8192)
+    );
+    assert_eq!(bytes.len(), bucket_file_len(2));
+
+    put_payload(&store, partition, Context::default(), &payloads[2], false).await;
+    store.clone().flush(true).await.unwrap();
+    let (header, bytes) = read_bucket_file(&dir, group_index, 0);
+    assert_eq!(header.packfile_sizes, SIZES_RECORDED);
+    assert_eq!(bytes.len(), bucket_file_len(3));
+}
+
+/// A bucket file holds the packfile sizes its header has no room for after its entries, in fewer
+/// bytes than an entry, so that a reader that does not know of them counts the entries alone. The
+/// store reopens with the entries intact.
+#[tokio::test]
+async fn a_bucket_file_holds_the_sizes_its_header_has_no_room_for_after_its_entries() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_sizes_trailer_");
+    let partition = Partition::from([0x42u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(1);
+    let pack = group_pack_dir(&dir, group_index);
+    std::fs::create_dir_all(&pack).unwrap();
+    for (id, len) in [(1, 64), (2, 32), (3, 16)] {
+        std::fs::write(pack.join(id.to_string()), vec![0u8; len]).unwrap();
+    }
+    let (address, bucket_index) = {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+            .await
+            .unwrap();
+        let address = put_payload(&store, partition, Context::default(), &payloads[0], false).await;
+        store.clone().flush(false).await.unwrap();
+        let bucket_count = store.group[group_index]
+            .bucket_count
+            .load(atomic::Ordering::Relaxed);
+        let bucket_index =
+            lore_storage::local::fan_out::bucket_index_for(&address.hash, bucket_count);
+        (address, bucket_index)
+    };
+
+    let (header, bytes) = read_bucket_file(&dir, group_index, bucket_index);
+    assert_eq!(
+        (header.packfile_sizes, header.first_packfile_size),
+        (SIZES_RECORDED | (3 << SIZES_COUNT_SHIFT) | 1, 64 + 4096)
+    );
+    let entries_end = bucket_file_len(1);
+    assert_eq!(
+        &bytes[entries_end..],
+        [
+            PackfileSize { id: 2, size: 32 },
+            PackfileSize { id: 3, size: 16 }
+        ]
+        .as_bytes()
+    );
+    assert_eq!(
+        (bytes.len() - size_of::<ImmutableStoreHeader>())
+            / (size_of::<u32>() + size_of::<ImmutableStoreEntry>()),
+        1
+    );
+
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    assert_payloads_read_back(&store, partition, [(address, payloads[0].clone())]).await;
+    assert!(!store.group[group_index].dirty[bucket_index].load(atomic::Ordering::Relaxed));
+}
+
+/// A bucket write that would record more packfile sizes than a bucket file holds syncs every
+/// packfile of the group instead, and records none.
+#[tokio::test]
+async fn more_packfiles_to_record_than_a_bucket_file_holds_are_synced_instead() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_sizes_overflow_");
+    let partition = Partition::from([0x43u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(1);
+    let pack = group_pack_dir(&dir, group_index);
+    std::fs::create_dir_all(&pack).unwrap();
+    for id in 1..=TRAILER_SIZES + 2 {
+        std::fs::write(pack.join(id.to_string()), [0u8; 16]).unwrap();
+    }
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    let address = put_payload(&store, partition, Context::default(), &payloads[0], false).await;
+    store.clone().flush(false).await.unwrap();
+    let bucket_count = store.group[group_index]
+        .bucket_count
+        .load(atomic::Ordering::Relaxed);
+    let bucket_index = lore_storage::local::fan_out::bucket_index_for(&address.hash, bucket_count);
+
+    let (header, bytes) = read_bucket_file(&dir, group_index, bucket_index);
+    assert_eq!(header.packfile_sizes, SIZES_RECORDED);
+    assert_eq!(bytes.len(), bucket_file_len(1));
+    assert!(!store.group[group_index].packstore.is_dirty(1).await);
+}
+
+/// A store over `dir` that wrote two payloads of one group, at offsets 0 and 4096 of packfile 1,
+/// to their bucket file without a sync, and closed. Returns the group, the two addresses, and the
+/// two payloads with a third of the group.
+async fn two_payloads_written(
+    dir: &Path,
+    partition: Partition,
+) -> (usize, Vec<Address>, Vec<Vec<u8>>) {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let (group_index, payloads) = payloads_in_one_group(3);
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    let mut addresses = vec![];
+    for payload in &payloads[..2] {
+        addresses.push(put_payload(&store, partition, Context::default(), payload, false).await);
+    }
+    store.clone().flush(false).await.unwrap();
+    (group_index, addresses, payloads)
+}
+
+/// The entry for `address` among the loaded entries of group `group_index`.
+async fn loaded_entry(
+    store: &LocalImmutableStore,
+    group_index: usize,
+    address: Address,
+) -> ImmutableStoreEntry {
+    group_entries(store, group_index)
+        .await
+        .into_iter()
+        .find(|entry| entry.address == address)
+        .expect("the entry is loaded")
+}
+
+/// A bucket file pointing past the end of its packfile, as after a crash lost the end of the
+/// packfile, has those payload locations cleared when it is loaded and is written again: the
+/// payload past the end is no longer found, a write at the new end does not take its place, and
+/// storing it again stores it.
+#[tokio::test]
+async fn payloads_past_the_end_of_their_packfile_are_cleared_when_their_bucket_loads() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_sizes_lost_tail_");
+    let partition = Partition::from([0x44u8; 16]);
+    let (group_index, addresses, payloads) = two_payloads_written(&dir, partition).await;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(group_pack_dir(&dir, group_index).join("1"))
+        .unwrap()
+        .set_len(4096)
+        .unwrap();
+
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    assert_payloads_read_back(&store, partition, [(addresses[0], payloads[0].clone())]).await;
+    let lost = loaded_entry(&store, group_index, addresses[1]).await;
+    assert_eq!(
+        (
+            lost.data.pack_file,
+            lost.data.flags & FragmentFlags::PayloadStoredLocal.bits()
+        ),
+        (0, 0)
+    );
+    assert!(store.group[group_index].dirty[0].load(atomic::Ordering::Relaxed));
+    assert!(store.clone().get(partition, addresses[1]).await.is_err());
+
+    let third = put_payload(&store, partition, Context::default(), &payloads[2], false).await;
+    put_payload(&store, partition, Context::default(), &payloads[1], false).await;
+    assert_payloads_read_back(
+        &store,
+        partition,
+        [
+            (addresses[0], payloads[0].clone()),
+            (addresses[1], payloads[1].clone()),
+            (third, payloads[2].clone()),
+        ],
+    )
+    .await;
+}
+
+/// A bucket file pointing into a packfile missing when the store opens has those payload locations
+/// cleared when it is loaded.
+#[tokio::test]
+async fn payloads_in_a_missing_packfile_are_cleared_when_their_bucket_loads() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_sizes_missing_packfile_");
+    let partition = Partition::from([0x45u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(1);
+    let address = {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+            .await
+            .unwrap();
+        store.group[group_index]
+            .packstore
+            .stop_writes(&[1])
+            .await
+            .unwrap();
+        let address = put_payload(&store, partition, Context::default(), &payloads[0], false).await;
+        store.clone().flush(false).await.unwrap();
+        address
+    };
+    std::fs::remove_file(group_pack_dir(&dir, group_index).join("2")).unwrap();
+
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    assert!(store.clone().get(partition, address).await.is_err());
+    assert_eq!(
+        loaded_entry(&store, group_index, address)
+            .await
+            .data
+            .pack_file,
+        0
+    );
+}
+
+/// A bucket file recording no packfile sizes, as an earlier version writes, is trusted: its
+/// entries are loaded as they are, though one points past the end of its packfile.
+#[tokio::test]
+async fn a_bucket_file_recording_no_sizes_is_trusted() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_sizes_unrecorded_");
+    let partition = Partition::from([0x46u8; 16]);
+    let (group_index, addresses, _) = two_payloads_written(&dir, partition).await;
+    edit_bucket_header(&dir, group_index, |header| {
+        header.packfile_sizes = 0;
+        header.first_packfile_size = 0;
+    });
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(group_pack_dir(&dir, group_index).join("1"))
+        .unwrap()
+        .set_len(4096)
+        .unwrap();
+
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    store.clone().get(partition, addresses[0]).await.unwrap();
+    assert_eq!(
+        loaded_entry(&store, group_index, addresses[1])
+            .await
+            .data
+            .pack_file,
+        1
+    );
+    assert!(!store.group[group_index].dirty[0].load(atomic::Ordering::Relaxed));
+}
+
+/// A bucket file whose header counts more packfile sizes than follow its entries, as when a crash
+/// cut it short, has its entries checked: those past the end of their packfile are cleared.
+#[tokio::test]
+async fn a_bucket_file_with_torn_sizes_has_its_entries_checked() {
+    let dir = lore_base::test_util::TempDir::new("is_sizes_torn_");
+    let partition = Partition::from([0x47u8; 16]);
+    let (group_index, addresses, payloads) = two_payloads_written(&dir, partition).await;
+    edit_bucket_header(&dir, group_index, |header| {
+        header.packfile_sizes = SIZES_RECORDED | (2 << SIZES_COUNT_SHIFT) | 1;
+    });
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(group_pack_dir(&dir, group_index).join("1"))
+        .unwrap()
+        .set_len(4096)
+        .unwrap();
+
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    assert_payloads_read_back(&store, partition, [(addresses[0], payloads[0].clone())]).await;
+    assert_eq!(
+        loaded_entry(&store, group_index, addresses[1])
+            .await
+            .data
+            .pack_file,
+        0
+    );
 }

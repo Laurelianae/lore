@@ -3,9 +3,8 @@
 use lore_base::error::NotSupported;
 use lore_base::types::RepositoryId;
 use lore_transport::auth::authentication;
+use lore_transport::auth::AuthEndpoint;
 use lore_transport::auth::exchange::*;
-
-use super::provider;
 
 /// Serializes the tests that point the process-global token store at a temp
 /// directory.
@@ -40,7 +39,7 @@ fn isolate_auth_store(label: &str) -> std::path::PathBuf {
 #[tokio::test]
 async fn supplied_access_token_replaces_the_repository_exchange() {
     let token = exchange(
-        "",
+        &AuthEndpoint::none(),
         "",
         RepositoryId::default(),
         "example.com".to_string(),
@@ -54,10 +53,16 @@ async fn supplied_access_token_replaces_the_repository_exchange() {
 
 #[tokio::test]
 async fn supplied_access_token_replaces_the_resource_exchange() {
-    let token =
-        exchange_custom_resource("", "", "", "example.com".to_string(), "", "supplied-authz")
-            .await
-            .expect("the supplied access token is used as given");
+    let token = exchange_custom_resource(
+        &AuthEndpoint::none(),
+        "",
+        "",
+        "example.com".to_string(),
+        "",
+        "supplied-authz",
+    )
+    .await
+    .expect("the supplied access token is used as given");
     assert_eq!(token, "supplied-authz");
 }
 
@@ -71,7 +76,7 @@ async fn access_token_alone_authorizes_without_an_authentication_token() {
         .parse()
         .expect("a valid repository id");
     let (authentication_token, authorization_token, identity) = auth_exchange(
-        "ucs-auth://auth.example.com",
+        &AuthEndpoint::resolve("ucs-auth://auth.example.com").expect("a registered scheme"),
         "example.com",
         "alice",
         repository,
@@ -93,7 +98,7 @@ async fn access_token_alone_authorizes_without_an_authentication_token() {
 #[tokio::test]
 async fn no_supplied_access_token_still_requires_an_auth_url() {
     let result = exchange(
-        "",
+        &AuthEndpoint::none(),
         "",
         RepositoryId::default(),
         "example.com".to_string(),
@@ -113,9 +118,9 @@ async fn no_supplied_access_token_still_requires_an_auth_url() {
 /// stale *stored* identity while picking one, which a supplied credential is
 /// not.
 ///
-/// The auth URL uses a scheme no `Authentication` implementation is registered
-/// for, so the authorization exchange fails without a network call. The
-/// authentication token is what this is about.
+/// The endpoint's implementation refuses every grant, so the authorization
+/// exchange fails without a network call. The authentication token is what
+/// this is about.
 #[tokio::test]
 async fn an_expired_supplied_identity_token_is_still_used() {
     /// The same claims as the fixtures above, with `exp` back in 2001.
@@ -125,8 +130,12 @@ async fn an_expired_supplied_identity_token_is_still_used() {
         .parse()
         .expect("a valid repository id");
 
+    let refusing = AuthEndpoint::new(
+        "stub-auth://auth.expired-token.test.invalid".to_string(),
+        AuthEndpoint::none().auth,
+    );
     let (authentication_token, _authorization_token, identity) = auth_exchange(
-        "no-such-scheme://auth.expired-token.test.invalid",
+        &refusing,
         "example.com",
         "alice",
         repository,
@@ -150,8 +159,8 @@ async fn an_expired_supplied_identity_token_is_still_used() {
 /// A stub `Authentication` returns a distinct authorization per
 /// authentication token, which makes the separation observable: were the
 /// cache shared across credentials, the second caller would come back with
-/// the first one's token and no second exchange would happen. Registering the
-/// stub under its own scheme also keeps this off the network.
+/// the first one's token and no second exchange would happen. Binding the
+/// stub as the endpoint's implementation also keeps this off the network.
 #[tokio::test]
 async fn one_supplied_credential_is_never_served_anothers_authorization() {
     use lore_transport::error::ProtocolError;
@@ -274,9 +283,13 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
         }
     }
 
-    async fn authorize(repository: RepositoryId, identity_token: &str) -> String {
+    async fn authorize(
+        endpoint: &AuthEndpoint,
+        repository: RepositoryId,
+        identity_token: &str,
+    ) -> String {
         exchange(
-            AUTH_URL,
+            endpoint,
             "alice",
             repository,
             "example.com".to_string(),
@@ -290,15 +303,15 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
     let stub = std::sync::Arc::new(StubAuthentication {
         exchanges: std::sync::atomic::AtomicUsize::new(0),
     });
-    authentication::add("stub-auth", stub.clone()).expect("registering the stub");
+    let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
 
     let repository: RepositoryId = "aabbccdd00112233aabbccdd00112233"
         .parse()
         .expect("a valid repository id");
 
-    assert_eq!(authorize(repository, AUTHN_ONE).await, AUTHZ_ONE);
+    assert_eq!(authorize(&endpoint, repository, AUTHN_ONE).await, AUTHZ_ONE);
     assert_eq!(
-        authorize(repository, AUTHN_ONE).await,
+        authorize(&endpoint, repository, AUTHN_ONE).await,
         AUTHZ_ONE,
         "the same credential reuses the authorization it earned"
     );
@@ -309,7 +322,7 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
     );
 
     assert_eq!(
-        authorize(repository, AUTHN_TWO).await,
+        authorize(&endpoint, repository, AUTHN_TWO).await,
         AUTHZ_TWO,
         "a different credential must earn its own authorization"
     );
@@ -318,6 +331,154 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
         2,
         "the second credential must not be served the first one's entry"
     );
+}
+
+/// An implementation that refuses the login token reports `NotAuthenticated`, and the
+/// exchange passes it on as such rather than as an internal failure, so the caller can
+/// tell that logging in again fixes it. The same holds for a refused partition and
+/// `NotAuthorized`.
+#[tokio::test]
+async fn a_refusal_of_the_login_token_stays_not_authenticated() {
+    use lore_base::error::NotAuthenticated;
+    use lore_base::error::NotAuthorized;
+    use lore_transport::error::ProtocolError;
+    use lore_transport::traits::Authentication;
+    use lore_transport::types::AuthSession;
+    use lore_transport::types::AuthSessionPoll;
+    use lore_transport::types::AuthenticationToken;
+    use lore_transport::types::AuthorizationToken;
+
+    /// `sub` alice, `aud` example.com, expiring in 2033.
+    const AUTHN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJuYW1lIjoiQWxpY2UifQ.signature";
+
+    /// Refuses every exchange with the error it holds.
+    struct Refusing(fn() -> ProtocolError);
+
+    fn unused() -> ProtocolError {
+        ProtocolError::internal("the stub only serves authorization exchanges")
+    }
+
+    #[async_trait::async_trait]
+    impl Authentication for Refusing {
+        async fn revoke_token(
+            &self,
+            _auth_url: &str,
+            _token: &str,
+            _token_type_hint: &str,
+            _correlation_id: &str,
+        ) -> Result<(), ProtocolError> {
+            Err(ProtocolError::from(NotSupported {
+                operation: "revoke_token".into(),
+            }))
+        }
+
+        async fn exchange_for_repository(
+            &self,
+            _auth_url: &str,
+            _authn_token: &str,
+            _repository: RepositoryId,
+            _correlation_id: &str,
+        ) -> Result<AuthorizationToken, ProtocolError> {
+            Err((self.0)())
+        }
+
+        async fn exchange_for_custom_resource(
+            &self,
+            _auth_url: &str,
+            _authn_token: &str,
+            _resource_id: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthorizationToken, ProtocolError> {
+            Err((self.0)())
+        }
+
+        async fn start_auth_session(
+            &self,
+            _auth_url: &str,
+            _client_state: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthSession, ProtocolError> {
+            Err(unused())
+        }
+
+        async fn poll_auth_session(
+            &self,
+            _auth_url: &str,
+            _client_state: &str,
+            _session_code: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthSessionPoll, ProtocolError> {
+            Err(unused())
+        }
+
+        async fn exchange_external_token(
+            &self,
+            _auth_url: &str,
+            _token: &str,
+            _token_type: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            Err(unused())
+        }
+
+        async fn refresh_authentication(
+            &self,
+            _auth_url: &str,
+            _refresh_token: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            Err(unused())
+        }
+    }
+
+    async fn assert_refused_as(
+        auth_url: &str,
+        refusal: fn() -> ProtocolError,
+        check: fn(&ExchangeError) -> bool,
+    ) {
+        let repository: RepositoryId = "ccddeeff00112233ccddeeff00112233"
+            .parse()
+            .expect("a valid repository id");
+        let endpoint =
+            AuthEndpoint::new(auth_url.to_string(), std::sync::Arc::new(Refusing(refusal)));
+
+        let refused = exchange(
+            &endpoint,
+            "alice",
+            repository,
+            "example.com".to_string(),
+            AUTHN,
+            "",
+        )
+        .await
+        .expect_err("the stub refuses the exchange");
+        assert!(check(&refused), "{auth_url}: {refused}");
+
+        let refused = exchange_custom_resource(
+            &endpoint,
+            "alice",
+            "urc-user-service",
+            "example.com".to_string(),
+            AUTHN,
+            "",
+        )
+        .await
+        .expect_err("the stub refuses the exchange");
+        assert!(check(&refused), "{auth_url}: {refused}");
+    }
+
+    assert_refused_as(
+        "stub-auth://auth.refused-login.test.invalid",
+        || NotAuthenticated.into(),
+        ExchangeError::is_not_authenticated,
+    )
+    .await;
+    assert_refused_as(
+        "stub-auth://auth.refused-partition.test.invalid",
+        || NotAuthorized.into(),
+        ExchangeError::is_not_authorized,
+    )
+    .await;
 }
 
 /// An expired token that came from the store is renewed in place when the
@@ -338,7 +499,7 @@ async fn an_expired_stored_token_is_renewed_through_its_refresh_token() {
     const EXPIRED_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjEwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
     /// A fresh authorization the stub hands out for the renewed token.
     const AUTHZ: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJhdXRoeiI6InllcyJ9.signature";
-    const AUTH_URL: &str = "https://refresh-wiring.test.invalid";
+    const AUTH_URL: &str = "refresh-wiring://token.test.invalid";
 
     struct RefreshStub {
         refreshes: std::sync::atomic::AtomicUsize,
@@ -356,10 +517,7 @@ async fn an_expired_stored_token_is_renewed_through_its_refresh_token() {
                 .refreshes
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
             Ok(AuthenticationToken {
-                token: provider::mint_access_token(
-                    AUTH_URL,
-                    &serde_json::json!({ "sub": "alice", "aud": ["example.com"] }),
-                ),
+                token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature".to_string(),
                 user_id: "alice".to_string(),
                 user_name: "Alice".to_string(),
                 expires_ms: 0,
@@ -445,7 +603,8 @@ async fn an_expired_stored_token_is_renewed_through_its_refresh_token() {
     let stub = std::sync::Arc::new(RefreshStub {
         refreshes: std::sync::atomic::AtomicUsize::new(0),
     });
-    authentication::add_for_url(AUTH_URL, stub.clone());
+    authentication::add("refresh-wiring", stub.clone())
+        .expect("the refresh scheme registers");
 
     // An expired token and a refresh token for it, as a completed OIDC login
     // would have left them.
@@ -459,8 +618,9 @@ async fn an_expired_stored_token_is_renewed_through_its_refresh_token() {
     let repository: RepositoryId = "00112233445566778899aabbccddeeff"
         .parse()
         .expect("a valid repository id");
+    let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
     let (authentication_token, authorization_token, identity) =
-        auth_exchange(AUTH_URL, "example.com", "alice", repository, "", "").await;
+        auth_exchange(&endpoint, "example.com", "alice", repository, "", "").await;
 
     assert_eq!(
         stub.refreshes.load(std::sync::atomic::Ordering::Acquire),
@@ -504,8 +664,9 @@ async fn an_expired_stored_identity_without_a_refresh_token_is_skipped() {
     let repository: RepositoryId = "00112233445566778899aabbccddeeff"
         .parse()
         .expect("a valid repository id");
+    let endpoint = AuthEndpoint::resolve(AUTH_URL).expect("https resolves to a builtin");
     let (authentication_token, _authorization_token, _identity) =
-        auth_exchange(AUTH_URL, "example.com", "alice", repository, "", "").await;
+        auth_exchange(&endpoint, "example.com", "alice", repository, "", "").await;
 
     assert!(
         authentication_token.is_empty(),

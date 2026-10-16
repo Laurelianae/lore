@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::sync::Arc;
 use std::sync::Weak;
 use std::time::Duration;
 
@@ -10,22 +9,22 @@ use lore_credential::insecure_decode_token;
 use lore_credential::token_store;
 use lore_credential::token_store::vulnerable_all_tokens;
 use lore_credential::verify_jwt_usage_for_remote;
-use lore_error_set::internal::SupportsInternalError;
 use lore_error_set::prelude::*;
 use lore_transport::AuthSession;
 use lore_transport::AuthSessionPoll;
 use lore_transport::Authentication;
 use lore_transport::AuthenticationToken;
+use lore_transport::EnvironmentConfig;
+use lore_transport::ProtocolError;
+use lore_transport::auth::AuthEndpoint;
 use lore_transport::auth::authentication;
-use lore_transport::auth::oidc::backend::OidcAuthentication;
+use lore_transport::auth::authentication::Selected;
 use tokio::time::Instant;
 use tokio::time::sleep;
 use tokio::time::timeout_at;
 use url::Url;
 use uuid::Uuid;
 
-use crate::auth::AuthMode;
-use crate::auth::AuthPath;
 use crate::auth::LoreAuthPendingEventData;
 use crate::auth::LoreAuthUrlEventData;
 use crate::errors::AddressNotFound;
@@ -106,6 +105,16 @@ impl EventError for InteractiveLoginError {
     }
 }
 
+fn select_auth_path(environment: &EnvironmentConfig) -> Result<Selected, ProtocolError> {
+    let mode = crate::lore::execution_context().globals().auth_mode;
+    authentication::select(mode, environment)?.ok_or_else(|| {
+        NotSupported {
+            operation: "No authentication configured on server".to_string(),
+        }
+        .into()
+    })
+}
+
 /// How much a `slow_down` answer widens the polling interval, per RFC 8628
 /// §3.5.
 const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
@@ -115,56 +124,18 @@ const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 /// loop.
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Resolves the auth URL a login flow uses (D2): the caller's `auth_mode`,
-/// resolved against what the server advertises -- its gRPC auth URL, if
-/// any, and its OIDC issuer, if any.
-///
-/// On the gRPC path the server's `auth_url` must be present; the caller
-/// sees "No authentication configured on server" otherwise, exactly as
-/// before the dispatch existed. On the OIDC path the advertisement builds
-/// the backend, which is registered under the issuer so every later lookup
-/// by URL finds it, and the issuer becomes the flow's auth URL -- the token
-/// store, the refresh loop and the user service all key on it.
-fn resolve_login_auth_url<E>(
-    auth_mode: AuthMode,
-    auth_url: String,
-    oidc: Option<lore_transport::types::Oidc>,
-) -> Result<String, E>
-where
-    E: SupportsInternalError + From<lore_base::error::NotSupported>,
-{
-    match auth_mode.resolve(Some(auth_url.as_str()), oidc.as_ref()) {
-        AuthPath::Grpc => {
-            if auth_url.is_empty() {
-                return Err(NotSupported {
-                    operation: "No authentication configured on server".to_string(),
-                }
-                .into());
-            }
-            Ok(auth_url)
-        }
-        AuthPath::Oidc => {
-            let oidc =
-                oidc.ok_or_else(|| E::internal("server does not advertise the OIDC auth path"))?;
-            authentication::add_for_url(
-                &oidc.issuer,
-                Arc::new(OidcAuthentication::new(oidc.clone())),
-            );
-            Ok(oidc.issuer)
-        }
-    }
-}
-
 /// Exchanges an external token for a URC authentication token via the
-/// registered `Authentication` implementation.
+/// endpoint's `Authentication` implementation.
 async fn exchange_token(
-    auth_url: String,
+    auth_endpoint: AuthEndpoint,
     token: &str,
     token_type: &str,
     recipient_url: &Url,
 ) -> Result<UserInfo, LoginError> {
-    let auth_impl =
-        authentication::find(&auth_url).forward::<LoginError>("finding authentication handler")?;
+    let AuthEndpoint {
+        url: auth_url,
+        auth: auth_impl,
+    } = auth_endpoint;
     let correlation_id = crate::lore::execution_context()
         .globals()
         .correlation_id
@@ -220,19 +191,14 @@ pub(crate) async fn with_token(
 ) -> Result<UserInfo, LoginError> {
     lore_debug!("Authenticating using remote {remote_url}");
 
-    let (auth_url, remote_url) = if let Some(url) = explicit_auth_url {
+    let (auth_endpoint, remote_url) = if let Some(url) = explicit_auth_url {
         // Auth URL provided directly (e.g. via --auth-url), skip environment resolution.
         // Use the auth URL's domain for JWT validation when no remote URL is available.
         lore_debug!("Using explicit auth URL: {url}");
         let parsed = url::Url::parse(url).internal("parsing explicit auth URL")?;
-        // The explicit path has no advertisement to build the OIDC backend
-        // from, so it cannot serve that scheme.
-        if parsed.scheme() == "oidc" {
-            return Err(LoginError::internal(
-                "OIDC login resolves from the server advertisement; omit --auth-url",
-            ));
-        }
-        (url.to_string(), parsed)
+        let endpoint =
+            AuthEndpoint::resolve(url).forward::<LoginError>("resolving the auth URL")?;
+        (endpoint, parsed)
     } else {
         let (parsed_remote, protocol) =
             lore_transport::parse(remote_url).forward::<LoginError>("parsing remote URL")?;
@@ -247,20 +213,11 @@ pub(crate) async fn with_token(
             .forward::<LoginError>("getting environment config")?;
         lore_debug!("Server environment config: {:?}", environment);
 
-        let auth_url = environment
-            .endpoint
-            .as_ref()
-            .and_then(|endpoint| endpoint.auth_url.clone())
-            .unwrap_or_default();
-
-        let auth_url = resolve_login_auth_url::<LoginError>(
-            crate::lore::execution_context().globals().auth_mode,
-            auth_url,
-            environment.oidc,
-        )?;
-
-        (auth_url, parsed_remote)
+        let selected = select_auth_path(&environment)
+            .forward::<LoginError>("selecting the authentication path")?;
+        (selected.endpoint, parsed_remote)
     };
+    let auth_url = auth_endpoint.url.clone();
 
     let user_info = if token_type == "lore" {
         // Direct lore token — just validate and store, no exchange needed
@@ -283,7 +240,7 @@ pub(crate) async fn with_token(
             return Err(LoginError::internal("Invalid token"));
         }
     } else {
-        exchange_token(auth_url, token, token_type, &remote_url).await?
+        exchange_token(auth_endpoint, token, token_type, &remote_url).await?
     };
 
     Ok(user_info)
@@ -303,7 +260,9 @@ pub fn with_token_boxed<'a>(
 ///
 /// Connects to the remote URL's auth endpoint, starts an auth session, and
 /// either opens the login URL in a browser or emits it as an
-/// [`LoreEvent::AuthUrl`] event when `no_browser` is set. Polls the auth
+/// [`LoreEvent::AuthUrl`] event when `no_browser` is set. The event is also
+/// emitted, browser or not, when the session has a code for the user to
+/// enter or confirm. Polls the auth
 /// service at the cadence the session sets until the user approves the
 /// login, reporting each wait as a [`LoreEvent::AuthPending`] event, and
 /// fails when the session ends without one.
@@ -330,20 +289,15 @@ pub async fn interactive(
         .forward::<InteractiveLoginError>("getting environment config")?;
     lore_debug!("Server environment config: {:?}", environment);
 
-    let auth_url = environment
-        .endpoint
-        .as_ref()
-        .and_then(|endpoint| endpoint.auth_url.clone())
-        .unwrap_or_default();
-
-    let auth_url = resolve_login_auth_url::<InteractiveLoginError>(
-        crate::lore::execution_context().globals().auth_mode,
-        auth_url,
-        environment.oidc,
-    )?;
-
-    let auth_impl = authentication::find(&auth_url)
-        .forward::<InteractiveLoginError>("finding authentication handler")?;
+    let Selected {
+        path,
+        endpoint: AuthEndpoint {
+            url: auth_url,
+            auth: auth_impl,
+        },
+    } = select_auth_path(&environment)
+        .forward::<InteractiveLoginError>("selecting the authentication path")?;
+    lore_debug!("Login over the {path:?} path");
     let correlation_id = crate::lore::execution_context()
         .globals()
         .correlation_id
@@ -368,17 +322,20 @@ pub async fn interactive(
         .await
         .forward::<InteractiveLoginError>("starting auth session")?;
 
-    lore_debug!(
-        "Got: '{} / {}' from service",
-        session.login_url,
-        session.session_code
-    );
+    // Neither the session code, which redeems the approval, nor the login
+    // URL, which may embed the user code, goes to the log.
+    lore_debug!("Login session opened, valid for {:?}", session.expires_in);
 
     if !no_browser {
         open::that(session.login_url.as_str()).internal("opening authentication URL")?;
-    } else {
+    }
+    // The URL goes to the caller when no browser opens it, and the code
+    // whenever there is one: the page may ask the user to confirm it (RFC
+    // 8628 §3.3.1), and only the caller can show it.
+    if no_browser || !session.user_code.is_empty() {
         event::LoreEvent::AuthUrl(LoreAuthUrlEventData {
             url: (&session.login_url).into(),
+            user_code: (&session.user_code).into(),
         })
         .send();
     }
@@ -416,7 +373,7 @@ pub async fn interactive(
         lore_debug!("Failed to store refresh token for {}: {e}", authn.user_id);
     }
 
-    let Some(user_info) = lore_credential::user_info(
+    let Some(mut user_info) = lore_credential::user_info(
         auth_url.as_str(),
         authn.user_id.as_str(),
         vulnerable_all_tokens(),
@@ -427,6 +384,11 @@ pub async fn interactive(
     else {
         return Err(InteractiveLoginError::internal("Unable to load user info"));
     };
+    // The token may carry no display name; the backend may have named the
+    // user another way, such as an OIDC ID token.
+    if user_info.name.is_empty() {
+        user_info.name = authn.user_name;
+    }
 
     Ok(user_info)
 }

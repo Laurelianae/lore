@@ -10,6 +10,12 @@ use serde_with::serde_as;
 
 use crate::token_store::IdentityToken;
 
+/// The claim an issuer puts the user identity in when `sub` is not it.
+pub const IDENTITY_CLAIM: &str = "identity";
+/// The namespaced alias of [`IDENTITY_CLAIM`], for providers that require namespaced custom
+/// claims.
+pub const IDENTITY_CLAIM_NAMESPACED: &str = "https://lore.org/claims/identity";
+
 #[derive(Debug, Default, Clone)]
 pub struct UserInfo {
     pub id: String,
@@ -26,8 +32,20 @@ pub struct UserInfo {
 pub struct JWTUserInfo {
     #[serde(rename = "iss")]
     pub issuer: String,
+    /// The subject. The identity this token names may be another claim, see
+    /// [`JWTUserInfo::identity`].
     #[serde(rename = "sub")]
     pub user_id: String,
+    /// `None` when the claim is absent; `Some` holds whatever was carried, a JSON `null`
+    /// included, so presence decides (see [`JWTUserInfo::identity`]).
+    #[serde(default, rename = "identity", deserialize_with = "present")]
+    pub identity: Option<serde_json::Value>,
+    #[serde(
+        default,
+        rename = "https://lore.org/claims/identity",
+        deserialize_with = "present"
+    )]
+    pub identity_namespaced: Option<serde_json::Value>,
     pub name: Option<String>,
     pub preferred_username: Option<String>,
     pub is_service_account: Option<bool>,
@@ -36,72 +54,86 @@ pub struct JWTUserInfo {
     #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(rename = "aud")]
     pub audience: Vec<String>,
-    /// The root domains the issuer granted, tried before `aud` (D5).
+    #[serde_as(as = "Option<OneOrMany<_, PreferMany>>")]
     #[serde(default)]
     pub root_domains: Option<Vec<String>>,
-    /// The namespaced alias of `root_domains`, for providers that require
-    /// namespaced custom claims (D5).
-    #[serde(rename = "https://lore.org/claims/root_domains", default)]
-    pub namespaced_root_domains: Option<Vec<String>>,
+    #[serde_as(as = "Option<OneOrMany<_, PreferMany>>")]
+    #[serde(default, rename = "https://lore.org/claims/root_domains")]
+    pub root_domains_namespaced: Option<Vec<String>>,
+}
+
+/// Keeps a present claim present: a JSON `null` decodes as `Some(Value::Null)`, where
+/// `Option<Value>` alone would read it as absent.
+fn present<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 impl JWTUserInfo {
-    /// All the root domains this token is intended for, derived per the OIDC
-    /// LEP's D5: the issuer's `root_domains` claim under its fixed name or
-    /// its namespaced alias when either is present, else the `aud` entries
-    /// that have a usable shape. The issuer's own URL is deliberately not
-    /// part of the list; `store_user_token` appends the auth endpoint's
-    /// domain, which keeps the fail-closed case (no usable source) working
-    /// by sending the token back to the endpoint it came from only.
+    /// The identity this token names: the first of `identity`, its namespaced alias and `sub`
+    /// the token carries, and only that one. `None` when that claim is empty, `null` or not a
+    /// string, so the token names no one; the rule does not fall through to the next claim.
+    pub fn identity(&self) -> Option<&str> {
+        self.identity_source().1
+    }
+
+    /// The name of the claim that decides the identity, and its value when it is a non-empty
+    /// string.
+    pub fn identity_source(&self) -> (&'static str, Option<&str>) {
+        let (claim, value) = [
+            (IDENTITY_CLAIM, &self.identity),
+            (IDENTITY_CLAIM_NAMESPACED, &self.identity_namespaced),
+        ]
+        .into_iter()
+        .find_map(|(claim, value)| value.as_ref().map(|value| (claim, value.as_str())))
+        .unwrap_or(("sub", Some(self.user_id.as_str())));
+        (claim, value.filter(|value| !value.is_empty()))
+    }
+
+    /// The root domains this token may be sent to, read from claims the issuer signed.
+    ///
+    /// The `root_domains` claim, or its namespaced alias, wins. Otherwise `aud` entries with a
+    /// usable shape contribute: an `https` URI its host, a domain-shaped entry a suffix. Names
+    /// are fixed so an environment response cannot point the client at a different claim.
     pub fn acceptable_root_domains(&self) -> Vec<String> {
-        for claim in [
-            self.root_domains.as_ref(),
-            self.namespaced_root_domains.as_ref(),
-        ] {
-            if let Some(domains) = claim
-                && !domains.is_empty()
-            {
-                return domains.clone();
-            }
+        let from_claim: Vec<String> = [&self.root_domains, &self.root_domains_namespaced]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|domain| !domain.is_empty())
+            .cloned()
+            .collect();
+        if !from_claim.is_empty() {
+            return from_claim;
         }
+
         self.audience
             .iter()
-            .filter_map(|entry| audience_entry_root_domain(entry))
+            .filter_map(|aud| domain_from_audience(aud))
             .collect()
     }
 }
 
-/// The claim the issuer sets to name the root domains its tokens may be
-/// sent to (D5). Fixed, so nothing in an attacker-controlled environment
-/// response can point the client at a different claim.
-pub const ROOT_DOMAINS_CLAIM: &str = "root_domains";
-
-/// The namespaced alias of [`ROOT_DOMAINS_CLAIM`], for providers that
-/// require namespaced custom claims (D5).
-pub const NAMESPACED_ROOT_DOMAINS_CLAIM: &str = "https://lore.org/claims/root_domains";
-
-/// One `aud` entry's contribution to the root-domain list (D5): the host of
-/// an `https` URI, or a domain-shaped entry as a suffix. An opaque
-/// identifier such as `lore-api` contributes nothing.
-pub fn audience_entry_root_domain(entry: &str) -> Option<String> {
-    if let Ok(url) = url::Url::parse(entry) {
-        return if url.scheme() == "https" {
-            url.host_str().map(str::to_string)
-        } else {
-            None
-        };
+fn domain_from_audience(aud: &str) -> Option<String> {
+    if aud.contains("://") {
+        let url = url::Url::parse(aud).ok()?;
+        if url.scheme() != "https" {
+            return None;
+        }
+        return url.host_str().map(str::to_string);
     }
-    let entry = entry.strip_prefix('.').unwrap_or(entry);
-    if entry.is_empty() || !entry.contains('.') {
-        return None;
-    }
-    let label_shaped = entry.split('.').all(|label| {
-        !label.is_empty()
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    });
-    label_shaped.then(|| format!(".{entry}"))
+
+    let apex = aud.strip_prefix('.').unwrap_or(aud);
+    let domain_shaped = apex.contains('.')
+        && apex.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        });
+    domain_shaped.then(|| aud.to_string())
 }
 
 pub async fn user_info<P>(
@@ -150,12 +182,15 @@ pub fn insecure_decode_token(
     jsonwebtoken::decode::<JWTUserInfo>(token, &key, &validation)
 }
 
+/// The user a token names. `None` when the token is not a JWT with the standard claims, or
+/// names no identity (see [`JWTUserInfo::identity`]).
 pub fn user_info_from_token(token: String) -> Option<UserInfo> {
     let Ok(token_data) = insecure_decode_token(&token) else {
         return None;
     };
+    let id = token_data.claims.identity()?.to_string();
     Some(UserInfo {
-        id: token_data.claims.user_id.clone(),
+        id,
         name: token_data.claims.name.clone().unwrap_or_default(),
         token,
         preferred_username: token_data.claims.preferred_username.unwrap_or_default(),
@@ -184,6 +219,12 @@ pub fn verify_jwt_usage_for_remote(
     remote_domain: &str,
 ) -> Result<(), JwtUsageError> {
     let root_domains = jwt.acceptable_root_domains();
+    if root_domains.is_empty() {
+        return Err(JwtUsageError::internal(
+            "JWT names no domain it may be sent to: have the issuer add a 'root_domains' claim, \
+             or set the token audience to the deployment's https URL or domain",
+        ));
+    }
     if domain_in_root_domains(remote_domain, &root_domains) {
         return Ok(());
     }
@@ -192,6 +233,6 @@ pub fn verify_jwt_usage_for_remote(
         "JWT acceptable domains '{root_domains:?}' does not contain '{remote_domain}' - forbidding JWT leak"
     );
     Err(JwtUsageError::internal(format!(
-        "JWT 'aud' does not specify remote domain '{remote_domain}'"
+        "JWT does not specify remote domain '{remote_domain}'"
     )))
 }

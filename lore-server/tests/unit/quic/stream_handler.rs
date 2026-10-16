@@ -36,6 +36,7 @@ use lore_server::quic::tests::TEST_PROTOCOL_V4;
 use lore_server::quic::tests::TestHandlerFactory;
 use lore_server::quic::tests::server_certs;
 use lore_server::quic::tests::test_data_path;
+use lore_transport::auth::AuthEndpoint;
 use lore_transport::quic::QuicErrorStatus;
 use lore_transport::quic::QuicOpCode;
 use lore_transport::quic::QuicServiceError;
@@ -1680,8 +1681,7 @@ async fn authenticated_storage_permission_matrix_on_both_protocols() {
                         jwt_issuer: None,
                         jwt_audience: Some(vec!["test".into()]),
                         jwt_typ: None,
-                        identity_claim: "sub".into(),
-                    };
+                                            };
                     let factory = TestHandlerFactory::with_authorization(
                         immutable.clone(),
                         mutable.clone(),
@@ -1903,8 +1903,7 @@ mod authorization_expiry {
             jwt_issuer: None,
             jwt_audience: Some(vec!["expiry".into()]),
             jwt_typ: None,
-            identity_claim: "sub".into(),
-        }))
+                    }))
     }
     fn token(expires: u64, repositories: &[RepositoryId], action: &str) -> String {
         let claims = AuthorizationToken {
@@ -2209,7 +2208,7 @@ mod authorization_expiry {
                     partition: repository,
                     user_agent: "expiry-test".into(),
                 });
-                let storage = Arc::new(StorageClient::new(
+                let storage = StorageClient::new(
                     std::sync::Weak::new(),
                     "lores://localhost",
                     TransportConfig {
@@ -2219,13 +2218,13 @@ mod authorization_expiry {
                         initial_cwnd: None,
                     },
                     adapter,
-                    "",
+                    &AuthEndpoint::none(),
                     "localhost",
                     "expiry-user",
                     repository,
                     harness.connection.clone(),
                     &credentials,
-                ));
+                );
                 bounded("create stream", storage.quic().create_initial_stream())
                     .await
                     .unwrap();

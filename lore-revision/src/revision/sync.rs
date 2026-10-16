@@ -194,7 +194,9 @@ impl EventError for SyncError {
 
 impl From<FsError> for SyncError {
     fn from(value: FsError) -> Self {
-        SyncError::internal_with_context(value, "Failed during internal filesystem operation")
+        Err::<(), _>(value)
+            .forward::<SyncError>("Failed during internal filesystem operation")
+            .unwrap_err()
     }
 }
 
@@ -828,6 +830,7 @@ pub(crate) async fn sync(
             lore_info!("Remote and local branch have diverged, performing merge",);
             let merge_options = merge::MergeStartOptions {
                 message: String::new(),
+                link_messages: std::collections::HashMap::new(),
                 no_commit: false,
                 scope: merge::MergeScope::MainOnly,
                 inherit_metadata: crate::metadata::MetadataInherit::default(),

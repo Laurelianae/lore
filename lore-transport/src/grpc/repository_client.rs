@@ -1,7 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::sync::Arc;
-
 use lore_base::error::NotFound;
 use lore_base::types::Context;
 use lore_base::types::Hash;
@@ -9,76 +7,48 @@ use lore_base::types::RepositoryId;
 use lore_proto::lore::repository::v1 as repository_v1;
 use lore_proto::lore::repository::v1::repository_service_client::RepositoryServiceClient;
 use tokio_stream::StreamExt;
-use tonic::codegen::InterceptedService;
 use tonic::service::Interceptor;
+use tonic::service::interceptor::InterceptedService;
 
+use super::AuthnInterceptor;
+use super::AuthzInterceptor;
 use super::Channel;
 use super::GRPCAuthRef;
 use super::grpc_retry;
 use super::handle_error;
-use super::inject_authorization;
-use super::inject_correlation_id;
-use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
 use crate::types::MetadataSetResult;
 use crate::types::RepositoryData;
 
+/// The repository service, sending the token its interceptor injects: the login token by
+/// default, or a partition's authorization token from [`RepositoryService::for_partition`].
 #[derive(Clone)]
-pub struct RepositoryService {
-    client: RepositoryServiceClient<InterceptedService<Channel, RepositoryInterceptor>>,
-}
-
-/// Claim-based repository RPCs use the supplied authorization token. Legacy
-/// servers retain the login credential, including for `CreateResource` and
-/// repository catalog calls to the auth service.
-#[derive(Clone)]
-struct RepositoryInterceptor {
-    auth: GRPCAuthRef,
-    credentials: Arc<SuppliedCredentials>,
-    legacy_auth: bool,
-}
-
-impl Interceptor for RepositoryInterceptor {
-    fn call(
-        &mut self,
-        mut request: tonic::Request<()>,
-    ) -> Result<tonic::Request<()>, tonic::Status> {
-        inject_correlation_id(&mut request)?;
-        let token = if self.legacy_auth {
-            self.auth.read().authentication_token.clone()
-        } else {
-            let (identity_token, access_token) = self.credentials.tokens();
-            if !access_token.is_empty() {
-                access_token
-            } else if !identity_token.is_empty() {
-                identity_token
-            } else {
-                self.auth.read().authentication_token.clone()
-            }
-        };
-        inject_authorization(&mut request, &token)?;
-        Ok(request)
-    }
+pub struct RepositoryService<I = AuthnInterceptor> {
+    client: RepositoryServiceClient<InterceptedService<Channel, I>>,
 }
 
 impl RepositoryService {
-    pub fn new(
-        channel: Channel,
-        auth: GRPCAuthRef,
-        credentials: &Arc<SuppliedCredentials>,
-        legacy_auth: bool,
-    ) -> Self {
-        let client = RepositoryServiceClient::with_interceptor(
-            channel,
-            RepositoryInterceptor {
-                auth,
-                credentials: credentials.clone(),
-                legacy_auth,
-            },
-        );
+    pub fn new(channel: Channel, auth: GRPCAuthRef) -> Self {
+        let client = RepositoryServiceClient::with_interceptor(channel, AuthnInterceptor { auth });
+
         Self { client }
     }
+}
 
+impl RepositoryService<AuthzInterceptor> {
+    /// Calls about `repository` carrying its authorization token, for a server that
+    /// authorizes them from the token's claims alone.
+    pub fn for_partition(channel: Channel, repository: RepositoryId, auth: GRPCAuthRef) -> Self {
+        let client = RepositoryServiceClient::with_interceptor(
+            channel,
+            AuthzInterceptor { repository, auth },
+        );
+
+        Self { client }
+    }
+}
+
+impl<I: Interceptor + Clone + Send + Sync + 'static> RepositoryService<I> {
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         &self,
