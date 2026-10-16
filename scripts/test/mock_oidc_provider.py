@@ -357,6 +357,11 @@ class MockOidcProvider:
             claims["identity"] = user.identity
         if resources is not None:
             claims["resources"] = resources
+        else:
+            # A login token carries the global permissions its server reads
+            # from `permission_claim`, as an enforcing deployment's provider
+            # mints them; a partition-scoped exchange token stays scoped.
+            claims["permissions"] = ["write"]
         token = self._sign(claims)
         with self._lock:
             self._minted.add(token)

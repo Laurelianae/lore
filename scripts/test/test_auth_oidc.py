@@ -59,6 +59,7 @@ OIDC_CONFIG = """
 [server.auth]
 jwt_issuer = "{issuer}"
 jwt_audience = ["{audience}"]
+permission_claim = "permissions"
 
 [server.auth.oidc]
 client_id = "{client_id}"
@@ -354,6 +355,21 @@ from lore_server import (
 
 from lore import Lore
 
+
+CLIENT_ID = "lore-smoke-client"
+AUDIENCE = "lore-smoke-audience"
+USER_ID = "oidc-user"
+USER_NAME = "Ada Lovelace"
+
+DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
+ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
+
+# The device poll cadence the fake advertises: the client refuses anything
+# below one second anyway.
+DEVICE_INTERVAL_SECONDS = 1
+DEVICE_LIFETIME_SECONDS = 1800
+DEFAULT_TOKEN_LIFETIME_SECONDS = 3600
 
 TIER1_CONFIG = """
 
@@ -836,7 +852,7 @@ def fork_oidc_env(request, tmp_path_factory, lore_server_executable_path):
 @pytest.fixture(scope="function")
 def fork_oidc_actor(fork_oidc_env, new_lore_repo, scratch_dir):
     """An actor factory against the Tier 1 server."""
-    return make_actor_factory(new_lore_repo, scratch_dir, oidc_env.remote_url)
+    return make_actor_factory(new_lore_repo, scratch_dir, fork_oidc_env.remote_url)
 
 
 @pytest.fixture(autouse=True)
@@ -862,11 +878,11 @@ def test_oidc_device_grant_login_completes_and_identity_persists(fork_oidc_env, 
     """`--auth-mode oidc` login runs the RFC 8628 device grant against the
     advertised issuer and stores the identity under it; `auth info` and
     `auth list` resolve it back."""
-    idp = oidc_env.idp
-    actor = oidc_actor("login")
+    idp = fork_oidc_env.idp
+    actor = fork_oidc_actor("login")
     repo = actor.make_repo()
 
-    output = login_interactive(repo, oidc_env.remote_url)
+    output = login_interactive(repo, fork_oidc_env.remote_url)
 
     assert "Login at:" in output
     assert f"{idp.issuer}/activate?user_code=WDJB-MJHT" in output
@@ -891,10 +907,10 @@ def test_oidc_device_grant_login_completes_and_identity_persists(fork_oidc_env, 
 def test_authenticated_operation_succeeds_under_tier1_authorizer(fork_oidc_env, fork_oidc_actor):
     """After login, repository create and push run under the global-grants
     authorizer reading the presented token's `groups` claim."""
-    idp = oidc_env.idp
+    idp = fork_oidc_env.idp
     idp.set_claims({"groups": ["admin"]})
-    actor = oidc_actor("tier1")
-    login_interactive(actor.make_repo(), oidc_env.remote_url)
+    actor = fork_oidc_actor("tier1")
+    login_interactive(actor.make_repo(), fork_oidc_env.remote_url)
 
     repo_id = f"oidc-tier1-{uuid.uuid4().hex[:8]}"
     repo = actor.make_repo(repo_id=repo_id)
@@ -914,10 +930,10 @@ def test_expired_token_is_renewed_by_the_refresh_grant(fork_oidc_env, fork_oidc_
     """A token minted with a short `exp` is renewed on the next operation:
     the refresh grant is hit, the rotation is persisted, and the operation
     succeeds with the renewed token."""
-    idp = oidc_env.idp
+    idp = fork_oidc_env.idp
     idp.set_claims({"groups": ["admin"], "exp": int(time.time()) + 2})
-    actor = oidc_actor("refresh")
-    login_interactive(actor.make_repo(), oidc_env.remote_url)
+    actor = fork_oidc_actor("refresh")
+    login_interactive(actor.make_repo(), fork_oidc_env.remote_url)
 
     # The login token dies within seconds; the renewal must hand out the
     # default lifetime, so clear the override before the refresh answers.
@@ -940,13 +956,13 @@ def test_expired_token_is_renewed_by_the_refresh_grant(fork_oidc_env, fork_oidc_
 def test_logout_revokes_tokens_at_the_provider(fork_oidc_env, fork_oidc_actor):
     """`auth logout` posts the stored access and refresh tokens to the
     advertised revocation endpoint and still clears the local store."""
-    idp = oidc_env.idp
-    actor = oidc_actor("logout")
+    idp = fork_oidc_env.idp
+    actor = fork_oidc_actor("logout")
     # The Tier 1 global-grants authorizer reads `groups` from the token;
     # repository creation below needs the grant.
     idp.set_claims({"groups": ["admin"]})
     scratch = actor.make_repo()
-    login_interactive(scratch, oidc_env.remote_url)
+    login_interactive(scratch, fork_oidc_env.remote_url)
     refresh = idp.last_refresh_token
 
     # `auth logout` resolves the endpoint from the repository's remote

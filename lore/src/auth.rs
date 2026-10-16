@@ -522,9 +522,10 @@ async fn logout_local(
     LORE_CONTEXT
         .scope(execution, async move {
             let result = async move {
-                let auth_url =
+                let auth_endpoint =
                     resolve_auth_endpoint(args.auth_url.as_str(), &repository_path, &identity)
                         .await?;
+                let auth_url = auth_endpoint.url.clone();
 
                 // Revoke at the provider where a backend is registered for
                 // this URL (the OIDC path; connect() registers it from the
@@ -536,7 +537,10 @@ async fn logout_local(
                 // they are minted at the exchange issuer and bounded by
                 // their own expiry.
                 if args.resource.is_empty() {
-                    let backend = lore_transport::auth::authentication::find(&auth_url).ok();
+                    // The endpoint carries the implementation selected for it:
+                    // the OIDC backend is bound per selection, not resolvable
+                    // from the scheme registry.
+                    let backend = Some(auth_endpoint.auth.clone());
                     if let Some(backend) = backend {
                         let identities = if args.user_id.is_empty() {
                             lore_credential::token_store::load_identities(&auth_url)
@@ -740,9 +744,10 @@ async fn resolve_auth_endpoint(
     auth_endpoint: &str,
     repository_path: &str,
     identity: &str,
-) -> Result<String, AuthStoreError> {
+) -> Result<lore_transport::auth::AuthEndpoint, AuthStoreError> {
     if !auth_endpoint.is_empty() {
-        return Ok(auth_endpoint.to_string());
+        return lore_transport::auth::AuthEndpoint::resolve(auth_endpoint)
+            .forward::<AuthStoreError>("resolving auth endpoint");
     }
 
     // Forward the connect error instead of discarding it, so the real failure
@@ -757,9 +762,12 @@ async fn resolve_auth_endpoint(
             .await
             .forward::<AuthStoreError>("resolving auth endpoint from remote")?;
 
-            let auth_url = connection.auth_url().to_string();
-            if !auth_url.is_empty() {
-                return Ok(auth_url);
+            // The endpoint carries the implementation selected for the
+            // connection: an OIDC backend is bound per selection, not
+            // resolvable from the scheme registry.
+            let endpoint = connection.auth_endpoint().clone();
+            if !endpoint.url.is_empty() {
+                return Ok(endpoint);
             }
         }
         // The repository exists and simply has no remote. Nothing is unreachable and
@@ -824,8 +832,9 @@ async fn emit_local_user_info(args: &LoreAuthLocalUserInfoArgs) -> Result<(), Au
     let identity = globals.identity().unwrap_or_default().to_string();
     let include_identity_token = args.with_identity_token != 0;
 
-    let auth_endpoint =
+    let resolved =
         resolve_auth_endpoint(args.auth_endpoint.as_str(), &repository_path, &identity).await?;
+    let auth_endpoint = resolved.url;
 
     let mut user_ids: Vec<String> = args
         .user_ids

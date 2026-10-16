@@ -28,7 +28,6 @@ use lore_error_set::prelude::*;
 use tokio::sync::Mutex;
 
 use crate::auth::AuthEndpoint;
-use crate::auth::authentication;
 use crate::connection::CredentialStore;
 use crate::connection::credential_store;
 
@@ -90,10 +89,11 @@ pub fn is_expired(expires: u64) -> bool {
 /// own root-domain derivation. Any failure -- no backend, no refresh
 /// token, a spent or refused one -- answers `None`, and the caller falls
 /// back to what it had: a debug log, no retry storm.
-async fn refresh_if_expired(auth_url: &str, identity: &str) -> Option<String> {
-    let Ok(auth_impl) = authentication::find(auth_url) else {
-        return None;
-    };
+async fn refresh_if_expired(auth_endpoint: &AuthEndpoint, identity: &str) -> Option<String> {
+    let auth_url = auth_endpoint.url.as_str();
+    // The endpoint carries the implementation selected for it: an OIDC backend
+    // is bound per selection, not resolvable from the scheme registry.
+    let auth_impl = auth_endpoint.auth.clone();
     let Ok(refresh_token) = token_store::load_refresh_token(auth_url, identity).await else {
         lore_debug!("No refresh token stored for {identity} at {auth_url}");
         return None;
@@ -508,6 +508,19 @@ pub async fn exchange_custom_resource(
 /// authorize for the given repository).
 ///
 /// `identity_token` and `access_token` are the caller-supplied credentials.
+/// Whether `auth_endpoint` authorizes from the token's own claims: a server that
+/// advertises no authentication, or the OIDC path. There a supplied access token is
+/// the credential itself, and it is preferred over a supplied identity token and
+/// over the token store (LP-008's precedence). A legacy auth-service endpoint
+/// instead retains login-token selection, where the identity token is the RPC
+/// credential and a scoped access token serves the uploads.
+fn claim_based_endpoint(auth_endpoint: &AuthEndpoint) -> bool {
+    auth_endpoint.is_none()
+        || auth_endpoint
+            .url
+            .starts_with(crate::auth::oidc::SCHEME_PREFIX)
+}
+
 pub async fn auth_exchange(
     auth_endpoint: &AuthEndpoint,
     remote_domain: &str,
@@ -516,6 +529,28 @@ pub async fn auth_exchange(
     identity_token: &str,
     access_token: &str,
 ) -> (String, String, String) {
+    if !access_token.is_empty() && claim_based_endpoint(auth_endpoint) {
+        let authorization_token = if repository.is_zero() {
+            String::new()
+        } else {
+            exchange(
+                auth_endpoint,
+                identity,
+                repository,
+                remote_domain.to_string(),
+                identity_token,
+                access_token,
+            )
+            .await
+            .unwrap_or_default()
+        };
+        return (
+            access_token.to_string(),
+            authorization_token,
+            identity.to_string(),
+        );
+    }
+
     if !identity.is_empty() {
         return auth_exchange_for_identity(
             auth_endpoint,
@@ -602,7 +637,7 @@ async fn auth_exchange_for_identity(
         && let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
         && is_expired(info.expires)
     {
-        if let Some(refreshed) = refresh_if_expired(&auth_endpoint.url, identity).await {
+        if let Some(refreshed) = refresh_if_expired(auth_endpoint, identity).await {
             authentication_token = refreshed;
         } else {
             lore_debug!("Skipping identity {identity}, authn token is expired");
@@ -693,6 +728,24 @@ pub async fn auth_exchange_custom_resource(
     identity_token: &str,
     access_token: &str,
 ) -> (String, String, String) {
+    if !access_token.is_empty() && claim_based_endpoint(auth_endpoint) {
+        let authorization_token = exchange_custom_resource(
+            auth_endpoint,
+            identity,
+            resource_id,
+            remote_domain.to_string(),
+            identity_token,
+            access_token,
+        )
+        .await
+        .unwrap_or_default();
+        return (
+            access_token.to_string(),
+            authorization_token,
+            identity.to_string(),
+        );
+    }
+
     if !identity.is_empty() {
         return auth_exchange_custom_resource_for_identity(
             auth_endpoint,
@@ -765,7 +818,7 @@ async fn auth_exchange_custom_resource_for_identity(
         && let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
         && is_expired(info.expires)
     {
-        if let Some(refreshed) = refresh_if_expired(&auth_endpoint.url, identity).await {
+        if let Some(refreshed) = refresh_if_expired(auth_endpoint, identity).await {
             authentication_token = refreshed;
         } else {
             lore_debug!("Skipping identity {identity}, authn token is expired");
