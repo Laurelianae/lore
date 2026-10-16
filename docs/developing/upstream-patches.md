@@ -11,19 +11,45 @@ This register tracks the patches maintained on `aidonia/main` relative to local 
 
 | Item | Recorded value |
 | --- | --- |
-| Review date | 2026-10-13 |
+| Review date | 2026-10-16 |
 | Upstream project | [EpicGames/lore](https://github.com/EpicGames/lore) |
 | Fork | [Laurelianae/lore](https://github.com/Laurelianae/lore), branch `aidonia/main` |
-| Baseline | Upstream `c094c64ebf9560f62065b988bd3227d6c846912b` (merged head; contains the previously verified `db1b7c3e07ec2f149178229f34ceee6a309d80ab`) |
-| Fork revision | Merge commit `9e7966fd6a6fdc4e77629ba6a26bdb6aea7e1510` |
-| Comparison | Seventeen series commits plus the merge; 110 changed files; 7,238 insertions and 1,063 deletions versus `c094c64` |
-| Upstream freshness | Verified via `ls-remote`: `EpicGames/lore@main` = `c094c64`. An earlier check the same day returned `db1b7c3`; upstream advanced by two commits (`0595e60`, `c094c64`) before execution, and the newer head was merged instead. |
+| Baseline | Upstream `5c88e6e7528a12b74ab3e1621b5d7c540a5d1606` (merged head; contains the previously verified `c094c64ebf9560f62065b988bd3227d6c846912b`) |
+| Fork revision | `48d9aed45c6bef2de30b3096fe1e2f346f64a32f` plus the tests commit `e5da4fa` and this register update |
+| Comparison | Thirty-three series commits plus the merge; 129 changed files; 8,886 insertions and 1,097 deletions versus `5c88e6e` |
+| Upstream freshness | Verified via `ls-remote`: `EpicGames/lore@main` = `5c88e6e` on 2026-10-16. The revision had been pulled into the fork's local `main` and `origin/main` before the review; the check confirmed it was still upstream's head, so the merge landed the exact revision pulled. |
 
 The 2026-10-08 review recorded `491a7ed75c9b0dac7de50ada6d2a9c38f3cbc046` as baseline with fork revision `4bfa0ec058d08ba9c2aa7abb783d7299c9829820` (nine commits; 86 files; 5,306 insertions and 513 deletions) and could not reach the network. Its values are superseded by the table above; the narrative below is retained as provenance.
 
 The configured remote is the fork, `origin`; there is no configured `upstream` remote. Local `main` and `origin/main` pointed to the same baseline during that review. This establishes the local comparison, not whether upstream has since incorporated any of these patches. The working tree was clean before that documentation change.
 
 [Upstream PR #49](https://github.com/EpicGames/lore/pull/49) is a comparison lead already recorded in the [server authorization configuration](../reference/lore-server-config.md). Its current status, merge commit, and behavioral equivalence are unverified. Do not mark a patch retired merely because that PR exists or touches similar code.
+
+## Reconciliation 2026-10-16
+
+**Landing strategy.** Upstream was landed as a merge, not a replay: `git merge 5c88e6e` on review branch `codex/upstream-patch-review-20261016`, producing merge commit `7f44d24`, with five follow-up commits (two re-lands, the access-token credential rule, and two test adaptations) completing the gate. The merge keeps `origin/aidonia/main` an ancestor of the new tip, so the push is an ordinary fast-forward and the retained patches' original SHAs stay valid.
+
+**Retirement review.** All thirteen patches were screened against `5c88e6e` with the register's marker checks and per-patch contracts. Upstream's four OIDC client commits — `33b1f62` (auth-path selection), `21c2bd1` (device grant), `228762f` (D5 derivation), `8b73077` (RFC 8693 partition exchange) — replace LP-011 and LP-012, and upstream's resolved-auth rework replaces LP-008. Ten patches remain Active; three retire, two of them with a residual re-landed on upstream's backend.
+
+**Conflict resolution.** Git auto-merged most files. The OIDC client area (`connection.rs`, `auth/mod.rs`, `oidc/*`, `login.rs`, `jwt.rs`, `Cargo.toml`) was resolved wholesale in favor of upstream's implementation, dropping `1526c6c`'s content and its `oidc/backend.rs` structure; LP-013's revocation was re-landed onto the new layout as `a8d07fa`, and the refresh grant plus the api-key mapping as `482c038`. Verified against the acceptance contracts in the auto-merged zones: LP-009's `SessionAuthorization` expiry/replay lifecycle kept through upstream's stale-session rebind (`bind_session`/`StaleSession`), with `AuthorizationExpired` kept non-recoverable in `send_with_reconnect` and mapped to `NotAuthenticated` in the storage client's `map_send_error` (the auto-merge had dropped the latter arm); LP-007's supplied-access-token precedence kept in the storage client's `issue()` for servers that advertise no auth endpoint, where upstream sends an empty token; LP-006's read/write gates and LP-002/LP-004's authorizer consultations intact. `GRPCAuth::new`'s refresher and `for_partition` replaced LP-008's per-request interceptor; the fork's wire-level `repository_client.rs` test file, which tested the retired interceptor, was dropped in favor of upstream's exchange, select, and connection-rotation coverage. The duplicate `oidc_provider` test module the merge produced was collapsed (`d737698`).
+
+**Adopted upstream behavior changes.**
+
+- `8b73077` makes a repository lookup (`RepositoryGet`) reachable for any verified token on resource-grant servers (`check_repository_lookup`): the client must name a repository before it can exchange for a token granting it, and the record discloses only the id, name, and metadata hash. `test_read_write_matrix` now asserts lookup per tier, keeping the HTTP content probes as the read/write gates. The claims and legacy tiers still gate the lookup on read.
+- A supplied access token is now the authentication credential itself on claim-based endpoints (no advertised auth server, or the OIDC path), per LP-008's precedence; on a legacy auth-service endpoint the identity token remains the RPC credential, with a scoped access token serving the uploads (`d42b015`). `auth_exchange` and `auth_exchange_custom_resource` short-circuit on it, so repository creation and the repository RPCs authorize from a token the caller supplied even without a stored login. The token-store `load_user_token` contract is unchanged.
+- The refresh wiring and the logout revocation now take the endpoint's carried implementation instead of `authentication::find`, which can never resolve an OIDC backend (it is bound per selection, not registered under a scheme).
+- An explicit `--auth-url` naming an `oidc+` issuer resolves through the registry and fails there, instead of the fork's refusal message; upstream's error shape stands.
+
+**Validation (executed 2026-10-16, on the review branch).**
+
+- `cargo build --release`, `cargo +nightly fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings --no-deps`: all clean.
+- `cargo test --workspace`: 4,758 passed, 0 failed (after the re-lands; re-verified below).
+- `cargo build -p lore-capi`: clean; `cargo test --locked -p lore-integration-tests --features integration_tests --no-run`: passed. The Compose services were not run (no AWS environment in this sandbox), recorded as a limitation per §Reconcile step 7.
+- Focused regressions: `cargo test -p lore-server --test unit quic::` 77 passed, `authnz::` 68 passed, `grpc::` 450 passed; `cargo test -p lore-transport` 240 passed; `cargo test -p lore-credential` 36 passed.
+- Smoke (release binaries): `uv run pytest scripts/test/test_repository_permissions.py` — 96 passed, 45 skipped (matches the LP-008 recorded counts); `uv run pytest scripts/test/test_auth_oidc.py` — 14 passed (upstream's nine plus the fork's device-grant, Tier 1, refresh-renewal, logout-revocation, and Tier 2 exchange suites); `uv run pytest scripts/test/ -m smoke` — 1,349 passed, 0 failed, 83 skipped, 24 deselected. The seven smoke failures recorded in 2026-10-13 no longer reproduce: upstream fixed them between `c094c64` and `5c88e6e`.
+- `pre-commit run --all-files`: all hooks passed, including the GitHub Actions workflow lint that could not run in 2026-10-13's sandbox.
+
+**Future comparisons** should use `git diff 5c88e6e <fork-tip>` — or the then-current merge-base — rather than the retired `c094c64` baseline, and keep this section's marker checks (§ above) as the retirement screen.
 
 ## Reconciliation 2026-10-13
 
@@ -57,12 +83,12 @@ IDs remain stable through rebases, splits, and retirement. The table is in repla
 | LP-005 | [b25e641](https://github.com/Laurelianae/lore/commit/b25e6410fb0fcb8fa6c5b96ea16c58e2ade7e071) | Permission-matrix test cleanup | Supporting work for LP-001 through LP-004 | Supporting |
 | LP-006 | [74f99b9](https://github.com/Laurelianae/lore/commit/74f99b9dde16fee134884a781df7cdc348bd1e5c) | Read/write enforcement across transports | Layers onto LP-001 through LP-005; adds smoke infrastructure used by LP-007 and LP-008 | Active |
 | LP-007 | [ca0b042](https://github.com/Laurelianae/lore/commit/ca0b04201cd9350b419ecb5120e9d7ac00595012) | Supplied access tokens in QUIC sessions | Extends LP-006 smoke coverage; same storage client later changed by LP-009 | Active |
-| LP-008 | [e799c84](https://github.com/Laurelianae/lore/commit/e799c84368a25a43f98d8ccad0c0e95f5f9a5700) | Scoped tokens for repository RPCs | Extends LP-006 smoke coverage; complements LP-007 | Active |
+| LP-008 | [e799c84](https://github.com/Laurelianae/lore/commit/e799c84368a25a43f98d8ccad0c0e95f5f9a5700) | Scoped tokens for repository RPCs | Extends LP-006 smoke coverage; complements LP-007 | Retired 2026-10-16 |
 | LP-009 | [4bfa0ec](https://github.com/Laurelianae/lore/commit/4bfa0ec058d08ba9c2aa7abb783d7299c9829820) | Cached QUIC authorization expiry and recovery | Uses LP-006 cached grants and LP-007 current-token selection | Active |
 | LP-010 | [eabb070](https://github.com/Laurelianae/lore/commit/eabb0702aa04b08861e60008b4cd8dc1921df1cc) | Portable Docker builds and fork release delivery | Reuses the portable ARM baseline, version stamping, and notices generation | Active |
-| LP-011 | [1526c6c](https://github.com/Laurelianae/lore/commit/1526c6c24f63e0d3081578626dfe2f777e041f07) | Client OIDC device grant, refresh, and auth-path dispatch | Builds on the D5 claim reading also recorded by LP-012; adds the `AuthMode` plumbing the connect bridge forwards | Active |
-| LP-012 | [1526c6c](https://github.com/Laurelianae/lore/commit/1526c6c24f63e0d3081578626dfe2f777e041f07) | RFC 8693 token exchange and external-token login | Layers onto LP-011's backend and D5 derivation | Active |
-| LP-013 | [5534934](https://github.com/Laurelianae/lore/commit/5534934c564d37341ff8e244a31ce6293937517e) | RFC 7009 token revocation on `lore auth logout` | Extends LP-011's backend and per-URL registry | Active |
+| LP-011 | [1526c6c](https://github.com/Laurelianae/lore/commit/1526c6c24f63e0d3081578626dfe2f777e041f07) | Client OIDC device grant, refresh, and auth-path dispatch | Builds on the D5 claim reading also recorded by LP-012; adds the `AuthMode` plumbing the connect bridge forwards | Retired 2026-10-16, refresh re-landed |
+| LP-012 | [1526c6c](https://github.com/Laurelianae/lore/commit/1526c6c24f63e0d3081578626dfe2f777e041f07) | RFC 8693 token exchange and external-token login | Layers onto LP-011's backend and D5 derivation | Retired 2026-10-16, api-key login re-landed |
+| LP-013 | [5534934](https://github.com/Laurelianae/lore/commit/5534934c564d37341ff8e244a31ce6293937517e) | RFC 7009 token revocation on `lore auth logout` | Extends LP-011's backend and per-URL registry | Active, re-landed 2026-10-16 |
 
 ## Patch details and acceptance contracts
 
@@ -173,6 +199,8 @@ Creation validates and authorizes before mutation hooks or writes, including ret
 
 **Retire when:** All upstream repository RPCs implement the same current-credential precedence and pass wire-level plus CLI coverage, including access-token-only creation and legacy selection after reconnect.
 
+**Disposition (2026-10-16): Retired.** Upstream's resolved-auth rework replaces the per-request interceptor: `GRPCAuth::new` resolves the authentication and authorization tokens once per endpoint (commits `33b1f62`, `8b73077`), `grpc_auth_refresher` re-resolves on credential rotation, reconnects re-run `repository_authz`, and the `AuthnInterceptor`/`AuthzInterceptor` pair injects the resolved tokens. A supplied access token is the authentication credential on claim-based endpoints and a legacy auth-service deployment retains login-token selection (`d42b015`). Verified with upstream's `auth/exchange.rs` selection tests (`supplied_access_token_replaces_the_repository_exchange`, `access_token_alone_authorizes_without_an_authentication_token`, `one_supplied_credential_is_never_served_anothers_authorization`), the `oidc/exchange.rs` wire tests, `connection.rs`'s rotation tests, and the permission smoke suite's 96 passing tests including the legacy distinct-credential matrices. The fork's wire-level `repository_client.rs` tests tested the retired interceptor and were dropped; the per-request-versus-per-connection selection difference is an implementation detail the rotation watcher absorbs.
+
 ### LP-009: Cached QUIC authorization expiry
 
 **Before:** JWT verification checked expiry when authorization was established, but open legacy connections and v4 sessions could keep using cached grants after expiry. Client sessions lacked the new expiry-specific recovery path.
@@ -232,6 +260,8 @@ The transport maps wire status `AuthorizationExpired = 6` to `NotAuthenticated`.
 
 **Retire when:** Upstream lands an equivalent client OIDC login (the LEP is upstream-approved, so this is expected). Verify against the same contract — device grant against the advertised issuer, refresh with rotation persisted through the exchange identity path, D5 derivation, and `AuthMode` dispatch with the explicit-not-advertised error — then retire per the register's reconciliation procedure.
 
+**Disposition (2026-10-16): Retired, refresh grant re-landed.** Upstream's `33b1f62` (auth-path selection, registry, supplied-credential bypass, connection dispatch), `21c2bd1` (device grant against the advertised issuer, `offline_access`, poll-state mapping), and `228762f` (D5 derivation) satisfy the dispatch, grant, and derivation contracts; `select.rs` and the `oidc/device.rs` tests are the regression surface. Upstream stores the refresh token but never uses it (`refresh_authentication` answered `NotSupported`), so the refresh grant was re-landed as `482c038` on the restructured backend, keeping the merge-surviving `refresh_if_expired` wiring and the rotation persistence contract; `oidc/refresh.rs` is its regression surface, and the exchange-wiring tests in `auth/exchange.rs` remain. The fork's per-URL registry is replaced structurally: the implementation is bound into the selected `AuthEndpoint`, and the refresh and logout paths now take it from there instead of re-resolving. Upstream allows an explicit `--auth-url` naming an `oidc+` issuer to fail at registry resolution where the fork refused it with a dedicated message — the upstream shape stands.
+
 ### LP-012: RFC 8693 token exchange and external-token login
 
 **Purpose:** Mint partition-scoped tokens so the Aidonia broker can express the GitHub-style permission model, and make `lore login --token-type api-key` work on the OIDC path. The provider-facing contract is the [OIDC broker contract](oidc-broker-contract.md); the Tier 2 configuration rule (issuer plus exactly one template) mirrors the server's startup validation.
@@ -246,6 +276,8 @@ The transport maps wire status `AuthorizationExpired = 6` to `NotAuthenticated`.
 
 **Retire when:** Upstream implements the RFC 8693 client exchange with the same template rule (exactly one carrier, verbatim custom resources, one resource per request) and the API-key `subject_token_type` mapping, verified against the broker contract's checklist; retire per the register's reconciliation procedure.
 
+**Disposition (2026-10-16): Retired, api-key login re-landed.** Upstream's `8b73077` implements the exchange (`oidc/exchange.rs`): the exactly-one-carrier rule refused before any request, one `resource`/`scope` per request with the substituted partition, verbatim custom resources, the separate-issuer root-domain check, Tier 1 passthrough, and refusal classification — `oidc/exchange.rs`'s tests are the regression surface. The api-key external-token mapping (`--token-type api-key` to `urn:lore:params:oauth:token-type:api-key`, `urn:` passthrough, unknown short names refused before any request) was absent upstream and was re-landed as `482c038` (`exchange_external` plus `subject_token_type`), with the wire test in `oidc/exchange.rs`. The subject is the caller's own credential, so like the fork it is checked against no root-domain list. Should the api-key flow prove unused, dropping it retires the residual entirely.
+
 ### LP-013: RFC 7009 token revocation on `lore auth logout`
 
 **Purpose:** Complete the proposal's phase-3 client list: `lore auth logout` revokes the removed identities' refresh token and authentication token at the provider's advertised `revocation_endpoint` (RFC 7009), so credentials die at the issuer instead of only disappearing locally. The provider-facing contract is the [OIDC broker contract](oidc-broker-contract.md).
@@ -258,13 +290,15 @@ The transport maps wire status `AuthorizationExpired = 6` to `NotAuthenticated`.
 
 **Retire when:** Upstream lands equivalent client-side revocation on logout; verify the failure contract (reported, non-fatal, local state always cleared) and the no-endpoint no-op against the same test surface, then retire per the register's reconciliation procedure.
 
+**Status (2026-10-16): Active, re-landed.** No upstream commit implements revocation. The merge dropped the fork's `backend.rs` with the rest of `1526c6c`; `a8d07fa` ported `revoke_token` onto the restructured `oidc` module (discovery, no-endpoint no-op, form POST, 2xx-is-success) and moved the regression tests to `oidc/revoke.rs` against the `RecordingProvider`. The trait method, the gRPC `NotSupported` stub, and the logout wiring (non-fatal error, local state always cleared) survived the merge; the logout lookup now takes the endpoint's carried implementation, since a per-selection OIDC backend is unreachable through `authentication::find`.
+
 ## Inspect and export the recorded series
 
 Run these commands from the repository root. Immutable revisions keep the original comparison reproducible even after branch names move.
 
 ```bash
-baseline=491a7ed75c9b0dac7de50ada6d2a9c38f3cbc046
-fork_revision=4bfa0ec058d08ba9c2aa7abb783d7299c9829820
+baseline=5c88e6e7528a12b74ab3e1621b5d7c540a5d1606
+fork_revision=e5da4fa
 git merge-base --is-ancestor "$baseline" "$fork_revision"
 git log --reverse --format='%H %s' "$baseline..$fork_revision"
 git diff --stat "$baseline" "$fork_revision"
@@ -274,7 +308,7 @@ patch_dir=$(mktemp -d "${TMPDIR:-/tmp}/lore-patches.XXXXXX")
 git format-patch --output-directory "$patch_dir" "$baseline..$fork_revision"
 ```
 
-`git format-patch` exports nine numbered patches in chronological order, including supporting tests. Keep the original commit links as provenance if a later replay changes commit hashes.
+The export covers the Active patches and their supporting commits; the retired LP-008, LP-011, and LP-012 content rides in history but is absent from the tree. Keep the original commit links as provenance if a later replay changes commit hashes.
 
 ## Reconcile after upstream changes
 
