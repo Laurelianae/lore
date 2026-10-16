@@ -133,7 +133,15 @@ def granted_repository(exchange_env, make_repo) -> tuple[Lore, str]:
     exchange_env.provider.grants[repo_id] = GRANTED
     repo = make_repo(repo_id)
     repo.run(urc_args=["auth", "login", exchange_env.remote_url, "--no-browser"])
-    repo.repository_create(repo_id=repo_id)
+    # Claim-based creation authorizes from the token: a token granting the
+    # proposed id is supplied, as an enforcing deployment requires. The
+    # automatic exchange before creation is separate work; the exchange
+    # itself is what the pushes below exercise.
+    creation_token = exchange_env.provider.mint_token(
+        USER,
+        resources=[{"resource_id": f"urc-{repo_id}", "permission": ["write"]}],
+    )
+    repo.repository_create(repo_id=repo_id, access_token=creation_token)
     return repo, repo_id
 
 
