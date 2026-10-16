@@ -26,7 +26,7 @@ async fn returns_explicit_endpoint_verbatim() {
     let endpoint = resolve_auth_endpoint("ucs-auth://auth.example.com", "/does/not/exist", "")
         .await
         .expect("an explicit endpoint should resolve");
-    assert_eq!(endpoint, "ucs-auth://auth.example.com");
+    assert_eq!(endpoint.url, "ucs-auth://auth.example.com");
 }
 
 // Run outside a repository with no explicit endpoint, the answer names the actual
