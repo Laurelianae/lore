@@ -2,12 +2,6 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
-/// The shared fake OIDC provider, included once for the whole binary:
-/// including it in more than one submodule of the same test binary trips
-/// `duplicate_mod`.
-#[path = "../support/oidc_provider.rs"]
-pub mod provider;
-
 mod exchange;
 mod mode;
 mod oidc;
@@ -53,4 +47,3 @@ fn builtin_schemes_are_served_by_the_auth_service() {
         );
     }
 }
-

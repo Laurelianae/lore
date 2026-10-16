@@ -1681,7 +1681,7 @@ async fn authenticated_storage_permission_matrix_on_both_protocols() {
                         jwt_issuer: None,
                         jwt_audience: Some(vec!["test".into()]),
                         jwt_typ: None,
-                                            };
+                    };
                     let factory = TestHandlerFactory::with_authorization(
                         immutable.clone(),
                         mutable.clone(),
@@ -1903,7 +1903,7 @@ mod authorization_expiry {
             jwt_issuer: None,
             jwt_audience: Some(vec!["expiry".into()]),
             jwt_typ: None,
-                    }))
+        }))
     }
     fn token(expires: u64, repositories: &[RepositoryId], action: &str) -> String {
         let claims = AuthorizationToken {

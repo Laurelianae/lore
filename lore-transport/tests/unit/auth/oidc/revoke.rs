@@ -61,7 +61,10 @@ async fn the_revocation_endpoint_receives_the_token_and_hint() {
         form.get("token_type_hint").map(String::as_str),
         Some("refresh_token"),
     );
-    assert_eq!(form.get("client_id").map(String::as_str), Some("lore-client"));
+    assert_eq!(
+        form.get("client_id").map(String::as_str),
+        Some("lore-client")
+    );
 }
 
 #[tokio::test]

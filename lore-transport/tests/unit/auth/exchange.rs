@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 use lore_base::error::NotSupported;
 use lore_base::types::RepositoryId;
-use lore_transport::auth::authentication;
 use lore_transport::auth::AuthEndpoint;
+use lore_transport::auth::authentication;
 use lore_transport::auth::exchange::*;
 
 /// Serializes the tests that point the process-global token store at a temp
@@ -603,8 +603,7 @@ async fn an_expired_stored_token_is_renewed_through_its_refresh_token() {
     let stub = std::sync::Arc::new(RefreshStub {
         refreshes: std::sync::atomic::AtomicUsize::new(0),
     });
-    authentication::add("refresh-wiring", stub.clone())
-        .expect("the refresh scheme registers");
+    authentication::add("refresh-wiring", stub.clone()).expect("the refresh scheme registers");
 
     // An expired token and a refresh token for it, as a completed OIDC login
     // would have left them.
