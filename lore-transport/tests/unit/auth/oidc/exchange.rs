@@ -412,3 +412,73 @@ async fn an_unusable_exchanged_token_is_an_error() {
         assert!(refused.is_internal(), "{answer}: {refused}");
     }
 }
+
+/// The external-token login (`--token-type api-key`): the token type maps to the Lore
+/// API-key URN, a full `urn:` value passes through verbatim, an unknown short name is
+/// refused before any request, and no resource or scope names a partition.
+#[tokio::test]
+async fn an_external_token_exchange_maps_the_token_type() {
+    let provider = provider_answering(|issuer| {
+        json(&serde_json::json!({
+            "access_token": access_token(issuer, "user-1", "User One"),
+            "token_type": "Bearer",
+            "expires_in": 300,
+        }))
+    })
+    .await;
+    let endpoint = oidc::endpoint(&provider.issuer);
+    let backend = OidcAuthentication::new(oidc(&provider.issuer));
+
+    let exchanged = backend
+        .exchange_external_token(&endpoint, "the-api-key", "api-key", "corr")
+        .await
+        .expect("the api-key exchange mints an authentication token");
+    assert_eq!(exchanged.user_id, "user-1");
+    let exchange = fields(&provider.requests_to("/token")[0]);
+    assert_eq!(
+        values(&exchange, "subject_token_type"),
+        vec!["urn:lore:params:oauth:token-type:api-key"],
+    );
+    assert_eq!(values(&exchange, "subject_token"), vec!["the-api-key"]);
+    assert_eq!(
+        values(&exchange, "requested_token_type"),
+        vec![ACCESS_TOKEN_TYPE],
+    );
+    assert!(!exchange.iter().any(|(field, _)| field == "resource"));
+    assert!(!exchange.iter().any(|(field, _)| field == "scope"));
+
+    // A full token-type URI passes through verbatim.
+    backend
+        .exchange_external_token(
+            &endpoint,
+            "t",
+            "urn:example:params:token-type:custom",
+            "corr",
+        )
+        .await
+        .expect("a urn: token type passes through");
+    assert_eq!(
+        values(
+            &fields(&provider.requests_to("/token")[1]),
+            "subject_token_type"
+        ),
+        vec!["urn:example:params:token-type:custom"],
+    );
+
+    // A provider short name the UCS auth service knew has no meaning here: refused
+    // before any request.
+    let requests_before = provider.requests_to("/token").len();
+    let error = backend
+        .exchange_external_token(&endpoint, "t", "github", "corr")
+        .await
+        .expect_err("an unknown short name is refused");
+    assert!(
+        error.to_string().contains("'github'") && error.to_string().contains("api-key"),
+        "{error}"
+    );
+    assert_eq!(
+        provider.requests_to("/token").len(),
+        requests_before,
+        "the refusal must not reach the wire"
+    );
+}

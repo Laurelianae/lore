@@ -43,6 +43,24 @@ struct ExchangeResponse {
     token_type: String,
 }
 
+/// The token type an API key names on the wire (LEP: API key login implemented as a
+/// token exchange).
+pub const API_KEY_TOKEN_TYPE: &str = "urn:lore:params:oauth:token-type:api-key";
+
+/// Maps a `--token-type` name to an RFC 8693 `subject_token_type`: `api-key` names
+/// the Lore API-key token type, and a value already shaped `urn:...` passes through
+/// verbatim. Any other short name is refused, naming what the path understands -- a
+/// provider name the UCS auth service knew has no meaning on the OIDC path.
+pub fn subject_token_type(token_type: &str, issuer: &str) -> Result<String, ProtocolError> {
+    match token_type {
+        "api-key" => Ok(API_KEY_TOKEN_TYPE.to_string()),
+        value if value.starts_with("urn:") => Ok(value.to_string()),
+        other => Err(ProtocolError::internal(format!(
+            "unsupported token type '{other}' for the OIDC path at {issuer}; use 'api-key' or a full 'urn:...' token type"
+        ))),
+    }
+}
+
 /// The target naming `repository` under the template the server advertises, or `None` when
 /// it advertises neither template: Tier 1, where the login token is sent everywhere and
 /// nothing is exchanged.
@@ -138,6 +156,35 @@ pub async fn exchange(
             Outcome::Refused(refusal) => return Err(refused(exchange_issuer, &target, &refusal)),
         };
     authorization_token(response)
+}
+
+/// The external-token exchange: `subject_token` (of `subject_token_type`) traded for a
+/// plain access token, with no resource or scope naming a partition.
+pub async fn exchange_external(
+    oidc: &Oidc,
+    subject_token: &str,
+    subject_token_type: &str,
+) -> Result<token::TokenResponse, ProtocolError> {
+    let exchange_issuer = oidc
+        .token_exchange_issuer
+        .as_deref()
+        .unwrap_or(&oidc.issuer);
+    let document = discovery::discover(exchange_issuer).await?;
+
+    let form = vec![
+        ("grant_type", GRANT_TYPE.to_owned()),
+        ("client_id", oidc.client_id.clone()),
+        ("subject_token", subject_token.to_owned()),
+        ("subject_token_type", subject_token_type.to_owned()),
+        ("requested_token_type", ACCESS_TOKEN_TYPE.to_owned()),
+    ];
+    match token::request("token exchange", &document.token_endpoint, form).await? {
+        Outcome::Token(response) => Ok(response),
+        Outcome::Refused(refusal) => Err(ProtocolError::internal(format!(
+            "token exchange failed: {}",
+            refusal.describe()
+        ))),
+    }
 }
 
 /// The hosts the login token may be sent to: those its claims name, and the login

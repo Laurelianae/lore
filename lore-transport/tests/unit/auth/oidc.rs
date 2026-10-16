@@ -3,6 +3,7 @@
 mod device;
 mod discovery;
 mod exchange;
+mod refresh;
 mod revoke;
 
 #[path = "../../support/oidc_provider.rs"]

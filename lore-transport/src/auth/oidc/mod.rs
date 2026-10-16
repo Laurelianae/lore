@@ -14,7 +14,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lore_base::error::Disconnected;
-use lore_base::error::NotSupported;
 use lore_base::lore_spawn_net;
 use lore_base::lore_warn;
 use lore_base::types::RepositoryId;
@@ -220,16 +219,6 @@ impl OidcAuthentication {
         OidcAuthentication { oidc }
     }
 
-    fn not_implemented(operation: &str, endpoint: &str) -> ProtocolError {
-        NotSupported {
-            operation: format!(
-                "{operation} against OIDC issuer {}: not implemented yet",
-                issuer(endpoint)
-            ),
-        }
-        .into()
-    }
-
     /// Refuses an `auth_url` naming an issuer other than the one the implementation was
     /// selected for.
     fn check_endpoint(&self, auth_url: &str) -> Result<(), ProtocolError> {
@@ -306,20 +295,45 @@ impl Authentication for OidcAuthentication {
     async fn exchange_external_token(
         &self,
         auth_url: &str,
-        _token: &str,
-        _token_type: &str,
+        token: &str,
+        token_type: &str,
         _correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError> {
-        Err(Self::not_implemented("token exchange", auth_url))
+        self.check_endpoint(auth_url)?;
+        let subject_token_type = exchange::subject_token_type(token_type, &self.oidc.issuer)?;
+        let granted = exchange::exchange_external(&self.oidc, token, &subject_token_type).await?;
+        token::authentication_token(granted)
     }
 
     async fn refresh_authentication(
         &self,
         auth_url: &str,
-        _refresh_token: &str,
+        refresh_token: &str,
         _correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError> {
-        Err(Self::not_implemented("token refresh", auth_url))
+        self.check_endpoint(auth_url)?;
+        let document = discovery::discover(&self.oidc.issuer)
+            .await
+            .map_err(ProtocolError::from)?;
+        let form = vec![
+            ("grant_type", "refresh_token".to_owned()),
+            ("refresh_token", refresh_token.to_owned()),
+            ("client_id", self.oidc.client_id.clone()),
+            ("scope", device::scope(&self.oidc)),
+        ];
+        let granted: token::TokenResponse =
+            match token::request("token refresh", &document.token_endpoint, form).await? {
+                token::Outcome::Token(granted) => granted,
+                token::Outcome::Refused(refusal) => {
+                    // A refresh token already rotated out is answered `invalid_grant`;
+                    // so is a token the provider no longer accepts for any reason.
+                    return Err(ProtocolError::internal(format!(
+                        "token refresh failed: {}",
+                        refusal.describe()
+                    )));
+                }
+            };
+        token::authentication_token(granted)
     }
 
     async fn revoke_token(

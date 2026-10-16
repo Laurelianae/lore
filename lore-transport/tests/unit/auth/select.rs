@@ -206,15 +206,8 @@ async fn the_oidc_endpoint_names_the_issuer_under_the_oidc_scheme() {
     assert!(!Arc::ptr_eq(&selected.endpoint.auth, &by_issuer));
     assert!(authentication::find(&selected.endpoint.url).is_err());
 
-    // The OIDC refresh grant is not implemented yet, and says so without
-    // touching the network.
-    let refused = selected
-        .endpoint
-        .auth
-        .refresh_authentication(&selected.endpoint.url, "refresh", "")
-        .await
-        .expect_err("not implemented yet");
-    assert!(refused.is_not_supported(), "{refused}");
+    // The refresh grant is the fork's re-landed addition on this backend; its
+    // contract is exercised in `super::refresh`.
 }
 
 /// A server whose gRPC auth URL and OIDC issuer are the same string, which a
