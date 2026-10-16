@@ -11,6 +11,7 @@ How-To guides are directions. Each one walks through a specific problem or towar
 - [Install the Lore CLI](install-lore-cli.md) — get the `lore` binary onto your PATH and ready to use.
 - [Deploy a local Lore Server](deploy-local-lore-server.md) — stand up a single-host Lore Server you can push to and clone from.
 - [Run parallel instances over a shared store](run-parallel-instances-over-a-shared-store.md) — Lore's equivalent of worktrees: keep many working trees of a repository over one store, and move, prune, and remove them.
+- [Serve a user directory for an OIDC deployment](serve-a-user-directory-for-oidc.md) — resolve readable user names with OAuth: what tokens carry, what directory to implement, and the migration to the native API.
 
 ## Suggested starting points
 
