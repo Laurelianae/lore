@@ -35,7 +35,7 @@ The configured remote is the fork, `origin`; there is no configured `upstream` r
 
 **Adopted upstream behavior changes.**
 
-- `8b73077` makes a repository lookup (`RepositoryGet`) reachable for any verified token on resource-grant servers (`check_repository_lookup`): the client must name a repository before it can exchange for a token granting it, and the record discloses only the id, name, and metadata hash. `test_read_write_matrix` now asserts lookup per tier, keeping the HTTP content probes as the read/write gates. The claims and legacy tiers still gate the lookup on read.
+- `8b73077` makes a repository lookup (`RepositoryGet`) reachable for any verified token on resource-grant servers (`check_repository_lookup`): the client must name a repository before it can exchange for a token granting it, and the record discloses only the id, name, and metadata hash. `test_read_write_matrix` now asserts lookup per tier, keeping the HTTP content probes as the read/write gates. The claims and legacy tiers still gate the lookup on read. **Fork delta:** the resource-grant tier deliberately diverges — a follow-up patch re-gated the lookup on a read-like grant, restoring the pre-merge Tier 2 behavior (LP-014 below).
 - A supplied access token is now the authentication credential itself on claim-based endpoints (no advertised auth server, or the OIDC path), per LP-008's precedence; on a legacy auth-service endpoint the identity token remains the RPC credential, with a scoped access token serving the uploads (`d42b015`). `auth_exchange` and `auth_exchange_custom_resource` short-circuit on it, so repository creation and the repository RPCs authorize from a token the caller supplied even without a stored login. The token-store `load_user_token` contract is unchanged.
 - The refresh wiring and the logout revocation now take the endpoint's carried implementation instead of `authentication::find`, which can never resolve an OIDC backend (it is bound per selection, not registered under a scheme).
 - An explicit `--auth-url` naming an `oidc+` issuer resolves through the registry and fails there, instead of the fork's refusal message; upstream's error shape stands.
@@ -89,6 +89,7 @@ IDs remain stable through rebases, splits, and retirement. The table is in repla
 | LP-011 | [1526c6c](https://github.com/Laurelianae/lore/commit/1526c6c24f63e0d3081578626dfe2f777e041f07) | Client OIDC device grant, refresh, and auth-path dispatch | Builds on the D5 claim reading also recorded by LP-012; adds the `AuthMode` plumbing the connect bridge forwards | Retired 2026-10-16, refresh re-landed |
 | LP-012 | [1526c6c](https://github.com/Laurelianae/lore/commit/1526c6c24f63e0d3081578626dfe2f777e041f07) | RFC 8693 token exchange and external-token login | Layers onto LP-011's backend and D5 derivation | Retired 2026-10-16, api-key login re-landed |
 | LP-013 | [5534934](https://github.com/Laurelianae/lore/commit/5534934c564d37341ff8e244a31ce6293937517e) | RFC 7009 token revocation on `lore auth logout` | Extends LP-011's backend and per-URL registry | Active, re-landed 2026-10-16 |
+| LP-014 | This commit (the follow-up to the 2026-10-16 merge) | Read-gated repository lookup on resource-grant servers | Restores LP-006's read gate for `RepositoryGet`/`RepositoryQuery` after `8b73077` opened it | Active |
 
 ## Patch details and acceptance contracts
 
@@ -291,6 +292,20 @@ The transport maps wire status `AuthorizationExpired = 6` to `NotAuthenticated`.
 **Retire when:** Upstream lands equivalent client-side revocation on logout; verify the failure contract (reported, non-fatal, local state always cleared) and the no-endpoint no-op against the same test surface, then retire per the register's reconciliation procedure.
 
 **Status (2026-10-16): Active, re-landed.** No upstream commit implements revocation. The merge dropped the fork's `backend.rs` with the rest of `1526c6c`; `a8d07fa` ported `revoke_token` onto the restructured `oidc` module (discovery, no-endpoint no-op, form POST, 2xx-is-success) and moved the regression tests to `oidc/revoke.rs` against the `RecordingProvider`. The trait method, the gRPC `NotSupported` stub, and the logout wiring (non-fatal error, local state always cleared) survived the merge; the logout lookup now takes the endpoint's carried implementation, since a per-selection OIDC backend is unreachable through `authentication::find`.
+
+### LP-014: Read-gated repository lookup on resource-grant servers
+
+**Purpose:** Keep the fork's LEP D4 model — the broker mints login tokens already carrying the user's partition grants — by restoring LP-006's baseline read gate on repository lookups after upstream's `8b73077` opened them on the resource-grant tier.
+
+**Before:** `ResourceGrantsAuthorizer` overrode `check_repository_lookup` (adopted with `8b73077` in the 2026-10-16 merge) to answer `Ok` for any verified token, so a Tier 2 login token carrying no grant on a repository could resolve its name to an id and read its record.
+
+**Current:** The override is deleted and the trait default applies: a lookup requires `check_repository_access(token, repository_id, None)`, i.e. a read-like grant (`read`/`write`/`admin`/`owner`) on the named repository, directly or through the `urc-*` wildcard. All lookup call sites (legacy `RepositoryQuery`, v1 `RepositoryGet` by id and by name, and forwarded `RepositoryGet`) go through `check_repository_query_authorization`, so a denial surfaces as `NOT_FOUND`, hiding the repository. The claims and legacy tiers and AllowAll servers are unchanged — the trait default already governed them.
+
+**Code and regressions:** The override's deletion in [resource_grants_authorizer.rs](../../lore-server/src/authnz/resource_grants_authorizer.rs). Upstream's trait method and the `check_repository_query_authorization` indirection ([repository_query.rs](../../lore-server/src/grpc/handlers/repository_query.rs)) are structure, not behavior, and are kept. Regression: `a_lookup_requires_a_read_like_grant` in [resource_grants_authorizer.rs](../../lore-server/tests/unit/authnz/resource_grants_authorizer.rs) (Ok for read-like entries, `PermissionDenied` for empty, unknown-only, and non-matching partitions, `Unauthenticated` without a token) and `test_read_write_matrix` in [test_repository_permissions.py](../../scripts/test/test_repository_permissions.py), which asserts the lookup against the read matrix on every tier again.
+
+**Compatibility:** A Tier 2 login token naming no partition can no longer bootstrap the partition exchange by resolving a name: the broker must keep including the user's partition grants (per-partition or wildcard) in the login token itself, as LEP D4 and the Tier 2 suites already assume. Users the broker has provisioned see no change; users without a grant on a repository get `NOT_FOUND` again. Upstream's motivating case — a grantless login token bootstrapping an exchange — is deliberately not supported.
+
+**Retire when:** Upstream re-gates the resource-grant lookup on read, or the fork deliberately adopts the open lookup with the compatibility consequences written down. PR #49 is not evidence.
 
 ## Inspect and export the recorded series
 
