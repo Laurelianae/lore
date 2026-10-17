@@ -90,6 +90,7 @@ IDs remain stable through rebases, splits, and retirement. The table is in repla
 | LP-012 | [1526c6c](https://github.com/Laurelianae/lore/commit/1526c6c24f63e0d3081578626dfe2f777e041f07) | RFC 8693 token exchange and external-token login | Layers onto LP-011's backend and D5 derivation | Retired 2026-10-16, api-key login re-landed |
 | LP-013 | [5534934](https://github.com/Laurelianae/lore/commit/5534934c564d37341ff8e244a31ce6293937517e) | RFC 7009 token revocation on `lore auth logout` | Extends LP-011's backend and per-URL registry | Active, re-landed 2026-10-16 |
 | LP-014 | [6e273b0](https://github.com/Laurelianae/lore/commit/6e273b0472d06a9b38be24f216cbc0cad89fe586) | Read-gated repository lookup on resource-grant servers | Restores LP-006's read gate for `RepositoryGet`/`RepositoryQuery` after `8b73077` opened it | Retired 2026-10-17 |
+| LP-015 | [9a63ec1](https://github.com/Laurelianae/lore/commit/9a63ec1) | Renew an expired stored login token before an exchange | Same renewal the service-auth path performs; covers the gate upstream's `33b1f62`/`8b73077` introduced | Active |
 
 ## Patch details and acceptance contracts
 
@@ -308,6 +309,18 @@ The transport maps wire status `AuthorizationExpired = 6` to `NotAuthenticated`.
 **Retire when:** Upstream re-gates the resource-grant lookup on read, or the fork deliberately adopts the open lookup with the compatibility consequences written down. PR #49 is not evidence.
 
 **Disposition (2026-10-17): Retired.** The fork deliberately adopts `8b73077`'s open lookup, retiring the divergence this patch restored: the `check_repository_lookup` override is back in `ResourceGrantsAuthorizer`, and the regression surfaces return to their pre-patch encodings — `a_lookup_needs_a_verified_token_and_no_grant`, the resource-tier lookup special case in `test_read_write_matrix`, and the exchange suite's original two lookup tests, with the `login_resources` stub hook removed. The compatibility consequences of the open lookup, written down per the retire clause: a Tier 2 login token carrying no partition grants can resolve a name to an id and read the record — the id, the name, and the metadata hash only — and then request the partition exchange, so an ungranted caller now fails at the refused exchange rather than with `NOT_FOUND` at the lookup. The exchange itself and every content path still require the broker's grant or a read-like grant (LP-006's gates and the HTTP probes), so content stays private. The LEP D4 broker model — minting the user's partition grants into login tokens — is unchanged and remains supported; it is no longer required for lookups to resolve.
+
+### LP-015: Renew an expired stored login token before an exchange
+
+**Purpose:** Keep the CLI working past the login token's TTL: the connection-level gate and the resource gate renew an expired stored login token through its refresh grant before trading it in, instead of sending a stale subject the issuer refuses.
+
+**Before:** Upstream's `33b1f62` auth-path selection and `8b73077` partition exchange put every repository-scoped connection through the gate at `connection.rs`, which calls `exchange()`/`exchange_custom_resource()` directly. Both loaded the stored login token via `user_info` and exchanged it verbatim. The service-auth path (`auth_exchange`) already renews through `refresh_if_expired`, but the gate runs first and fails the whole connection on the refusal, so the refresh grant was never consulted: five minutes after a login, every clone, push, and status failed with `Not authenticated` (the CLI maps the issuer's `invalid_grant` refusal to `NotAuthenticated`), while a valid cached partition token still worked because it skipped the exchange entirely.
+
+**Current:** A shared `exchange_subject` helper loads the identity's stored token and, when it is expired and no identity token was supplied, renews it via `refresh_if_expired` — the same call `auth_exchange_for_identity` makes, persisting the rotation. Both `exchange()` and `exchange_custom_resource()` use it, so the connection gate, `lore auth info --with-access-token`, and the user-service token flows all renew. A supplied identity token stays an instruction and is traded in as given (an expired one is answered by the server as itself, per the LP-008-superseding precedence). The `auth_exchange` family is unchanged: it renews first and its `exchange()` call then loads the fresh token, so no rotation is spent twice.
+
+**Code and regressions:** [exchange.rs](../../lore-transport/src/auth/exchange.rs), committed as [9a63ec1](https://github.com/Laurelianae/lore/commit/9a63ec1). Acceptance includes `the_repository_exchange_renews_an_expired_stored_login_token` and `the_resource_exchange_renews_an_expired_stored_login_token` in `lore-transport/tests/unit/auth/exchange.rs` (one refresh grant spent, the renewed token — never the stale one — recorded as the subject, rotation persisted), and `an_unrenewable_expired_login_token_is_not_traded_in` (no request sent when nothing can renew).
+
+**Retire when:** Upstream renews the login token in the gate paths (or moves the gate onto the `auth_exchange` family); verify the expired-token flow end to end — push and clone after the TTL succeed without re-login — then retire per the register's reconciliation procedure.
 
 ## Inspect and export the recorded series
 
