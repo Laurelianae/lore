@@ -608,7 +608,13 @@ mod pooled {
             .await;
 
         assert!(started.is_err_and(|err| err.is_slow_down()));
-        assert_eq!(serving.started_sessions_per_connection(), vec![1, 1]);
+        // The refusal answers as soon as it arrives, while the serving starts race it as detached
+        // tasks, so whether they have started their sessions yet when the error returns is a race.
+        wait_until(
+            || serving.started_sessions_per_connection() == [1, 1],
+            "the session starts never reached the server",
+        )
+        .await;
         wait_until(
             || serving.live_sessions_per_connection() == [0, 0],
             "the sessions started on the serving connections were left open",

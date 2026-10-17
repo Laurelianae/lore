@@ -252,8 +252,10 @@ async fn a_refused_issue_reaches_the_command_and_a_later_one_issues_the_session(
 }
 
 /// Commands that find their session stale while its issue waits on the server share that issue,
-/// and each receives the refusal it ends in, the server asked to start the session once. The
-/// commands have 10 ms to reach the issue before the server answers.
+/// and each receives the refusal it ends in, the server asked to start the session once. While
+/// the start stays held, a command however late the runner schedules it joins the pending issue
+/// instead of issuing another, so the hold only has to outlast that scheduling, and a command
+/// first polled after the refusal would be the only way to a second start.
 #[tokio::test(flavor = "multi_thread")]
 async fn commands_waiting_for_a_refused_issue_each_receive_its_refusal() {
     const COMMANDS: usize = 32;
@@ -280,7 +282,7 @@ async fn commands_waiting_for_a_refused_issue_each_receive_its_refusal() {
         "the session was not issued again",
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
     starts
         .send(SessionStarts::Refuse)
         .expect("the server refuses the held start");
