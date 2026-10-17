@@ -194,7 +194,14 @@ def test_read_write_matrix(permission_server, permissions, online):
         encode_bytes_field(1, bytes.fromhex(repository)),
         metadata(repository, token),
     )
-    assert (code == grpc.StatusCode.OK) == read
+    if server.tier == "resource":
+        # Repository lookup is reachability, not access: any verified token may
+        # look a repository up, since the client must name it before it can
+        # exchange for a token granting it, and the record discloses no more
+        # than the id, the name and the metadata hash.
+        assert code == grpc.StatusCode.OK
+    else:
+        assert (code == grpc.StatusCode.OK) == read
     assert (http(server, repository, token, address=address)[0] == 200) == read
     assert (http(server, repository, token, data=b"new content")[0] == 200) == write
     key, initial, changed = b"k" * 32, b"i" * 32, b"c" * 32

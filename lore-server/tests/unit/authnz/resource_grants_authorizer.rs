@@ -336,41 +336,23 @@ async fn no_token_denies_even_plain_access() {
     }
 }
 
-/// A lookup requires a read-like grant on the partition: the fork's model
-/// has the broker mint login tokens carrying the user's resource grants, so
-/// a token that names no partition cannot resolve any name either. Reaching
-/// the record or contents needs the same grant.
+/// A lookup needs a verified token and no grant: the client looks a repository up before
+/// it can exchange for a token naming it. Reaching the partition still needs the grant.
 #[tokio::test]
-async fn a_lookup_requires_a_read_like_grant() {
+async fn a_lookup_needs_a_verified_token_and_no_grant() {
     let authorizer = default_authorizer();
+    let login = token_with_extra(json!({}));
+    let token = VerifiedToken {
+        raw: "raw",
+        claims: &login,
+    };
 
-    for permission in ["read", "write", "admin", "owner"] {
-        let claims =
-            claims_with_resources(vec![entry(&format!("urc-{REPOSITORY_HEX}"), &[permission])]);
-        let token = VerifiedToken {
-            raw: "raw",
-            claims: &claims,
-        };
+    for id in [REPOSITORY_HEX, UNRELATED_HEX] {
         authorizer
-            .check_repository_lookup(Some(&token), repository(REPOSITORY_HEX))
+            .check_repository_lookup(Some(&token), repository(id))
             .await
-            .expect("a read-like grant permits the lookup");
-        let err = authorizer
-            .check_repository_lookup(Some(&token), repository(UNRELATED_HEX))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), Code::PermissionDenied);
-    }
-
-    for permissions in [&[][..], &["obliterate"]] {
-        let claims =
-            claims_with_resources(vec![entry(&format!("urc-{REPOSITORY_HEX}"), permissions)]);
-        let token = VerifiedToken {
-            raw: "raw",
-            claims: &claims,
-        };
-        let err = authorizer
-            .check_repository_lookup(Some(&token), repository(REPOSITORY_HEX))
+            .expect("any verified token may look a repository up");
+        let err = check(&authorizer, &login, repository(id), None)
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::PermissionDenied);
