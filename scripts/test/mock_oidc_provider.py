@@ -170,6 +170,10 @@ class MockOidcProvider:
         self.exchange_carrier = "resource"
         # Partition id to the actions an exchange for it grants.
         self.grants: dict[str, list[str]] = {}
+        # The resources a device-grant login token carries: the user's grants,
+        # as LEP D4 requires the login token to hold. `None` mints the stock
+        # permissionless login token.
+        self.login_resources: list[dict] | None = None
         self._minted: set[str] = set()
         self._server: _Server | None = None
         self._thread: threading.Thread | None = None
@@ -198,6 +202,7 @@ class MockOidcProvider:
             self._poll_script.clear()
             self.requests.clear()
             self.grants.clear()
+            self.login_resources = None
 
     def reset_requests(self) -> None:
         with self._lock:
@@ -267,7 +272,9 @@ class MockOidcProvider:
                     self._poll_script.pop(0)
                 return 400, {"error": error}
         return 200, {
-            "access_token": self.mint_token(self.user),
+            "access_token": self.mint_token(
+                self.user, resources=self.login_resources or None
+            ),
             "token_type": "Bearer",
             "expires_in": DEFAULT_TOKEN_LIFETIME_SECONDS,
             "scope": form.get("scope", "openid offline_access"),

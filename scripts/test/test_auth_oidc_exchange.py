@@ -257,9 +257,23 @@ def test_repository_operations_need_only_the_stored_login_token(
     """With only the login token in the store, the lookups by name and by id
     resolve with it, and the calls about one partition carry that partition's
     exchanged token: clone by name and by id, info with and without a URL,
-    metadata set and get, and delete."""
+    metadata set and get, and delete. The login token carries the user's
+    grants (LEP D4): a read on this repository, which is what the lookups
+    resolve with under the read-gated lookup."""
+    provider = exchange_env.provider
     remote_url = exchange_env.remote_url
-    repo, repo_id = granted_repository(exchange_env, make_repo)
+    repo_id = uuid.uuid4().hex
+    provider.grants[repo_id] = GRANTED
+    provider.login_resources = [
+        {"resource_id": f"urc-{repo_id}", "permission": ["read"]}
+    ]
+    repo = make_repo(repo_id)
+    repo.run(urc_args=["auth", "login", remote_url, "--no-browser"])
+    provider.login_resources = None
+    creation_token = provider.mint_token(
+        USER, resources=[{"resource_id": f"urc-{repo_id}", "permission": ["write"]}]
+    )
+    repo.repository_create(repo_id=repo_id, access_token=creation_token)
     seed_commit_and_push(repo)
 
     repo.clone()
@@ -284,10 +298,11 @@ def test_repository_operations_need_only_the_stored_login_token(
 def test_a_lookup_by_name_does_not_open_an_ungranted_partition(
     exchange_env, make_repo, new_lore_repo, scratch_dir
 ):
-    """Any verified caller resolves the name, but the exchange for a partition
-    the stub grants nothing on is refused, so the clone fails. The clone runs
-    from a client with a token store of its own, which holds no partition
-    token from the owner's push."""
+    """A caller with no grant on the repository is refused at the lookup
+    itself (LP-014), so the clone fails and no exchange is ever requested:
+    the lookup does not open the ungranted partition. The clone runs from a
+    client with a token store of its own, which holds no partition token
+    from the owner's push."""
     provider = exchange_env.provider
     repo, repo_id = granted_repository(exchange_env, make_repo)
     seed_commit_and_push(repo)
@@ -312,4 +327,4 @@ def test_a_lookup_by_name_does_not_open_an_ungranted_partition(
             ]
         )
 
-    assert exchanges(provider), "the client never asked for the partition"
+    assert not exchanges(provider), "the lookup opened the partition anyway"
