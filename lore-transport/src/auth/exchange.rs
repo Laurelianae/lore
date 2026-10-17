@@ -158,6 +158,46 @@ async fn refresh_if_expired(auth_endpoint: &AuthEndpoint, identity: &str) -> Opt
 /// A non-empty `identity_token` replaces the authentication token.
 ///
 /// A non-empty `access_token` the authorization token.
+/// The login token an authorization exchange sends as its subject.
+///
+/// Loads the identity's stored token. A stored token past its expiry is
+/// renewed first — persisting the rotation — because the issuer refuses a
+/// stale subject and the connection-level callers fail whole connections on
+/// that refusal; the service-auth path makes the same renewal through
+/// [`auth_exchange_for_identity`]. A supplied identity token is an
+/// instruction rather than a renewal candidate and is returned as given; an
+/// expired one is answered by the server as itself.
+async fn exchange_subject(
+    auth_endpoint: &AuthEndpoint,
+    identity: &str,
+    auth_domain: String,
+    identity_token: &str,
+) -> Result<String, ExchangeError> {
+    let Some(auth_service_only_token) = lore_credential::user_info(
+        auth_endpoint.url.as_str(),
+        identity,
+        tokens_only_for_recipient_domain(auth_domain),
+        identity_token,
+        "",
+    )
+    .await
+    else {
+        lore_debug!("Not authenticated, unable to perform authz exchange");
+        return Err(NotAuthenticated.into());
+    };
+
+    if !identity_token.is_empty() || !is_expired(auth_service_only_token.expires) {
+        return Ok(auth_service_only_token.token);
+    }
+    lore_debug!("Authn token for {identity} has expired; renewing it before the exchange");
+    refresh_if_expired(auth_endpoint, identity)
+        .await
+        .ok_or_else(|| {
+            lore_debug!("Authn token for {identity} is expired and cannot be renewed");
+            ExchangeError::from(NotAuthenticated)
+        })
+}
+
 pub async fn exchange(
     auth_endpoint: &AuthEndpoint,
     identity: &str,
@@ -241,18 +281,7 @@ pub async fn exchange(
 
     // Load authn token for the auth service domain
     lore_trace!("Authorizing using authn identity: {identity}");
-    let Some(auth_service_only_token) = lore_credential::user_info(
-        auth_url.as_str(),
-        identity,
-        tokens_only_for_recipient_domain(auth_domain),
-        identity_token,
-        access_token,
-    )
-    .await
-    else {
-        lore_debug!("Not authenticated, unable to perform authz exchange");
-        return Err(NotAuthenticated.into());
-    };
+    let subject = exchange_subject(auth_endpoint, identity, auth_domain, identity_token).await?;
     lore_trace!("Authorizing using endpoint: {auth_endpoint}");
 
     let time_start = Instant::now();
@@ -265,12 +294,7 @@ pub async fn exchange(
 
     lore_trace!("Send auth exchange request");
     let authz = auth_impl
-        .exchange_for_repository(
-            &auth_url,
-            &auth_service_only_token.token,
-            repository,
-            &correlation_id,
-        )
+        .exchange_for_repository(&auth_url, &subject, repository, &correlation_id)
         .await
         .map_err(|err| {
             if err.is_not_authorized() {
@@ -419,18 +443,7 @@ pub async fn exchange_custom_resource(
     }
 
     lore_trace!("Authorizing using authn identity: {identity}");
-    let Some(auth_service_only_token) = lore_credential::user_info(
-        auth_url.as_str(),
-        identity,
-        tokens_only_for_recipient_domain(auth_domain),
-        identity_token,
-        access_token,
-    )
-    .await
-    else {
-        lore_debug!("Not authenticated, unable to perform authz exchange");
-        return Err(NotAuthenticated.into());
-    };
+    let subject = exchange_subject(auth_endpoint, identity, auth_domain, identity_token).await?;
     lore_trace!("Authorizing using endpoint: {auth_endpoint}");
 
     let time_start = Instant::now();
@@ -442,12 +455,7 @@ pub async fn exchange_custom_resource(
 
     lore_trace!("Send auth exchange request");
     let authz = auth_impl
-        .exchange_for_custom_resource(
-            &auth_url,
-            &auth_service_only_token.token,
-            resource_id,
-            &correlation_id,
-        )
+        .exchange_for_custom_resource(&auth_url, &subject, resource_id, &correlation_id)
         .await
         .map_err(|err| {
             if err.is_not_authorized() {

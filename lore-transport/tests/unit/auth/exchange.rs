@@ -672,3 +672,477 @@ async fn an_expired_stored_identity_without_a_refresh_token_is_skipped() {
         "no backend is registered for the URL, so the identity is skipped"
     );
 }
+
+/// The connection-level repository exchange renews an expired stored login
+/// token before trading it in: the issuer refuses a stale subject, and the
+/// connection gate fails whole connections on that refusal. The renewal is
+/// the same one the service-auth path performs, and the rotation is
+/// persisted like its.
+#[tokio::test]
+async fn the_repository_exchange_renews_an_expired_stored_login_token() {
+    use lore_credential::token_store;
+    use lore_transport::error::ProtocolError;
+    use lore_transport::traits::Authentication;
+    use lore_transport::types::AuthenticationToken;
+    use lore_transport::types::AuthorizationToken;
+
+    /// `sub` alice, `aud` example.com, `exp` back in 2001.
+    const EXPIRED_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjEwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
+    /// A fresh login token the stub's refresh grant hands out.
+    const RENEWED_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
+    /// A fresh authorization the stub hands out for the renewed token.
+    const AUTHZ: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJhdXRoeiI6InllcyJ9.signature";
+    const AUTH_URL: &str = "gate-renewal://token.test.invalid";
+
+    struct RenewingStub {
+        refreshes: std::sync::atomic::AtomicUsize,
+        subjects: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Authentication for RenewingStub {
+        async fn refresh_authentication(
+            &self,
+            _auth_url: &str,
+            _refresh_token: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            let count = self
+                .refreshes
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            Ok(AuthenticationToken {
+                token: RENEWED_TOKEN.to_string(),
+                user_id: "alice".to_string(),
+                user_name: "Alice".to_string(),
+                expires_ms: 0,
+                acceptable_root_domains: vec!["example.com".to_string()],
+                refresh_token: Some(format!("rotated-{count}")),
+                scope: None,
+            })
+        }
+
+        async fn exchange_for_repository(
+            &self,
+            _auth_url: &str,
+            authn_token: &str,
+            _repository: RepositoryId,
+            _correlation_id: &str,
+        ) -> Result<AuthorizationToken, ProtocolError> {
+            self.subjects
+                .lock()
+                .expect("the subject recorder")
+                .push(authn_token.to_string());
+            Ok(AuthorizationToken {
+                token: AUTHZ.to_string(),
+                expires_ms: 2000000000 * 1000,
+                acceptable_root_domains: vec!["example.com".to_string()],
+            })
+        }
+
+        async fn revoke_token(
+            &self,
+            _auth_url: &str,
+            _token: &str,
+            _token_type_hint: &str,
+            _correlation_id: &str,
+        ) -> Result<(), ProtocolError> {
+            Err(ProtocolError::from(NotSupported {
+                operation: "revoke_token".into(),
+            }))
+        }
+
+        async fn start_auth_session(
+            &self,
+            _auth_url: &str,
+            _client_state: &str,
+            _correlation_id: &str,
+        ) -> Result<lore_transport::types::AuthSession, ProtocolError> {
+            Err(ProtocolError::internal("the stub only renews"))
+        }
+
+        async fn poll_auth_session(
+            &self,
+            _auth_url: &str,
+            _client_state: &str,
+            _session_code: &str,
+            _correlation_id: &str,
+        ) -> Result<lore_transport::types::AuthSessionPoll, ProtocolError> {
+            Err(ProtocolError::internal("the stub only renews"))
+        }
+
+        async fn exchange_external_token(
+            &self,
+            _auth_url: &str,
+            _token: &str,
+            _token_type: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            Err(ProtocolError::internal("the stub only renews"))
+        }
+
+        async fn exchange_for_custom_resource(
+            &self,
+            _auth_url: &str,
+            _authn_token: &str,
+            _resource_id: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthorizationToken, ProtocolError> {
+            Err(ProtocolError::internal("the stub only renews"))
+        }
+    }
+
+    let _lock = STORE_MUTEX
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
+    isolate_auth_store("gate-renewal");
+
+    let stub = std::sync::Arc::new(RenewingStub {
+        refreshes: std::sync::atomic::AtomicUsize::new(0),
+        subjects: std::sync::Mutex::new(Vec::new()),
+    });
+
+    // An expired token and a refresh token for it, as a completed OIDC login
+    // would have left them.
+    token_store::store_user_token(AUTH_URL, "alice", EXPIRED_TOKEN, vec!["example.com".into()])
+        .await
+        .expect("the expired token is stored");
+    token_store::store_refresh_token(AUTH_URL, "alice", "refresh-0")
+        .await
+        .expect("the refresh token is stored");
+
+    let repository: RepositoryId = "00112233445566778899aabbccddeeff"
+        .parse()
+        .expect("a valid repository id");
+    let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
+    let token = exchange(
+        &endpoint,
+        "alice",
+        repository,
+        "example.com".to_string(),
+        "",
+        "",
+    )
+    .await
+    .expect("the expired login token is renewed before the exchange");
+
+    assert_eq!(
+        stub.refreshes.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "exactly one refresh grant is spent on the expired token"
+    );
+    assert_eq!(
+        stub.subjects
+            .lock()
+            .expect("the subject recorder")
+            .as_slice(),
+        [RENEWED_TOKEN],
+        "the exchange trades in the renewed token, never the stale one"
+    );
+    assert_eq!(token, AUTHZ);
+
+    // The rotation is persisted: the spent token is gone from the store.
+    let stored = token_store::load_refresh_token(AUTH_URL, "alice")
+        .await
+        .expect("the rotation is in the store");
+    assert_eq!(stored, "rotated-0");
+}
+
+/// The resource-scoped exchange renews an expired stored login token exactly
+/// like the repository one: same gate, same refusal on a stale subject.
+#[tokio::test]
+async fn the_resource_exchange_renews_an_expired_stored_login_token() {
+    use lore_credential::token_store;
+    use lore_transport::error::ProtocolError;
+    use lore_transport::traits::Authentication;
+    use lore_transport::types::AuthenticationToken;
+    use lore_transport::types::AuthorizationToken;
+
+    /// `sub` alice, `aud` example.com, `exp` back in 2001.
+    const EXPIRED_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjEwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
+    /// A fresh login token the stub's refresh grant hands out.
+    const RENEWED_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
+    /// A fresh authorization the stub hands out for the renewed token.
+    const AUTHZ: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJhdXRoeiI6InllcyJ9.signature";
+    const AUTH_URL: &str = "gate-renewal-resource://token.test.invalid";
+
+    struct RenewingStub {
+        refreshes: std::sync::atomic::AtomicUsize,
+        subjects: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Authentication for RenewingStub {
+        async fn refresh_authentication(
+            &self,
+            _auth_url: &str,
+            _refresh_token: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            let count = self
+                .refreshes
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            Ok(AuthenticationToken {
+                token: RENEWED_TOKEN.to_string(),
+                user_id: "alice".to_string(),
+                user_name: "Alice".to_string(),
+                expires_ms: 0,
+                acceptable_root_domains: vec!["example.com".to_string()],
+                refresh_token: Some(format!("rotated-{count}")),
+                scope: None,
+            })
+        }
+
+        async fn exchange_for_custom_resource(
+            &self,
+            _auth_url: &str,
+            authn_token: &str,
+            _resource_id: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthorizationToken, ProtocolError> {
+            self.subjects
+                .lock()
+                .expect("the subject recorder")
+                .push(authn_token.to_string());
+            Ok(AuthorizationToken {
+                token: AUTHZ.to_string(),
+                expires_ms: 2000000000 * 1000,
+                acceptable_root_domains: vec!["example.com".to_string()],
+            })
+        }
+
+        async fn revoke_token(
+            &self,
+            _auth_url: &str,
+            _token: &str,
+            _token_type_hint: &str,
+            _correlation_id: &str,
+        ) -> Result<(), ProtocolError> {
+            Err(ProtocolError::from(NotSupported {
+                operation: "revoke_token".into(),
+            }))
+        }
+
+        async fn start_auth_session(
+            &self,
+            _auth_url: &str,
+            _client_state: &str,
+            _correlation_id: &str,
+        ) -> Result<lore_transport::types::AuthSession, ProtocolError> {
+            Err(ProtocolError::internal("the stub only renews"))
+        }
+
+        async fn poll_auth_session(
+            &self,
+            _auth_url: &str,
+            _client_state: &str,
+            _session_code: &str,
+            _correlation_id: &str,
+        ) -> Result<lore_transport::types::AuthSessionPoll, ProtocolError> {
+            Err(ProtocolError::internal("the stub only renews"))
+        }
+
+        async fn exchange_external_token(
+            &self,
+            _auth_url: &str,
+            _token: &str,
+            _token_type: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            Err(ProtocolError::internal("the stub only renews"))
+        }
+
+        async fn exchange_for_repository(
+            &self,
+            _auth_url: &str,
+            _authn_token: &str,
+            _repository: RepositoryId,
+            _correlation_id: &str,
+        ) -> Result<AuthorizationToken, ProtocolError> {
+            Err(ProtocolError::internal("the stub only renews"))
+        }
+    }
+
+    let _lock = STORE_MUTEX
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
+    isolate_auth_store("gate-renewal-resource");
+
+    let stub = std::sync::Arc::new(RenewingStub {
+        refreshes: std::sync::atomic::AtomicUsize::new(0),
+        subjects: std::sync::Mutex::new(Vec::new()),
+    });
+
+    token_store::store_user_token(AUTH_URL, "alice", EXPIRED_TOKEN, vec!["example.com".into()])
+        .await
+        .expect("the expired token is stored");
+    token_store::store_refresh_token(AUTH_URL, "alice", "refresh-0")
+        .await
+        .expect("the refresh token is stored");
+
+    let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
+    let token = exchange_custom_resource(
+        &endpoint,
+        "alice",
+        "urc-00112233445566778899aabbccddeeff",
+        "example.com".to_string(),
+        "",
+        "",
+    )
+    .await
+    .expect("the expired login token is renewed before the exchange");
+
+    assert_eq!(
+        stub.refreshes.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "exactly one refresh grant is spent on the expired token"
+    );
+    assert_eq!(
+        stub.subjects
+            .lock()
+            .expect("the subject recorder")
+            .as_slice(),
+        [RENEWED_TOKEN],
+        "the exchange trades in the renewed token, never the stale one"
+    );
+    assert_eq!(token, AUTHZ);
+}
+
+/// With no refresh token in the store, an expired stored login token fails
+/// the exchange as `NotAuthenticated` instead of being traded in: the issuer
+/// would refuse the stale subject, and sending it would only move the
+/// failure behind a network round trip.
+#[tokio::test]
+async fn an_unrenewable_expired_login_token_is_not_traded_in() {
+    use lore_credential::token_store;
+    use lore_transport::error::ProtocolError;
+    use lore_transport::traits::Authentication;
+    use lore_transport::types::AuthenticationToken;
+    use lore_transport::types::AuthorizationToken;
+
+    /// `sub` alice, `aud` example.com, `exp` back in 2001.
+    const EXPIRED_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjEwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
+    const AUTH_URL: &str = "gate-renewal-absent://token.test.invalid";
+
+    struct UnrenewableStub {
+        exchange_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Authentication for UnrenewableStub {
+        async fn refresh_authentication(
+            &self,
+            _auth_url: &str,
+            _refresh_token: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            Err(ProtocolError::internal("the stub never refreshes"))
+        }
+
+        async fn exchange_for_repository(
+            &self,
+            _auth_url: &str,
+            _authn_token: &str,
+            _repository: RepositoryId,
+            _correlation_id: &str,
+        ) -> Result<AuthorizationToken, ProtocolError> {
+            self.exchange_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            Err(ProtocolError::internal("the stub never exchanges"))
+        }
+
+        async fn revoke_token(
+            &self,
+            _auth_url: &str,
+            _token: &str,
+            _token_type_hint: &str,
+            _correlation_id: &str,
+        ) -> Result<(), ProtocolError> {
+            Err(ProtocolError::from(NotSupported {
+                operation: "revoke_token".into(),
+            }))
+        }
+
+        async fn start_auth_session(
+            &self,
+            _auth_url: &str,
+            _client_state: &str,
+            _correlation_id: &str,
+        ) -> Result<lore_transport::types::AuthSession, ProtocolError> {
+            Err(ProtocolError::internal("the stub never renews"))
+        }
+
+        async fn poll_auth_session(
+            &self,
+            _auth_url: &str,
+            _client_state: &str,
+            _session_code: &str,
+            _correlation_id: &str,
+        ) -> Result<lore_transport::types::AuthSessionPoll, ProtocolError> {
+            Err(ProtocolError::internal("the stub never renews"))
+        }
+
+        async fn exchange_external_token(
+            &self,
+            _auth_url: &str,
+            _token: &str,
+            _token_type: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            Err(ProtocolError::internal("the stub never renews"))
+        }
+
+        async fn exchange_for_custom_resource(
+            &self,
+            _auth_url: &str,
+            _authn_token: &str,
+            _resource_id: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthorizationToken, ProtocolError> {
+            Err(ProtocolError::internal("the stub never renews"))
+        }
+    }
+
+    let _lock = STORE_MUTEX
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
+    isolate_auth_store("gate-renewal-absent");
+
+    let stub = std::sync::Arc::new(UnrenewableStub {
+        exchange_attempts: std::sync::atomic::AtomicUsize::new(0),
+    });
+
+    token_store::store_user_token(AUTH_URL, "alice", EXPIRED_TOKEN, vec!["example.com".into()])
+        .await
+        .expect("the expired token is stored");
+
+    let repository: RepositoryId = "00112233445566778899aabbccddeeff"
+        .parse()
+        .expect("a valid repository id");
+    let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
+    let result = exchange(
+        &endpoint,
+        "alice",
+        repository,
+        "example.com".to_string(),
+        "",
+        "",
+    )
+    .await;
+
+    assert!(
+        result.unwrap_err().is_not_authenticated(),
+        "an expired login token with nothing to renew it is not traded in"
+    );
+    assert_eq!(
+        stub.exchange_attempts
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "the exchange is refused before any request is sent"
+    );
+}
